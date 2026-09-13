@@ -25,8 +25,7 @@ Results include the commit, dirty status, executable hash, compiler, machine,
 CPU affinity, environment, and timestamp. Keep separate output files: the
 selected output path is replaced. `compare.py` checks environment/workload
 compatibility and exits nonzero for a slowdown above `--threshold` (default
-0.10 = 10%). Use a dedicated machine for performance gates. Shared CI runners
-provide smoke coverage and result artifacts, not stable timing thresholds.
+0.10 = 10%). Run comparisons manually on a dedicated machine for stable timing.
 
 ## macOS / Docker
 
