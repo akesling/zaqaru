@@ -12,3 +12,7 @@
 /web/demo
 /_site
 /web/brotli.wasm
+
+# Local benchmark results and Python harness caches.
+/benchmark-results/
+/tools/microbench/__pycache__/

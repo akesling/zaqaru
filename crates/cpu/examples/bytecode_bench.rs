@@ -10,7 +10,7 @@
 //! under wasmtime, where the dispatch and bounds-check costs differ from
 //! native; a native ratio is a real signal but not the wasm one, and the
 //! next measurement is the same kernel under wasmtime. Run with
-//! `cargo run --release -p the engine --example bytecode_bench`.
+//! `cargo run --release -p zaqaru-cpu --example bytecode_bench`.
 
 use std::time::Instant;
 
@@ -89,6 +89,7 @@ fn main() {
 
     // --- the interpreter ---
     let mut interp = Guest::new(base_a, iterations);
+    interp.cache = BlockCache::interpreting();
     let start = Instant::now();
     let outcome = Engine::run(&mut interp.tcb, &mut interp.space, &mut interp.cache, u64::MAX);
     let interp_secs = start.elapsed().as_secs_f64();
