@@ -407,7 +407,11 @@ pub fn run<'a>(
     resolver: Resolver<'a>,
 ) -> Leave {
     let mut code = &trace.code;
-    let mut regs = [0u64; REGISTERS];
+    // Register operands are masked to five bits below. Back the local file
+    // with every encodable slot so indexing is provably in bounds without
+    // a branch per operand. The transpiler still allocates only REGISTERS
+    // slots, and only the sixteen architectural registers are flushed.
+    let mut regs = [0u64; 32];
     regs[..crate::state::REGISTER_COUNT].copy_from_slice(&tcb.registers);
     // The lazy-flags record, held in a local copy through the trace and
     // flushed to the control block only at a leave — so a `cmp`/`jcc` pair, an

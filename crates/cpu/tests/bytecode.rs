@@ -157,6 +157,8 @@ fn agree(build: impl Fn(&mut CodeAssembler, u64) + Copy) -> Outcome {
     };
     let reference = {
         let mut guest = Guest::at(base, build);
+        // Keep the oracle independent of the accelerator under test.
+        guest.cache = BlockCache::interpreting();
         let outcome = Engine::run(&mut guest.tcb, &mut guest.space, &mut guest.cache, QUANTUM);
         guest.snapshot(outcome)
     };

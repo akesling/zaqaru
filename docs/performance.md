@@ -673,3 +673,12 @@ In the order it pays.
   interpreter sits. Every attempt to get there for arbitrary code has
   lost to the cost of guessing what will run; the bytecode gets 1.3–4× by
   not guessing.
+
+## 9. Register-file bounds checks (2026-09-13)
+
+Padding the bytecode interpreter's local register array to the full five-bit
+operand range measured **1.149×** geometric-mean throughput across 15 C
+workloads in a local Docker amd64 run on Apple Silicon. This is an experiment
+under host emulation, not a native x86-64 result or a Python application claim.
+See [the experiment report](register-file-experiment.md) for per-workload
+numbers, baseline hashes, correctness checks, and reproduction commands.
