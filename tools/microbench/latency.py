@@ -27,6 +27,9 @@ Four numbers, because a server has more than one kind of slow:
 
 import http.client
 import json
+import os
+from pathlib import Path
+from measure import metadata
 import statistics
 import subprocess
 import sys
@@ -79,7 +82,7 @@ def await_idle(pid: int, limit: float) -> float:
         time.sleep(1.0)
         current = cpu_ticks(pid)
         used, previous = current - previous, current
-        if used >= 40:
+        if used >= os.sysconf("SC_CLK_TCK") * 0.4:
             busy, calm = True, 0
         elif busy:
             calm += 1
@@ -123,35 +126,43 @@ def percentiles(samples: list[float]) -> dict[str, float]:
     }
 
 
-def measure(port: int, label: str, ready: float) -> dict:
-    cold = fetch(port)[1]
+def checked_fetch(port: int) -> float:
+    status, seconds, size = fetch(port)
+    if status != 200 or size == 0:
+        raise ValueError(f"port {port}: HTTP {status}, {size} bytes")
+    return seconds
+
+
+def measure(port: int, label: str, ready: float, pristine: bool = True) -> dict:
+    cold = checked_fetch(port)
     for _ in range(WARMUP):
-        fetch(port)
+        checked_fetch(port)
 
     sequential = []
     for _ in range(SEQUENTIAL):
-        status, seconds, size = fetch(port)
-        if status != 200:
-            raise SystemExit(f"{label}: got {status}")
-        sequential.append(seconds)
+        sequential.append(checked_fetch(port))
 
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(fetch, port) for _ in range(CONCURRENCY * EACH)]
-        concurrent = [future.result()[1] for future in futures]
+        futures = [pool.submit(checked_fetch, port) for _ in range(CONCURRENCY * EACH)]
+        concurrent = [future.result() for future in futures]
     wall = time.perf_counter() - started
 
     result = {
         "ready_seconds": ready,
-        "cold_ms": cold * 1000,
+        "cold_ms": cold * 1000 if pristine else None,
+        "post_readiness_ms": cold * 1000,
+        "readiness_method": "cpu_idle" if pristine else "http_poll",
+        "samples": {"sequential": sequential, "concurrent": concurrent},
+        "metadata": metadata(),
         "sequential": percentiles(sequential),
         "sequential_rps": len(sequential) / sum(sequential),
         "concurrent": percentiles(concurrent),
         "concurrent_rps": len(concurrent) / wall,
     }
     print(f"\n{label}")
-    print(f"  start-up to first 200   {ready:8.2f} s")
-    print(f"  first request after     {cold * 1000:8.1f} ms")
+    print(f"  readiness observed      {ready:8.2f} s")
+    print(f"  {'first request' if pristine else 'post-readiness request'} {cold * 1000:8.1f} ms")
     s = result["sequential"]
     print(f"  sequential  min {s['min']:8.1f}  p50 {s['p50']:8.1f}  "
           f"p90 {s['p90']:8.1f}  p99 {s['p99']:8.1f}  max {s['max']:8.1f} ms")
@@ -170,11 +181,9 @@ def main() -> None:
     # A pid means "wait for it to go quiet" rather than "ask it".
     pid = int(sys.argv[4]) if len(sys.argv) > 4 else None
     ready = await_idle(pid, limit) if pid else await_ready(port, limit)
-    status, _, _ = fetch(port)
-    if status != 200:
-        raise SystemExit(f"{which}: quiet, but answered {status} rather than 200")
-    result = measure(port, which, ready)
+    result = measure(port, which, ready, pristine=pid is not None)
     out = f"/tmp/microbench/latency.{which}.json"
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as file:
         json.dump(result, file, indent=2)
     print(f"written to {out}")

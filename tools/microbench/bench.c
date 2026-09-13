@@ -1,4 +1,4 @@
-/* Nine workload shapes, one binary, so that one rootfs and one bake cover
+/* Fifteen workload shapes, one binary, so that one rootfs and one bake cover
  * all of them and the only thing differing between runs is the argument.
  *
  * Every kernel is deterministic and prints a checksum. The checksum is not
@@ -86,9 +86,9 @@ static uint64_t kernel_loads(uint64_t rounds) {
     return acc;
 }
 static uint64_t kernel_stores(uint64_t rounds) {
-    uint64_t buf = 0, *p = &buf;
+    uint64_t buf = 0, *p = &buf, value = 42;
     for (uint64_t i = 0; i < rounds; i++)
-        __asm__ volatile(R60("mov %%rax, (%0)\n\t") : : "r"(p) : "rax","memory");
+        __asm__ volatile(R60("mov %1, (%0)\n\t") : : "r"(p), "r"(value) : "memory");
     return buf;
 }
 
