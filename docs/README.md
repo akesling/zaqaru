@@ -1,5 +1,7 @@
 # docs
 
+- [Optimization report](reports/optimization.html) — standalone HTML summary of
+  the benchmark work, engine improvements, browser specialization and remaining limits.
 - [architecture.md](architecture.md) — how zaqaru works: the artifact, the
   machine, the kernel, the host boundary, the bake, and the determinism
   that falls out of them.

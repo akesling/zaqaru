@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Zaqaru browser optimization experiment</title>
+<h1>Browser continuation experiment</h1>
+<p>The optimizer and x86 executors run locally in this browser worker.</p>
+<pre id="log"></pre>
+<script type="module">
+const worker = new Worker('./browser-worker.mjs', {type: 'module'});
+worker.onmessage = ({data}) => {
+  document.querySelector('#log').textContent += (data.message ?? JSON.stringify(data, null, 2)) + '\n';
+  if (data.result || data.error) window.experimentResult = data;
+};
+worker.onerror = event => { window.experimentResult = {error: event.message}; };
+</script>

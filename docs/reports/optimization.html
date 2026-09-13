@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zaqaru — optimization progress</title>
+<style>
+:root{color-scheme:light;--ink:#142c34;--muted:#50666e;--paper:#f5f4ed;--line:#cbd5d2;--green:#066b59;--blue:#426cbd;--gold:#b77416}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1120px;margin:auto;padding:56px 32px 40px}a{color:var(--green);text-underline-offset:3px}a:focus-visible,summary:focus-visible{outline:3px solid var(--gold);outline-offset:4px}.eyebrow{font:700 12px/1.5 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.13em;color:var(--green)}h1{font-size:clamp(38px,6vw,68px);line-height:1.04;letter-spacing:-.045em;margin:18px 0 22px;max-width:850px}h2{font-size:25px;line-height:1.2;letter-spacing:-.025em;margin:0 0 20px}h3{font-size:17px;margin:0 0 7px}p{margin:0 0 14px}.lead{font-size:20px;max-width:850px;color:var(--muted)}.scope{font-size:13px;color:var(--muted);margin-top:23px}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:32px 0}.metric{background:#fff;border:1px solid var(--line);border-top:4px solid var(--green);padding:22px}.number{display:block;font-size:43px;letter-spacing:-.04em;font-weight:750;line-height:1.15}.metric strong{display:block;margin:8px 0}.metric p{font-size:13px;color:var(--muted);margin:0}section{border-top:1px solid var(--line);padding-top:28px;margin-top:32px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:30px}.step{display:grid;grid-template-columns:32px 1fr;gap:12px;margin-bottom:20px}.stepnum{color:var(--green);font:700 15px ui-monospace,monospace;padding-top:3px}.step p{font-size:14px;color:var(--muted);margin:0}.tag{font:12px ui-monospace,monospace;color:var(--muted)}.tablewrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:14px}th{text-align:left;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}th,td{padding:11px 12px 11px 0;border-bottom:1px solid var(--line);vertical-align:top}td:last-child,th:last-child{padding-right:0}.nowrap{white-space:nowrap}.note{font-size:13px;color:var(--muted);margin-top:12px}.callout{background:#e6eee8;border-left:4px solid var(--green);padding:18px 20px;margin-top:20px}.callout p:last-child{margin-bottom:0}.warning{background:#f1e9d9;border-color:var(--gold)}.bars{margin:24px 0}.barrow{display:grid;grid-template-columns:115px 1fr 85px;gap:12px;align-items:center;margin:12px 0;font-size:13px}.track{display:flex;height:28px;background:#e4e7e2;border-radius:3px;overflow:hidden}.baseline{background:var(--ink)}.transition{background:var(--gold)}.execution{background:var(--green)}.legend{display:flex;flex-wrap:wrap;gap:18px;font-size:12px;color:var(--muted)}.key{display:inline-block;width:10px;height:10px;margin-right:6px}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:20px 0}.flow div{border:1px solid var(--line);background:white;padding:15px;font-size:13px}.flow b{display:block;margin-bottom:6px}.flow span{color:var(--muted)}ul,ol{padding-left:21px;margin:12px 0}li{margin:7px 0}code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}code{font-size:.85em}pre{background:var(--ink);color:#f0f6ee;padding:18px;overflow:auto;font-size:12px;line-height:1.7;border-radius:4px}summary{cursor:pointer;color:var(--green);font-weight:650;padding:12px 0}details{margin-top:12px}footer{border-top:1px solid var(--line);margin-top:34px;padding-top:20px;color:var(--muted);font-size:12px}.sources{display:flex;flex-wrap:wrap;gap:10px 22px}.small{font-size:14px;color:var(--muted)}
+@media(max-width:720px){main{padding:30px 20px}.metrics,.grid{grid-template-columns:1fr}.flow{grid-template-columns:1fr 1fr}.number{font-size:36px}.barrow{grid-template-columns:90px 1fr 65px;gap:8px}.lead{font-size:18px}}
+@media print{body{background:white;font-size:11px}main{max-width:none;padding:0}h1{font-size:36px}.lead{font-size:14px}.metrics{gap:10px}.metric{padding:12px}.number{font-size:28px}section{margin-top:20px;padding-top:18px}.metric,.step,.flow,table{break-inside:avoid}a{color:inherit}pre{white-space:pre-wrap}details{display:none}}
+</style>
+</head>
+<body>
+<main>
+<header>
+<div class="eyebrow">Zaqaru / engineering report / 13 September 2026</div>
+<h1>Less interpretation.<br>More execution.</h1>
+<p class="lead">We improved the existing engine, built trustworthy local comparisons, and demonstrated live x86 specialization inside a browser. Large gains are real in selected workloads; a general 2× container speedup remains unproven.</p>
+<p class="scope">Scope: arbitrary x86 / OCI programs · No language-specific shortcuts · Two store imports · Manual benchmarks only · Branch <code>perf/two-times-exploration</code></p>
+</header>
+<div class="metrics" aria-label="Three distinct performance results">
+<article class="metric"><span class="number">+14.9%</span><strong>Benchmark-suite throughput</strong><p>Geometric mean across 15 kernels after removing register bounds checks. Local amd64 Docker; five repetitions. Individual gains vary.</p></article>
+<article class="metric"><span class="number">3.76–8.23×</span><strong>Specialized engine loops</strong><p>Four isolated x86 fixtures versus the updated baseline. Compilation excluded. These are not application results.</p></article>
+<article class="metric"><span class="number">3.97×</span><strong>One long browser workload</strong><p>Mixed arithmetic/memory tail, including the successor transition. One Chrome sample; initial startup and warmup excluded.</p></article>
+</div>
+<section>
+<h2>What changed</h2>
+<div class="grid">
+<div>
+<article class="step"><span class="stepnum">01</span><div><h3>Repair the measurement foundation</h3><p>Added checksum validation, completed-work checks, instruction-count comparisons, fresh baked modules, interleaved A/B ordering, raw samples and environment hashes. Fixed the differential reference to disable acceleration. Wrapped local Docker builds, tests and measurements in scripts. Kept all benchmark validation out of CI.</p><span class="tag">6cdf119 · 57ad2ff · 0cec2b9</span></div></article>
+<article class="step"><span class="stepnum">02</span><div><h3>Make register indices provably safe</h3><p>Expanded the bytecode interpreter’s local register array from 24 to 32 slots, matching its five-bit operand encoding. The compiler can remove per-operand bounds checks. Only 16 architectural registers are copied back; guest state and bytecode format stay the same.</p><span class="tag">faf6988 · default engine</span></div></article>
+<article class="step"><span class="stepnum">03</span><div><h3>Specialize the existing interpreter</h3><p>Used weval to turn constant decoded bytecode and instruction addresses into Wasm functions. Registers, flags, permissions, memory and execution budgets remain dynamic. This reuses the engine’s x86 semantics instead of maintaining a second instruction implementation.</p><span class="tag">4862b4c · opt-in experiment</span></div></article>
+</div>
+<div>
+<article class="step"><span class="stepnum">04</span><div><h3>Compile live continuations in the browser</h3><p>Ported the evaluator into a Wasm optimizer Block with the two existing StructFS imports. Hot-trace profiling selects up to 32 traces; a frozen source snapshot becomes a specialized successor. Trace identities and a small lookup cache avoid repeatedly comparing whole bytecode buffers.</p><span class="tag">9b7edb9 · opt-in evolution</span></div></article>
+<article class="step"><span class="stepnum">05</span><div><h3>Remove fallback and transfer costs</h3><p>Added high-byte ALU lowering for supported AH/BH/CH/DH forms, preserving neighboring bytes and flags. This removed a costly fallback in the mixed workload. Cached compiled trace transfers now stay inside the bytecode runner, returning to the engine when invalidation or other handling is needed.</p><span class="tag">9b7edb9 · 26854b4</span></div></article>
+<article class="step"><span class="stepnum">06</span><div><h3>Make experiments reviewable</h3><p>Added repeatable build and browser/Node scripts, artifact hashes, exact continuation checks and timing that includes the transition. Fixed a browser harness navigation race. Committed each milestone separately.</p><span class="tag">839f057 · no CI overhead</span></div></article>
+</div>
+</div>
+</section>
+<section>
+<h2>Results, with the boundaries intact</h2>
+<p class="small">The register-array comparison uses <code>57ad2ff</code> as its baseline. All later historical comparisons use <code>faf6988</code>, which already includes that improvement. We do not count the 14.9% gain twice or combine results from different hosts into one score.</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Experiment</th><th>Execution gain</th><th>Cost &amp; interpretation</th></tr></thead>
+<tbody>
+<tr><td>Register array · 15 kernels</td><td class="nowrap">1.149× aggregate</td><td>Local amd64 Docker on Apple Silicon. Loads: 1.472×; calls: 1.217×. String and float: 0.993× each.</td></tr>
+<tr><td>Four specialized loops</td><td class="nowrap">3.76–8.23×</td><td>Five alternating pairs per fixture. About one second to specialize four functions, excluded from loop timings.</td></tr>
+<tr><td>Browser mixed · short</td><td class="nowrap">6.89× tail</td><td>408 ms baseline; 59 ms successor; 2.21 s transition. Including transition: <strong>0.18×</strong>, a slowdown.</td></tr>
+<tr><td>Browser mixed · long</td><td class="nowrap">12.06× tail</td><td>9.75 s baseline; 0.81 s successor; 1.65 s transition. Including transition: <strong>3.97×</strong>.</td></tr>
+<tr><td>Calls · cached transfer loop</td><td class="nowrap">1.31× → 1.44×</td><td>Median historical-baseline ratios from three interleaved Node samples per variant. Successor median: 92.3 → 84.4 ms. Chrome after-change checks: 1.18–1.33×.</td></tr>
+</tbody></table></div>
+<p class="note">Browser mixed results are individual exploratory samples. Historical warmup can differ by one scheduler quantum; tail speedups are normalized by remaining retired work. Calls still loses once compilation is included. Docker builds the browser fixtures; the browser/Node Wasm timings execute on the local host, not inside amd64 Docker.</p>
+<div class="grid">
+<div>
+<h3>Where compilation pays back</h3>
+<p class="small">Long mixed workload in Chrome: elapsed time after warmup, including the transition.</p>
+<div class="bars" role="img" aria-label="Historical baseline 9.75 seconds. Successor transition 1.65 seconds plus execution 0.81 seconds, totaling 2.46 seconds.">
+<div class="barrow"><span>Historical</span><div class="track"><span class="baseline" style="width:100%"></span></div><b>9.75 s</b></div>
+<div class="barrow"><span>Successor</span><div class="track"><span class="transition" style="width:16.92%"></span><span class="execution" style="width:8.31%"></span></div><b>2.46 s</b></div>
+</div>
+<div class="legend"><span><i class="key transition"></i>Transition</span><span><i class="key execution"></i>Execution</span></div>
+</div>
+<div class="callout warning"><h3>What did not work</h3><p class="small">A trace abstraction regressed normal ALU and random-memory execution by 13–15% and was removed. A later six-workload scaffold check still measured a 0.965× geometric mean; normal-build overhead remains unresolved. An early rotate fixture exited before completing its loop, so its timing was rejected and completion checks were added.</p></div>
+</div>
+<details><summary>Full register-array results and specialized loop breakdown</summary>
+<div class="tablewrap"><table><thead><tr><th>Kernel</th><th>Speedup</th><th>Kernel</th><th>Speedup</th></tr></thead><tbody>
+<tr><td>Mixed</td><td>1.062×</td><td>Nops</td><td>1.180×</td></tr>
+<tr><td>Register moves</td><td>1.222×</td><td>Register adds</td><td>1.077×</td></tr>
+<tr><td>Loads</td><td>1.472×</td><td>Stores</td><td>1.238×</td></tr>
+<tr><td>ALU</td><td>1.157×</td><td>Sequential memory</td><td>1.205×</td></tr>
+<tr><td>Random memory</td><td>1.103×</td><td>Calls</td><td>1.217×</td></tr>
+<tr><td>Branches</td><td>1.238×</td><td>Strings</td><td>0.993×</td></tr>
+<tr><td>Floating point</td><td>0.993×</td><td>Syscalls</td><td>1.034×</td></tr>
+<tr><td>Allocation</td><td>1.136×</td><td>Geometric mean</td><td>1.149×</td></tr>
+</tbody></table></div>
+<p class="note">Specialized single-trace fixtures: arithmetic/rotate 7.77×; permission-checked indexed memory 3.76×; flags/carry/conditional moves/partial writes 5.88×; multiply/shift 8.23×.</p>
+</details>
+</section>
+<section>
+<h2>A browser-capable path to Assembly evolution</h2>
+<p>The intended architecture is an optimizer producing generated Wasm executor Blocks, with a controller composing an immutable successor Assembly and explicitly transferring continuation ownership. There are no new host imports and no store that silently replaces a running module.</p>
+<div class="flow" aria-label="Implemented continuation experiment, in order">
+<div><b>1 / Observe &amp; freeze</b><span>Profile live x86 traces, stop the source and capture memory plus mount state.</span></div>
+<div><b>2 / Specialize</b><span>The Wasm optimizer evaluates known bytecode and emits successor Wasm.</span></div>
+<div><b>3 / Instantiate</b><span>Create a frozen successor with the continuation and existing store interface.</span></div>
+<div><b>4 / Transfer &amp; resume</b><span>Retire the source, activate the successor once and compare completed work.</span></div>
+</div>
+<div class="callout"><p><strong>Implemented:</strong> compilation inside Wasm and execution in an actual Chrome Worker, plus Node validation. Executor imports remain <code>env.ll_read</code> and <code>env.ll_write</code>; the compiler Block uses <code>structfs.read</code> and <code>structfs.write</code>.</p><p><strong>Still a prototype:</strong> the demo drives instances directly. Assembly-managed activation, exclusive controller authority, lineage validation, failure recovery and live external-resource handoff are not implemented. Freeze/resume tokens are bookkeeping, not security capabilities.</p></div>
+<p class="note">Current limits: one optimization generation, compilation while frozen, at most 32 selected traces, a roughly 3.3 MiB compiler and about 595 MiB of guest memory in the fixture. Mobile-browser suitability is untested. AOT/server-side optimization remains useful; optimization available inside the browser has priority.</p>
+</section>
+<section class="grid">
+<div><h2>Correctness evidence</h2><ul class="small">
+<li><strong>81 CPU unit and bytecode tests passed</strong>, including high-byte ALU flags, neighboring-register preservation and fault behavior.</li>
+<li><strong>560 specialization comparisons</strong> covered registers, flags, RIP, retired work, memory, faults, deferral, budgets and dirty code across the four fixtures.</li>
+<li><strong>Four artifact tests passed</strong> for import remapping, duplicate imports, snapshot replacement and unsupported globals.</li>
+<li><strong>Browser and Node checks passed</strong> for matching output, process state, instruction counts, compiled execution, frozen refusal and one-time activation.</li>
+<li>Hardware lockstep validation failed at <code>PTRACE_GETREGS</code> under local amd64 Docker. Native x86 performance and full x86 specialization correctness remain unverified.</li>
+</ul></div>
+<div><h2>What must happen next</h2><ol class="small">
+<li><strong>Reduce cross-trace state traffic.</strong> Call-heavy code has nearly complete compiled coverage but remains below 2×. The new transfer loop still spills machine state between compiled functions.</li>
+<li><strong>Make transitions safe and economical.</strong> Implement the Assembly controller and recovery path, measure compilation payback, and handle changing hot code across generations.</li>
+<li><strong>Broaden end-to-end evidence.</strong> Measure diverse OCI images, startup, steady execution and request latency separately, including compilation and all regressions.</li>
+<li><strong>Recheck ordinary execution.</strong> Resolve scaffold overhead and validate on native x86-64 when available. Local Docker remains the working environment.</li>
+</ol><p class="small">Language-runtime replacement and Python-specific fast paths remain out of scope. Supplemental Python rootfs runs stopped at the existing unsupported <code>sysinfo</code> syscall; no Python or Django gain is claimed.</p></div>
+</section>
+<section>
+<h2>Reproduce and inspect</h2>
+<p class="small">Run from the repository root. These are manual tools; no benchmark CI was added to the final branch.</p>
+<pre><code># Saved baseline/candidate comparison and correctness checks
+./tools/microbench/experiment.sh ab --repeats 5
+./tools/microbench/experiment.sh test
+
+# Four specialized engine fixtures
+./tools/microbench/specialize.sh
+
+# Browser continuation (prepare sources and dependencies first)
+bash tools/evolution/run.sh prepare /path/to/structfs
+bash tools/evolution/run.sh build mixed 100000000
+bash tools/evolution/run.sh browser
+# Alternatives: build calls 40; run.sh node</code></pre>
+<p class="note">A/B requires previously saved baseline and candidate executables. The preparation step downloads pinned dependencies; Chrome is required for the browser harness. Raw timing JSON, generated artifacts and hashes live in ignored <code>benchmark-results/</code>. This report embeds its styling and charts and needs no network or JavaScript to read; the source links below resolve within the repository.</p>
+<nav class="sources" aria-label="Supporting experiment records">
+<a href="../../tools/microbench/README.md">Benchmark guide</a>
+<a href="../register-file-experiment.md">Register-array measurements</a>
+<a href="../two-times-exploration.md">Specialization research log</a>
+<a href="../../tools/evolution/README.md">Browser experiment and limits</a>
+</nav>
+</section>
+<footer>Report covers optimization work through <code>839f057</code>. The browser architecture above supersedes the older compiler-store and direct-host-import proposals preserved in the research log. Selected workloads exceed 2×; arbitrary-container acceleration has not yet been established.</footer>
+</main>
+</body>
+</html>
