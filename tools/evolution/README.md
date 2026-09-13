@@ -90,6 +90,19 @@ The calls workload (`calls 40`) measured only about **1.27×** against `faf6988`
 in Node, despite nearly complete compiled coverage, and lost when transition cost
 was included. Frequent transfers between traces remain a limiting case.
 
+Keeping cached transfers inside the bytecode runner improved the calls experiment
+further. Three interleaved Node samples per variant gave median historical-baseline
+tail speedups of **1.31× before and 1.44× after** (median successor times 92.3 ms
+and 84.4 ms). Two Chrome checks measured 1.18–1.33× after the change. All runs matched
+output and retired work; the short workload still loses when compilation is
+included. This loop returns to the engine for dirty code, cache misses, faults,
+interpreter fallback, and exhausted budgets. It still spills machine state between
+compiled traces, so it does not solve the call-heavy 2× target.
+
+The CPU unit and bytecode suites can run in local Docker. The separate hardware
+lockstep suite currently fails at `PTRACE_GETREGS` under local amd64 emulation;
+it cannot provide hardware-oracle validation in this setup.
+
 ## Still required for Assembly evolution
 
 The demo directly drives source and successor instances. It is **not yet an

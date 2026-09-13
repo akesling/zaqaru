@@ -375,6 +375,7 @@ pub enum Leave {
 /// CPython's per-bytecode `jmp *reg` from round-tripping the run loop. A miss
 /// exits to the run loop, which decodes and transpiles the target (warming the
 /// cache) and re-enters.
+#[derive(Clone, Copy)]
 pub enum Resolver<'a> {
     /// No address cache: every indirect transfer leaves to the run loop. What
     /// the differential harness and the single-block benchmark use.
@@ -414,11 +415,36 @@ pub fn run<'a>(
     resolver: Resolver<'a>,
 ) -> Leave {
     #[cfg(all(feature = "evolution", target_arch = "wasm32"))]
-    if start == 0 {
-        if let Some(leave) = evolution::dispatch(trace, tcb, space, budget) {
-            return leave;
+    {
+        let mut trace = trace;
+        let mut start = start;
+        let mut remaining = budget;
+        loop {
+            let before = tcb.retired;
+            let compiled = if start == 0 {
+                evolution::dispatch(trace, tcb, space, remaining)
+            } else {
+                None
+            };
+            let leave = compiled.unwrap_or_else(|| {
+                run_inner::<false>(trace, start, tcb, space, remaining, resolver, &[], &[])
+            });
+            remaining = remaining.saturating_sub(tcb.retired.wrapping_sub(before));
+            // Cached successors need no outer-engine bookkeeping. Code writes
+            // must return there first so it can invalidate decoded traces.
+            if leave != Leave::Exit || remaining == 0 || space.has_dirty_code() {
+                return leave;
+            }
+            match resolver.resolve(tcb.rip) {
+                Some(next) => {
+                    trace = next;
+                    start = 0;
+                }
+                None => return leave,
+            }
         }
     }
+    #[cfg(not(all(feature = "evolution", target_arch = "wasm32")))]
     run_inner::<false>(trace, start, tcb, space, budget, resolver, &[], &[])
 }
 
