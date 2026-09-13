@@ -70,3 +70,39 @@ performance result:
 ```sh
 cargo run --release -p zaqaru-cpu --example bytecode_bench -- 100000
 ```
+
+## Local performance experiments
+
+`experiment.sh` keeps baseline/candidate results in predictable files and runs
+correctness tests through the same Docker image:
+
+```sh
+./tools/microbench/experiment.sh baseline --repeats 5
+# Change the engine, then use the same workload options.
+./tools/microbench/experiment.sh candidate --repeats 5
+./tools/microbench/experiment.sh compare
+./tools/microbench/experiment.sh test
+```
+
+For an initial experiment, add `--kernels mixed loads stores alu branches calls`
+to both measurement commands. Each measurement replaces its named JSON file;
+copy a baseline before starting a different experiment. Additional diagnostics
+can use `experiment.sh exec COMMAND ARG...` inside the same Linux environment.
+The image uses Rust's bundled Wasm linker so its supported Wasm features match
+the compiler that builds the guest archive.
+
+For drift-resistant A/B timing, save both executables and interleave them within
+each workload (each executable carries its own guest engine):
+
+```sh
+# With the baseline engine sources:
+./tools/microbench/experiment.sh save baseline
+# With the candidate engine sources:
+./tools/microbench/experiment.sh save candidate
+./tools/microbench/experiment.sh ab --repeats 5
+```
+
+This compares bytecode execution of the two versions, checks both against the
+same native checksum, and reports per-workload and geometric-mean speedups.
+Executable hashes are included in `benchmark-results/ab.json`. The lower-level
+runner accepts `--binary`, `--against`, and `--modes` for other combinations.

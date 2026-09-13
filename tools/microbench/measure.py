@@ -13,6 +13,8 @@ import json
 import os
 import platform
 import re
+import statistics
+import sys
 import subprocess
 import tempfile
 import time
@@ -20,7 +22,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 SCALES = {
-    "mixed": 200_000, "nops": 1_000_000, "regmov": 1_000_000,
+    "mixed": 2_000_000, "nops": 1_000_000, "regmov": 1_000_000,
     "regadd": 1_000_000, "loads": 1_000_000, "stores": 1_000_000,
     "alu": 7_000_000, "memory_sequential": 2, "memory_random": 8_000_000,
     "calls": 150, "branches": 1_500_000, "string": 2_500,
@@ -76,6 +78,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernels", nargs="+", choices=SCALES, default=list(SCALES))
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--binary", type=Path, help="Use an already-built Zaqaru executable")
+    parser.add_argument("--against", type=Path, help="Interleave a saved baseline executable in bytecode mode")
+    parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     parser.add_argument("--core", type=int, default=None)
     parser.add_argument("--scale-factor", type=float, default=1.0)
     parser.add_argument("--output", type=Path, default=Path("/tmp/microbench/results.json"))
@@ -88,13 +93,18 @@ def main():
     core = args.core if args.core is not None else allowed[0]
     if core not in allowed:
         parser.error(f"core {core} is unavailable; allowed: {allowed}")
-    binary = REPO / "target/release/zaqaru"
-    subprocess.run(["cargo", "build", "--locked", "--release", "-p", "zaqaru"], cwd=REPO, check=True)
+    binary = (args.binary or REPO / "target/release/zaqaru").resolve()
+    if args.binary is None:
+        subprocess.run(["cargo", "build", "--locked", "--release", "-p", "zaqaru"], cwd=REPO, check=True)
+    baseline = args.against.resolve() if args.against else None
+    modes = tuple(args.modes) + (("baseline",) if baseline else ())
     info = metadata()
-    info.update({"core": core, "repeats": args.repeats,
+    info.update({"core": core, "repeats": args.repeats, "modes": modes,
                  "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                  "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
                  "compiler": subprocess.check_output(["gcc", "--version"], text=True).splitlines()[0]})
+    if baseline:
+        info["baseline_sha256"] = hashlib.sha256(baseline.read_bytes()).hexdigest()
     results = {"schema": 1, "metadata": info, "kernels": {}}
     with tempfile.TemporaryDirectory(prefix="zaqaru-bench-") as tmp:
         work = Path(tmp)
@@ -104,29 +114,31 @@ def main():
                         str(REPO / "tools/microbench/bench.c"), "-lm"], check=True)
         modules = {}
 
-        def bake(name, scale):
-            key = (name, scale)
+        def bake(name, scale, executable=binary):
+            key = (executable, name, scale)
             if key not in modules:
-                path = work / f"{name}.{scale}.wasm"
-                subprocess.run([str(binary), "bake", str(root), "-o", str(path),
+                path = work / f"{len(modules)}.{name}.{scale}.wasm"
+                subprocess.run([str(executable), "bake", str(root), "-o", str(path),
                                 "--", "/init", name, str(scale)], check=True, capture_output=True)
                 modules[key] = path
             return modules[key]
 
         def run(mode, name, scale):
+            executable = baseline if mode == "baseline" else binary
             command = ([str(root / "init"), name, str(scale)] if mode == "native" else
-                       [str(binary), "run", str(bake(name, scale)), "--seed", "1"] +
+                       [str(executable), "run", str(bake(name, scale, executable)), "--seed", "1"] +
                        (["--no-bytecode"] if mode == "interpreter" else []))
             start = time.perf_counter()
             done = subprocess.run(["taskset", "-c", str(core), *command],
                                   capture_output=True, text=True, check=True, timeout=600)
             return parse_sample(done.stdout, done.stderr, name, time.perf_counter() - start, mode)
 
-        results["fixed"] = {mode: [run(mode, "noop", 0) for _ in range(args.repeats)] for mode in MODES}
+        results["fixed"] = {mode: [run(mode, "noop", 0) for _ in range(args.repeats)] for mode in modes}
         for name in args.kernels:
             scale = max(1, int(SCALES[name] * args.scale_factor))
+            print(f"Measuring {name}...", flush=True)
             native_scale = scale
-            while run("native", name, native_scale)["total"] < 0.3:
+            while "native" in modes and run("native", name, native_scale)["total"] < 0.3:
                 native_scale *= 2
                 if native_scale > 1 << 40:
                     raise ValueError(f"{name}: native calibration failed")
@@ -134,32 +146,45 @@ def main():
             # Baking must happen outside timing, including the first sample.
             for s in expected:
                 bake(name, s)
-            samples = {mode: [[], []] for mode in MODES}
+                if baseline:
+                    bake(name, s, baseline)
+            samples = {mode: [[], []] for mode in modes}
             for repeat in range(args.repeats):
-                modes = MODES[repeat % 3:] + MODES[:repeat % 3]
+                order = modes[repeat % len(modes):] + modes[:repeat % len(modes)]
                 for factor in (1, 2):
-                    for mode in modes:
+                    for mode in order:
                         at = (native_scale if mode == "native" else scale) * factor
                         row = run(mode, name, at)
                         samples[mode][factor - 1].append(row)
                         if mode != "native" and row["answer"] != expected[at]:
                             raise ValueError(f"{mode}/{name}/{at}: checksum mismatch")
             rows = {mode: summarize(*samples[mode], native_scale if mode == "native" else scale)
-                    for mode in MODES}
-            for mode in MODES:
+                    for mode in modes}
+            for mode in modes:
                 for group in samples[mode]:
                     if len({r["answer"] for r in group}) != 1:
                         raise ValueError(f"{mode}/{name}: unstable checksum")
-            if rows["interpreter"]["retired"] != rows["bytecode"]["retired"]:
+            if len({r["retired"] for r in rows.values() if "retired" in r}) > 1:
                 raise ValueError(f"{name}: engine retirement counts differ")
             results["kernels"][name] = rows
-            gain = rows["interpreter"]["per_unit"] / rows["bytecode"]["per_unit"]
-            print(f"{name:20s} bytecode {rows['bytecode']['per_unit'] * 1e9:10.1f} ns/unit; "
-                  f"{gain:.2f}x interpreter", flush=True)
+            for mode, row in rows.items():
+                print(f"  {mode:12s} {row['per_unit'] * 1e9:10.1f} ns/unit", flush=True)
+            if baseline and "bytecode" in rows:
+                gain = rows["baseline"]["per_unit"] / rows["bytecode"]["per_unit"]
+                print(f"  candidate speedup: {gain:.3f}x", flush=True)
+    if baseline and "bytecode" in modes:
+        gains = [r["baseline"]["per_unit"] / r["bytecode"]["per_unit"] for r in results["kernels"].values()]
+        results["speedup_geomean"] = statistics.geometric_mean(gains)
+        print(f"Geometric mean speedup: {results['speedup_geomean']:.3f}x", flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(results, indent=2) + "\n")
     print(f"Written to {args.output}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except subprocess.CalledProcessError as error:
+        print(error.stdout or "", file=sys.stderr)
+        print(error.stderr or "", file=sys.stderr)
+        raise
