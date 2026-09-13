@@ -37,8 +37,24 @@ try {
   const command = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
     const key = ++id; pending.set(key, {resolve, reject}); socket.send(JSON.stringify({id:key, method, params, sessionId}));
   });
-  const {targetId} = await command('Target.createTarget', {url:`http://127.0.0.1:${server.address().port}/tools/evolution/index.html`});
+  const {targetId} = await command('Target.createTarget', {url:'about:blank'});
   const {sessionId} = await command('Target.attachToTarget', {targetId, flatten:true});
+  await command('Page.enable', {}, sessionId);
+  // Attach before navigating, then wait for the new document. Evaluating in
+  // the initial about:blank context races its destruction during navigation.
+  const loaded = new Promise(resolve => {
+    const listener = ({data}) => {
+      const event = JSON.parse(data);
+      if (event.sessionId === sessionId && event.method === 'Page.loadEventFired') {
+        socket.removeEventListener('message', listener);
+        resolve();
+      }
+    };
+    socket.addEventListener('message', listener);
+  });
+  const navigation = await command('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/tools/evolution/index.html`}, sessionId);
+  if (navigation.errorText) throw new Error(navigation.errorText);
+  await loaded;
   const result = await command('Runtime.evaluate', {
     expression: 'new Promise((resolve, reject) => { const started = Date.now(); const timer = setInterval(() => { if (window.experimentResult) { clearInterval(timer); resolve(window.experimentResult); } else if (Date.now() - started > 180000) { clearInterval(timer); reject(new Error("experiment timeout")); } }, 100); })',
     awaitPromise:true, returnByValue:true,
