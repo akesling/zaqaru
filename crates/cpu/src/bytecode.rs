@@ -35,6 +35,9 @@ use crate::flags::{Condition, Rule};
 use crate::space::{Fault, Space};
 use crate::state::{Tcb, Width};
 
+mod registers;
+#[cfg(all(feature = "specialize", target_arch = "wasm32"))]
+pub mod specialize;
 pub mod transpile;
 
 pub use transpile::transpile;
@@ -399,20 +402,54 @@ impl<'a> Resolver<'a> {
 /// flushed at a leave, because a faithful fault and a faithful flag are worth
 /// more than avoiding the indirection, and neither is on the hottest path.
 pub fn run<'a>(
-    mut trace: &'a Trace,
+    trace: &'a Trace,
     start: usize,
     tcb: &mut Tcb,
     space: &mut Space,
     budget: u64,
     resolver: Resolver<'a>,
 ) -> Leave {
+    run_inner::<false>(trace, start, tcb, space, budget, resolver, &[], &[])
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn run_inner<'a, const SPECIALIZE: bool>(
+    mut trace: &'a Trace,
+    start: usize,
+    tcb: &mut Tcb,
+    space: &mut Space,
+    budget: u64,
+    resolver: Resolver<'a>,
+    specialized_code: &[Word],
+    specialized_ip: &[u64],
+) -> Leave {
     let mut code = &trace.code;
+    // Preserve the original normal-engine code reference. Only the opt-in
+    // specialization entry reads constant input buffers.
+    macro_rules! word {
+        ($pc:expr) => {
+            if SPECIALIZE {
+                specialized_code[$pc]
+            } else {
+                code[$pc]
+            }
+        };
+    }
+    macro_rules! ip {
+        ($pc:expr) => {
+            if SPECIALIZE {
+                specialized_ip[$pc]
+            } else {
+                trace.ip[$pc]
+            }
+        };
+    }
     // Register operands are masked to five bits below. Back the local file
     // with every encodable slot so indexing is provably in bounds without
     // a branch per operand. The transpiler still allocates only REGISTERS
     // slots, and only the sixteen architectural registers are flushed.
-    let mut regs = [0u64; 32];
-    regs[..crate::state::REGISTER_COUNT].copy_from_slice(&tcb.registers);
+    let mut regs = registers::Registers::<SPECIALIZE>::new(&tcb.registers);
     // The lazy-flags record, held in a local copy through the trace and
     // flushed to the control block only at a leave — so a `cmp`/`jcc` pair, an
     // `adc` chain, a `setcc`, touch a register-resident struct the compiler
@@ -426,7 +463,7 @@ pub fn run<'a>(
     // always read full-width.
     macro_rules! read {
         ($idx:expr, $w:expr) => {
-            regs[$idx as usize] & $w.mask()
+            regs.get($idx as usize) & $w.mask()
         };
     }
     // Writing a register slice with x86's width semantics: a qword or
@@ -435,15 +472,16 @@ pub fn run<'a>(
     // byte.
     macro_rules! write {
         ($idx:expr, $w:expr, $val:expr) => {{
-            let slot = &mut regs[$idx as usize];
-            match $w {
-                Width::Qword => *slot = $val,
-                Width::Dword => *slot = $val & 0xffff_ffff,
+            let value = $val;
+            let value = match $w {
+                Width::Qword => value,
+                Width::Dword => value & 0xffff_ffff,
                 w => {
                     let mask = w.mask();
-                    *slot = (*slot & !mask) | ($val & mask);
+                    (regs.get($idx as usize) & !mask) | (value & mask)
                 }
-            }
+            };
+            regs.set($idx as usize, value);
         }};
     }
     // Copy the register file back to the control block. Called at every
@@ -456,7 +494,8 @@ pub fn run<'a>(
     macro_rules! flush {
         () => {{
             tcb.retired = tcb.retired.wrapping_add(spent);
-            tcb.registers.copy_from_slice(&regs[..crate::state::REGISTER_COUNT]);
+            regs.flush(&mut tcb.registers);
+            registers::leave::<SPECIALIZE>();
             tcb.flags = flags;
         }};
     }
@@ -470,16 +509,22 @@ pub fn run<'a>(
     // stub already sets `rip` to the right place, so leaving is its job.
     macro_rules! break_on_dirty {
         () => {
-            if space.has_dirty_code() && trace.ip[pc] != trace.ip[pc - 1] {
-                tcb.rip = trace.ip[pc];
+            if space.has_dirty_code() && ip!(pc) != ip!(pc - 1) {
+                tcb.rip = ip!(pc);
                 flush!();
                 return Leave::Exit;
             }
         };
     }
 
+    // Context updates follow every PC assignment, before control-flow merges.
+    // Updating only at the loop header lets weval merge different PCs into a
+    // runtime value, preventing dispatch specialization. These are compile-time
+    // no-ops in the normal engine.
+    registers::enter::<SPECIALIZE>();
     loop {
-        let word = code[pc];
+        registers::context::<SPECIALIZE>(pc);
+        let word = word!(pc);
         let op = match Op::from_byte((word >> field::OP) as u8) {
             Some(op) => op,
             // A well-formed trace never holds a byte no op uses.
@@ -491,6 +536,7 @@ pub fn run<'a>(
         let imm = (word >> field::IMM) as u32;
         let retire = (word >> field::RETIRE) & 1 != 0;
         pc += 1;
+        registers::context::<SPECIALIZE>(pc);
 
         match op {
             Op::ExitTo => {
@@ -505,7 +551,7 @@ pub fn run<'a>(
                 if retire {
                     spent += 1;
                 }
-                let target = regs[d];
+                let target = regs.get(d);
                 if spent >= budget {
                     tcb.rip = target;
                     flush!();
@@ -516,6 +562,7 @@ pub fn run<'a>(
                         trace = next;
                         code = &trace.code;
                         pc = 0;
+                        registers::context::<SPECIALIZE>(pc);
                     }
                     None => {
                         tcb.rip = target;
@@ -528,8 +575,9 @@ pub fn run<'a>(
                 // The guest address of the one instruction to interpret is
                 // the following word; `rip` points at it and the caller runs
                 // it, then re-enters at the word after this one.
-                let address = code[pc];
+                let address = word!(pc);
                 pc += 1;
+                registers::context::<SPECIALIZE>(pc);
                 tcb.rip = address;
                 flush!();
                 return Leave::Defer { resume: pc };
@@ -545,11 +593,12 @@ pub fn run<'a>(
                 let target = imm as usize;
                 if target <= pc && spent >= budget {
                     // Resume where execution is: at the branch target.
-                    tcb.rip = trace.ip[target];
+                    tcb.rip = ip!(target);
                     flush!();
                     return Leave::Preempted;
                 }
                 pc = target;
+                registers::context::<SPECIALIZE>(pc);
             }
             Op::BrIf => {
                 let condition = Condition::from_code(((word >> field::CONDITION) & 0xf) as u8)
@@ -562,22 +611,24 @@ pub fn run<'a>(
                     // A taken back-edge is a loop iteration boundary: check the
                     // budget there, in retired-instruction units.
                     if target <= pc && spent >= budget {
-                        tcb.rip = trace.ip[target];
+                        tcb.rip = ip!(target);
                         flush!();
                         return Leave::Preempted;
                     }
                     pc = target;
+                    registers::context::<SPECIALIZE>(pc);
                 }
             }
             Op::Li => {
-                regs[d] = imm as u64;
+                regs.set(d, imm as u64);
                 if retire {
                     spent += 1;
                 }
             }
             Op::Li64 => {
-                regs[d] = code[pc];
+                regs.set(d, word!(pc));
                 pc += 1;
+                registers::context::<SPECIALIZE>(pc);
                 if retire {
                     spent += 1;
                 }
@@ -590,13 +641,7 @@ pub fn run<'a>(
                     spent += 1;
                 }
             }
-            Op::Add
-            | Op::Sub
-            | Op::Or
-            | Op::Xor
-            | Op::And
-            | Op::Cmp
-            | Op::Test => {
+            Op::Add | Op::Sub | Op::Or | Op::Xor | Op::And | Op::Cmp | Op::Test => {
                 let width = width_of(word);
                 let left = read!(a, width);
                 let right = if (word >> field::IMMEDIATE) & 1 != 0 {
@@ -664,11 +709,11 @@ pub fn run<'a>(
             }
             Op::Load => {
                 let width = width_of(word);
-                let address = regs[a].wrapping_add(imm as i32 as i64 as u64);
+                let address = regs.get(a).wrapping_add(imm as i32 as i64 as u64);
                 match space.load(address, width) {
                     Ok(value) => write!(d, width, value),
                     Err(fault) => {
-                        tcb.rip = trace.ip[pc - 1];
+                        tcb.rip = ip!(pc - 1);
                         flush!();
                         return Leave::Fault(fault);
                     }
@@ -679,10 +724,10 @@ pub fn run<'a>(
             }
             Op::Store => {
                 let width = width_of(word);
-                let address = regs[a].wrapping_add(imm as i32 as i64 as u64);
+                let address = regs.get(a).wrapping_add(imm as i32 as i64 as u64);
                 let value = read!(b, width);
                 if let Err(fault) = space.store(address, width, value) {
-                    tcb.rip = trace.ip[pc - 1];
+                    tcb.rip = ip!(pc - 1);
                     flush!();
                     return Leave::Fault(fault);
                 }
@@ -712,14 +757,15 @@ pub fn run<'a>(
             Op::Push => {
                 let width = width_of(word);
                 let value = read!(a, width);
-                let at = regs[crate::state::STACK_POINTER]
+                let at = regs
+                    .get(crate::state::STACK_POINTER)
                     .wrapping_sub(u64::from(width.bytes()));
                 if let Err(fault) = space.store(at, width, value) {
-                    tcb.rip = trace.ip[pc - 1];
+                    tcb.rip = ip!(pc - 1);
                     flush!();
                     return Leave::Fault(fault);
                 }
-                regs[crate::state::STACK_POINTER] = at;
+                regs.set(crate::state::STACK_POINTER, at);
                 if retire {
                     spent += 1;
                 }
@@ -727,15 +773,17 @@ pub fn run<'a>(
             }
             Op::Pop => {
                 let width = width_of(word);
-                let at = regs[crate::state::STACK_POINTER];
+                let at = regs.get(crate::state::STACK_POINTER);
                 match space.load(at, width) {
                     Ok(value) => {
-                        regs[crate::state::STACK_POINTER] =
-                            at.wrapping_add(u64::from(width.bytes()));
+                        regs.set(
+                            crate::state::STACK_POINTER,
+                            at.wrapping_add(u64::from(width.bytes())),
+                        );
                         write!(d, width, value);
                     }
                     Err(fault) => {
-                        tcb.rip = trace.ip[pc - 1];
+                        tcb.rip = ip!(pc - 1);
                         flush!();
                         return Leave::Fault(fault);
                     }
@@ -746,22 +794,23 @@ pub fn run<'a>(
             }
             Op::Lea => {
                 let scale = 1u64 << ((word >> field::CONDITION) & 0b11);
-                let value = regs[a]
-                    .wrapping_add(regs[b].wrapping_mul(scale))
+                let value = regs
+                    .get(a)
+                    .wrapping_add(regs.get(b).wrapping_mul(scale))
                     .wrapping_add(imm as i32 as i64 as u64);
-                regs[d] = value;
+                regs.set(d, value);
                 if retire {
                     spent += 1;
                 }
             }
             Op::Narrow => {
-                regs[d] = regs[a] & 0xffff_ffff;
+                regs.set(d, regs.get(a) & 0xffff_ffff);
                 if retire {
                     spent += 1;
                 }
             }
             Op::LoadFs => {
-                regs[d] = tcb.fs_base;
+                regs.set(d, tcb.fs_base);
                 if retire {
                     spent += 1;
                 }
@@ -774,7 +823,7 @@ pub fn run<'a>(
                 let count = (if (word >> field::IMMEDIATE) & 1 != 0 {
                     imm as u64
                 } else {
-                    regs[b]
+                    regs.get(b)
                 }) & if width == Width::Qword { 0x3f } else { 0x1f };
                 let left = read!(a, width);
                 let result = width.truncate(match op {
@@ -817,7 +866,7 @@ pub fn run<'a>(
                 let raw = if (word >> field::IMMEDIATE) & 1 != 0 {
                     imm as u64
                 } else {
-                    regs[b]
+                    regs.get(b)
                 };
                 let count = raw & if width == Width::Qword { 0x3f } else { 0x1f };
                 let value = read!(a, width);
@@ -872,19 +921,22 @@ pub fn run<'a>(
                 let carry = u64::from(flags.carry());
                 let (result, rule) = match op {
                     Op::Adc => (left.wrapping_add(right).wrapping_add(carry), Rule::AddCarry),
-                    _ => (left.wrapping_sub(right).wrapping_sub(carry), Rule::SubBorrow),
+                    _ => (
+                        left.wrapping_sub(right).wrapping_sub(carry),
+                        Rule::SubBorrow,
+                    ),
                 };
                 let result = width.truncate(result);
-                flags
-                    .record_with_carry(rule, width, left, right, result, carry == 1);
+                flags.record_with_carry(rule, width, left, right, result, carry == 1);
                 write!(d, width, result);
                 if retire {
                     spent += 1;
                 }
             }
             Op::FusedBranch => {
-                let control = code[pc];
+                let control = word!(pc);
                 pc += 1;
+                registers::context::<SPECIALIZE>(pc);
                 let width = width_of(word);
                 let condition = Condition::from_code(((word >> field::CONDITION) & 0xf) as u8)
                     .expect("a four-bit condition is one of sixteen");
@@ -894,8 +946,8 @@ pub fn run<'a>(
                 } else {
                     read!(b, width)
                 };
-                let producer = Op::from_byte((control >> 32) as u8)
-                    .expect("the fused producer is a real op");
+                let producer =
+                    Op::from_byte((control >> 32) as u8).expect("the fused producer is a real op");
                 let target = (control & 0xffff_ffff) as usize;
                 let live_after = (control >> 40) & 1 != 0;
                 // The producer decides the result, the flag rule, and whether
@@ -935,11 +987,12 @@ pub fn run<'a>(
                 spent += 2;
                 if holds {
                     if target <= pc && spent >= budget {
-                        tcb.rip = trace.ip[target];
+                        tcb.rip = ip!(target);
                         flush!();
                         return Leave::Preempted;
                     }
                     pc = target;
+                    registers::context::<SPECIALIZE>(pc);
                 }
             }
             Op::Div | Op::Idiv => {
@@ -949,13 +1002,13 @@ pub fn run<'a>(
                 // the fault at the right address: `rip` names this instruction
                 // and it did not retire, so re-interpreting it is exact.
                 if divisor == 0 {
-                    tcb.rip = trace.ip[pc - 1];
+                    tcb.rip = ip!(pc - 1);
                     flush!();
                     return Leave::Defer { resume: pc };
                 }
                 let bits = u64::from(width.bits());
-                let low = regs[0] & width.mask(); // RAX
-                let high = regs[2] & width.mask(); // RDX
+                let low = regs.get(0) & width.mask(); // RAX
+                let high = regs.get(2) & width.mask(); // RDX
                 let dividend = (u128::from(high) << bits) | u128::from(low);
                 let (quotient, remainder, overflows) = if matches!(op, Op::Idiv) {
                     let shift = 128 - bits * 2;
@@ -972,10 +1025,14 @@ pub fn run<'a>(
                 } else {
                     let divisor = u128::from(divisor);
                     let quotient = dividend / divisor;
-                    (quotient, dividend % divisor, quotient > u128::from(width.mask()))
+                    (
+                        quotient,
+                        dividend % divisor,
+                        quotient > u128::from(width.mask()),
+                    )
                 };
                 if overflows {
-                    tcb.rip = trace.ip[pc - 1];
+                    tcb.rip = ip!(pc - 1);
                     flush!();
                     return Leave::Defer { resume: pc };
                 }
@@ -985,21 +1042,16 @@ pub fn run<'a>(
                     spent += 1;
                 }
             }
-            Op::VecMov
-            | Op::VecStore
-            | Op::VecAnd
-            | Op::VecXor
-            | Op::VecCmpEqB
-            | Op::VecMask => {
+            Op::VecMov | Op::VecStore | Op::VecAnd | Op::VecXor | Op::VecCmpEqB | Op::VecMask => {
                 // The source's sixteen bytes: another XMM register, or memory
-                // at `regs[a] + imm` (the immediate modifier selects it). A
+                // at `regs.get(a) + imm` (the immediate modifier selects it). A
                 // memory access faults like any other.
                 let from_memory = (word >> field::IMMEDIATE) & 1 != 0;
                 let source: [u8; 16] = if from_memory && !matches!(op, Op::VecStore) {
-                    let address = regs[a].wrapping_add(imm as i32 as i64 as u64);
+                    let address = regs.get(a).wrapping_add(imm as i32 as i64 as u64);
                     let mut bytes = [0u8; 16];
                     if let Err(fault) = space.read(address, &mut bytes) {
-                        tcb.rip = trace.ip[pc - 1];
+                        tcb.rip = ip!(pc - 1);
                         flush!();
                         return Leave::Fault(fault);
                     }
@@ -1012,9 +1064,9 @@ pub fn run<'a>(
                 };
                 match op {
                     Op::VecStore => {
-                        let address = regs[a].wrapping_add(imm as i32 as i64 as u64);
+                        let address = regs.get(a).wrapping_add(imm as i32 as i64 as u64);
                         if let Err(fault) = space.write(address, &source) {
-                            tcb.rip = trace.ip[pc - 1];
+                            tcb.rip = ip!(pc - 1);
                             flush!();
                             return Leave::Fault(fault);
                         }
@@ -1052,11 +1104,11 @@ pub fn run<'a>(
             }
             Op::MemRmw => {
                 let width = width_of(word);
-                let address = regs[a].wrapping_add(imm as i32 as i64 as u64);
+                let address = regs.get(a).wrapping_add(imm as i32 as i64 as u64);
                 let left = match space.load(address, width) {
                     Ok(value) => value,
                     Err(fault) => {
-                        tcb.rip = trace.ip[pc - 1];
+                        tcb.rip = ip!(pc - 1);
                         flush!();
                         return Leave::Fault(fault);
                     }
@@ -1078,7 +1130,7 @@ pub fn run<'a>(
                     flags.record(rule, width, left, right, result);
                 }
                 if let Err(fault) = space.store(address, width, result) {
-                    tcb.rip = trace.ip[pc - 1];
+                    tcb.rip = ip!(pc - 1);
                     flush!();
                     return Leave::Fault(fault);
                 }
@@ -1090,13 +1142,14 @@ pub fn run<'a>(
             Op::LoadX => {
                 let width = width_of(word);
                 let scale = 1u64 << ((word >> field::CONDITION) & 0b11);
-                let address = regs[a]
-                    .wrapping_add(regs[b].wrapping_mul(scale))
+                let address = regs
+                    .get(a)
+                    .wrapping_add(regs.get(b).wrapping_mul(scale))
                     .wrapping_add(imm as i32 as i64 as u64);
                 match space.load(address, width) {
                     Ok(value) => write!(d, width, value),
                     Err(fault) => {
-                        tcb.rip = trace.ip[pc - 1];
+                        tcb.rip = ip!(pc - 1);
                         flush!();
                         return Leave::Fault(fault);
                     }
@@ -1108,12 +1161,13 @@ pub fn run<'a>(
             Op::StoreX => {
                 let width = width_of(word);
                 let scale = 1u64 << ((word >> field::CONDITION) & 0b11);
-                let address = regs[a]
-                    .wrapping_add(regs[b].wrapping_mul(scale))
+                let address = regs
+                    .get(a)
+                    .wrapping_add(regs.get(b).wrapping_mul(scale))
                     .wrapping_add(imm as i32 as i64 as u64);
                 let value = read!(d, width);
                 if let Err(fault) = space.store(address, width, value) {
-                    tcb.rip = trace.ip[pc - 1];
+                    tcb.rip = ip!(pc - 1);
                     flush!();
                     return Leave::Fault(fault);
                 }

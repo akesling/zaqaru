@@ -106,3 +106,24 @@ This compares bytecode execution of the two versions, checks both against the
 same native checksum, and reports per-workload and geometric-mean speedups.
 Executable hashes are included in `benchmark-results/ab.json`. The lower-level
 runner accepts `--binary`, `--against`, and `--modes` for other combinations.
+
+## Manual specialization experiment
+
+```sh
+./tools/microbench/specialize.sh
+# Optional loop iterations (default 10000000):
+./tools/microbench/specialize.sh 20000000
+```
+
+This checksum-pins weval 0.5.0 and uses the same amd64 Docker image. It
+specializes the actual bytecode interpreter for four x86 loops, checks 560
+machine-state comparisons against the actual `faf6988` engine, and times five
+alternating pairs on core 0. The historical sources are extracted locally; the
+script checks that their dependency versions and checksums are preserved. Outputs
+include `benchmark-results/specialize.csv`, `specialize.json`, and `weval.log`.
+
+These are single-trace engine measurements, **not general OCI speedups**.
+Specialization and Wasmtime compilation are outside the timed region. See
+[the experiment record](../../docs/two-times-exploration.md) for scope,
+limitations, and the remaining integration work. This experiment is manual;
+it adds nothing to CI or the normal container build.
