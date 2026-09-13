@@ -113,6 +113,12 @@ fn workspace_root() -> Result<PathBuf> {
 /// The image object is written beside the output and removed afterwards; a
 /// failed link leaves it for inspection.
 pub fn link(image: &image::Image, guest: &Guest, output: &Path) -> Result<()> {
+    link_with_exports(image, guest, output, &[])
+}
+
+/// Experimental guests may expose additional entry points without changing the
+/// ordinary container ABI. This does not add any host imports.
+pub fn link_with_exports(image: &image::Image, guest: &Guest, output: &Path, exports: &[&str]) -> Result<()> {
     let object = object::emit(image)?;
     let image_object = output.with_extension("image.o");
     std::fs::write(&image_object, &object)
@@ -138,6 +144,7 @@ pub fn link(image: &image::Image, guest: &Guest, output: &Path) -> Result<()> {
         .args(layout::link_arguments())
         .arg("-o")
         .arg(output);
+    for export in exports { command.arg(format!("--export={export}")); }
     let linked = command.output().context("running wasm-ld")?;
     ensure!(
         linked.status.success(),

@@ -17,4 +17,6 @@ pub mod abi;
 pub mod alloc;
 #[cfg(target_arch = "wasm32")]
 pub mod boot;
+#[cfg(all(target_arch = "wasm32", feature = "evolution"))]
+pub mod evolution;
 pub mod wire;

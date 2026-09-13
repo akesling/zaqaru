@@ -14,6 +14,7 @@ crate-type = ["staticlib"]
 [features]
 # The disassembly panel's path in the container's store.
 disassembly = ["kernel/disassembly"]
+evolution = ["cpu/evolution"]
 
 [dependencies]
 cpu = { package = "zaqaru-cpu", path = "../cpu" }

@@ -38,6 +38,8 @@ use crate::state::{Tcb, Width};
 mod registers;
 #[cfg(all(feature = "specialize", target_arch = "wasm32"))]
 pub mod specialize;
+#[cfg(all(feature = "evolution", target_arch = "wasm32"))]
+pub mod evolution;
 pub mod transpile;
 
 pub use transpile::transpile;
@@ -329,6 +331,8 @@ fn width_of(word: Word) -> Width {
 /// internal. `entry` is the guest address the trace begins at, the key the
 /// address cache will find it by.
 pub struct Trace {
+    #[cfg(all(feature = "evolution", target_arch = "wasm32"))]
+    identity: u64,
     /// The guest address the trace is entered at.
     pub entry: u64,
     /// The bytecode, first word of each op followed by any spilled word.
@@ -409,6 +413,12 @@ pub fn run<'a>(
     budget: u64,
     resolver: Resolver<'a>,
 ) -> Leave {
+    #[cfg(all(feature = "evolution", target_arch = "wasm32"))]
+    if start == 0 {
+        if let Some(leave) = evolution::dispatch(trace, tcb, space, budget) {
+            return leave;
+        }
+    }
     run_inner::<false>(trace, start, tcb, space, budget, resolver, &[], &[])
 }
 
@@ -457,9 +467,11 @@ fn run_inner<'a, const SPECIALIZE: bool>(
     let mut flags = tcb.flags;
     let mut pc = start;
     let mut spent: u64 = 0;
+    #[cfg(all(feature = "evolution", target_arch = "wasm32"))]
+    let mut trace_spent = 0;
 
     // Reading a register slice at a width — zero-extended, no high-byte case
-    // (the transpiler defers `%ah`/`%bh`/… for now). Scratch registers are
+    // (supported high-byte ALU operands are lowered through scratches). Scratch registers are
     // always read full-width.
     macro_rules! read {
         ($idx:expr, $w:expr) => {
@@ -493,6 +505,8 @@ fn run_inner<'a, const SPECIALIZE: bool>(
     // pointer on every op — the hot path touches only the local.
     macro_rules! flush {
         () => {{
+            #[cfg(all(feature = "evolution", target_arch = "wasm32"))]
+            if !SPECIALIZE { evolution::record_retired(trace, spent - trace_spent); }
             tcb.retired = tcb.retired.wrapping_add(spent);
             regs.flush(&mut tcb.registers);
             registers::leave::<SPECIALIZE>();
@@ -559,6 +573,19 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 }
                 match resolver.resolve(target) {
                     Some(next) => {
+                        #[cfg(all(feature = "evolution", target_arch = "wasm32"))]
+                        if !SPECIALIZE && evolution::observe(next) {
+                            // Enter generated code through the outer engine,
+                            // with registers and retirement fully materialized.
+                            tcb.rip = target;
+                            flush!();
+                            return Leave::Exit;
+                        }
+                        #[cfg(all(feature = "evolution", target_arch = "wasm32"))]
+                        if !SPECIALIZE {
+                            evolution::record_retired(trace, spent - trace_spent);
+                            trace_spent = spent;
+                        }
                         trace = next;
                         code = &trace.code;
                         pc = 0;

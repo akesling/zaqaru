@@ -502,6 +502,8 @@ impl Emitter {
 
     fn finish(self) -> Trace {
         Trace {
+            #[cfg(all(feature = "evolution", target_arch = "wasm32"))]
+            identity: super::evolution::next_identity(),
             entry: self.entry,
             code: self.code,
             ip: self.ip,
@@ -810,6 +812,28 @@ impl Emitter {
     fn emit_alu(&mut self, quick: &Quick, op: Op) -> Option<()> {
         let width = quick.width;
         let no_flags = self.flags_dead[self.index];
+        if let Source::Register(dst) = quick.destination
+            && dst.high_byte
+        {
+            let value = self.read_byte_register(dst);
+            let source = if matches!(quick.source, Source::Memory) {
+                Source::Register(Slice { number: self.emit_scratch_load(quick, width)?, width, high_byte: false })
+            } else { quick.source };
+            let writes = !matches!(op, Op::Cmp | Op::Test);
+            self.emit_alu_reg(op, value, value, source, width, no_flags, !writes)?;
+            if writes {
+                // Reinsert only bits 8..15. Helpers never change flags, and
+                // only the final merge retires the original x86 instruction.
+                let mask = self.temp();
+                self.li(mask, !(0xffu64 << 8), false);
+                let merged = self.temp();
+                self.push(encode(Op::And, merged, dst.number, mask, Width::Qword, false, true, false, 0, 0));
+                self.push(encode(Op::And, value, value, 0, Width::Qword, true, true, false, 0, 0xff));
+                self.push(encode(Op::Shl, value, value, 0, Width::Qword, true, true, false, 0, 8));
+                self.push(encode(Op::Or, dst.number, merged, value, Width::Qword, false, true, true, 0, 0));
+            }
+            return Some(());
+        }
         // At most one operand is memory. Three shapes cover the rest.
         match (quick.destination, quick.source) {
             // `op reg, [mem]` — load the source into a scratch, compute into
@@ -867,8 +891,9 @@ impl Emitter {
         retire: bool,
     ) -> Option<()> {
         match rhs {
-            Source::Register(slice) if !slice.high_byte => {
-                self.push(encode(op, d, a, slice.number, width, false, no_flags, retire, 0, 0));
+            Source::Register(slice) => {
+                let source = self.read_byte_register(slice);
+                self.push(encode(op, d, a, source, width, false, no_flags, retire, 0, 0));
                 Some(())
             }
             Source::Immediate(value) => {
@@ -883,6 +908,14 @@ impl Emitter {
             }
             _ => None,
         }
+    }
+
+    /// Read AH/BH/CH/DH through an ordinary scratch, preserving the flag record.
+    fn read_byte_register(&mut self, slice: Slice) -> u8 {
+        if !slice.high_byte { return slice.number; }
+        let value = self.temp();
+        self.push(encode(Op::Shr, value, slice.number, 0, Width::Qword, true, true, false, 0, 8));
+        value
     }
 
     /// Loads a source (register, immediate, or memory) into a fresh scratch
@@ -1547,4 +1580,3 @@ fn fits_immediate(width: Width, value: u64) -> bool {
         Width::Qword => value <= u64::from(u32::MAX),
     }
 }
-

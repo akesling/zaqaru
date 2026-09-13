@@ -1,0 +1,18 @@
+[package]
+name = "zaqaru-evolution"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Manual experiment: not a member of the normal workspace or its CI gates.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+wasm-encoder = { version = "0.254", features = ["wasmparser"] }
+wasmparser = "0.254"
+bake = { package = "zaqaru-bake", path = "../../crates/bake" }
+image = { package = "zaqaru-image", path = "../../crates/image" }
+
+[dev-dependencies]
+wat = "1"

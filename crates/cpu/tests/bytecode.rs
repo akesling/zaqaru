@@ -235,6 +235,61 @@ fn arithmetic_of_every_width_agrees() {
 }
 
 #[test]
+fn high_byte_alu_preserves_neighbors_and_live_flags() {
+    agree(|a, base| {
+        a.mov(rax, 0x1122_3344_5566_7788u64).unwrap();
+        a.mov(rbx, 0x8877_6655_4433_2211u64).unwrap();
+        a.mov(rcx, 0xffff_ffff_ffff_ffffu64).unwrap();
+        a.mov(rdx, 0x1234_5678_90ab_cdefu64).unwrap();
+        a.mov(rsi, base + 0x1000).unwrap();
+        a.mov(byte_ptr(rsi), 0x81u32).unwrap();
+        a.add(ah, bh).unwrap();
+        a.pushfq().unwrap();
+        a.sub(ch, ah).unwrap();
+        a.pushfq().unwrap();
+        a.xor(bh, byte_ptr(rsi)).unwrap();
+        a.pushfq().unwrap();
+        a.and(dh, 1u32).unwrap();
+        a.pushfq().unwrap();
+        a.or(al, dh).unwrap();
+        a.pushfq().unwrap();
+        a.cmp(ah, ch).unwrap();
+        a.pushfq().unwrap();
+        a.test(byte_ptr(rsi), bh).unwrap();
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn high_byte_alu_is_lowered_instead_of_deferred() {
+    let base = { let arena = Arena::new(LENGTH); arena.base() };
+    let mut guest = Guest::at(base, |a, _| {
+        a.and(dh, 1u32).unwrap();
+        a.add(ah, bh).unwrap();
+        a.cmp(ch, dh).unwrap();
+        a.syscall().unwrap();
+    });
+    let index = guest.cache.entry(guest.entry, &mut guest.space).unwrap();
+    let block = guest.cache.block(index);
+    let trace = bytecode::transpile(block).unwrap();
+    for instruction in block.instructions.iter().take(3) {
+        assert!(!trace.code.iter().zip(&trace.ip).any(|(word, ip)|
+            *ip == instruction.ip() && (*word as u8) == bytecode::Op::Defer as u8));
+    }
+}
+
+#[test]
+fn a_faulting_high_byte_alu_does_not_write_the_destination() {
+    let outcome = agree(|a, base| {
+        a.mov(rax, 0x1122_3344_5566_7788u64).unwrap();
+        a.mov(rsi, base + LENGTH + 0x1000).unwrap();
+        a.add(ah, byte_ptr(rsi)).unwrap();
+        a.syscall().unwrap();
+    });
+    assert!(matches!(outcome, Outcome::Trap(Trap::Fault(_))));
+}
+
+#[test]
 fn immediates_wide_and_narrow_agree() {
     agree(|a, _| {
         a.mov(rax, -1i64).unwrap();

@@ -16,6 +16,8 @@ name = "cpu"
 [features]
 # Opt-in partial-evaluation experiment; no effect on normal container builds.
 specialize = []
+# Runtime trace discovery for the manual Assembly evolution experiment.
+evolution = ["specialize"]
 # Counting what a real program retires, so that the next instruction to
 # lower is chosen by measurement rather than by reading code and guessing.
 # Off by default because it runs once per retired instruction, which is the

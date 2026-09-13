@@ -57,6 +57,8 @@ pub const KIND_STOPPED: i32 = 3;
 /// drives.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
+    #[cfg(feature = "evolution")]
+    if !crate::evolution::runnable() { return KIND_STOPPED; }
     // SAFETY: one instance, one thread of execution, and the host makes one
     // call at a time.
     let slot = unsafe { &mut *(&raw mut SYSTEM) };
@@ -134,6 +136,8 @@ pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
 /// As [`zaqaru_run`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zaqaru_stop_at(target: i64) -> i32 {
+    #[cfg(feature = "evolution")]
+    if !crate::evolution::runnable() { return KIND_STOPPED; }
     let slot = unsafe { &mut *(&raw mut SYSTEM) };
     if let Some(status) = unsafe { FINISHED } {
         if let Some(system) = slot {

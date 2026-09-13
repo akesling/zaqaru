@@ -4,6 +4,16 @@ This branch now contains a working partial-evaluation prototype. It does **not**
 yet provide a general 2× container speedup. The container baseline is `faf6988`,
 including the register-array optimization; that earlier gain is not counted again.
 
+## Browser-capable continuation experiment
+
+The next experiment now lives in [tools/evolution](../tools/evolution/README.md).
+It can specialize a running x86 container entirely inside Wasm and resume a
+successor in a browser Worker, retaining the two store imports. AOT/server-side
+optimization is also in scope; in-browser optimization has higher priority.
+This proves compilation and continuation mechanics, not Assembly-managed
+activation or a general end-to-end 2× speedup. See its README for measured costs
+and the remaining architectural work.
+
 ## Implemented experiment
 
 Run `./tools/microbench/specialize.sh` from the repository root. It uses local
@@ -76,6 +86,11 @@ calls, dynamic code discovery, or application-level workload mix, and the checks
 do not establish correctness of every supported x86 instruction under weval.
 
 ## Remaining architecture decision
+
+Updated constraint: **no new host imports**. The user is open to a proposal for
+a StructFS store. See [the compiler-store proposal](compiler-store-proposal.md),
+which retains the two imports and separates compilation from turn-boundary
+activation. The earlier direct-import option below is superseded, not approved.
 
 The prototype clears the hot-loop experiment's speed threshold. Integration is
 still required: automatic discovery, multi-trace control flow, invalidation,

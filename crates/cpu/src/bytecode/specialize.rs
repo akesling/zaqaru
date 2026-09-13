@@ -22,6 +22,8 @@ unsafe extern "C" {
 #[inline(always)]
 pub fn run(code: &[u64], ip: &[u64], tcb: &mut Tcb, space: &mut Space, budget: u64) -> Leave {
     let empty = Trace {
+        #[cfg(feature = "evolution")]
+        identity: 0,
         entry: 0,
         code: Vec::new(),
         ip: Vec::new(),
