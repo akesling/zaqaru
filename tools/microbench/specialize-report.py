@@ -32,6 +32,7 @@ report = {
     "core": 0,
     "rustc": command("rustc", "--version"),
     "weval": "0.5.0",
+    "feature": sys.argv[3] if len(sys.argv) > 3 else "specialize",
     "iterations": int(sys.argv[1]),
     "specialization_seconds_rounded": int(sys.argv[2]),
     "validation_cases": 560,

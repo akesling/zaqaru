@@ -101,6 +101,13 @@ pub extern "C" fn zaqaru_region_retired() -> u64 { unsafe { REGION_RETIRED } }
 #[unsafe(no_mangle)]
 pub extern "C" fn zaqaru_region_entries() -> u64 { unsafe { REGION_ENTRIES } }
 #[unsafe(no_mangle)]
+pub extern "C" fn zaqaru_guard_windows() -> u64 {
+    #[cfg(feature = "guarded-stack")]
+    { crate::space::guarded::accepted_windows() }
+    #[cfg(not(feature = "guarded-stack"))]
+    { 0 }
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn zaqaru_region_limit(limit: u32) -> i32 {
     if unsafe { PREPARED } || !(2..=32).contains(&limit) { return -1; }
     unsafe { REGION_LIMIT = limit; }

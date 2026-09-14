@@ -113,6 +113,8 @@ runner accepts `--binary`, `--against`, and `--modes` for other combinations.
 ./tools/microbench/specialize.sh
 # Optional loop iterations (default 10000000):
 ./tools/microbench/specialize.sh 20000000
+# Optional candidate feature (default specialize):
+./tools/microbench/specialize.sh 100000 virtual-flags
 ```
 
 This checksum-pins weval 0.5.0 and uses the same amd64 Docker image. It

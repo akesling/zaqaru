@@ -36,6 +36,8 @@ use crate::space::{Fault, Space};
 use crate::state::{Tcb, Width};
 
 mod registers;
+#[cfg(feature = "virtual-flags")]
+mod flag_state;
 #[cfg(feature = "specialize")]
 pub mod region;
 #[cfg(all(feature = "specialize", target_arch = "wasm32"))]
@@ -468,6 +470,8 @@ fn run_inner<'a, const SPECIALIZE: bool>(
     specialized_ip: &[u64],
 ) -> Leave {
     let mut code = &trace.code;
+    #[cfg(feature = "guarded-stack")]
+    let mut space = crate::space::guarded::GuardedSpace::<SPECIALIZE>::new(space, tcb.registers[4]);
     // Preserve the original normal-engine code reference. Only the opt-in
     // specialization entry reads constant input buffers.
     macro_rules! word {
@@ -497,7 +501,10 @@ fn run_inner<'a, const SPECIALIZE: bool>(
     // flushed to the control block only at a leave — so a `cmp`/`jcc` pair, an
     // `adc` chain, a `setcc`, touch a register-resident struct the compiler
     // can keep in place rather than the control-block pointer on every op.
+    #[cfg(not(feature = "virtual-flags"))]
     let mut flags = tcb.flags;
+    #[cfg(feature = "virtual-flags")]
+    let mut flags = flag_state::FlagState::<SPECIALIZE>::new(tcb.flags);
     let mut pc = start;
     let mut spent: u64 = 0;
     #[cfg(all(feature = "evolution", target_arch = "wasm32"))]
@@ -543,7 +550,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
             tcb.retired = tcb.retired.wrapping_add(spent);
             regs.flush(&mut tcb.registers);
             registers::leave::<SPECIALIZE>();
-            tcb.flags = flags;
+            tcb.flags = flags.snapshot();
         }};
     }
     // Self-modifying code: a store that landed on a page some cached block —
@@ -705,7 +712,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 if retire {
                     spent += 1;
                 }
-                if condition.holds(&flags) {
+                if condition.holds(&flags.snapshot()) {
                     let target = imm as usize;
                     // A taken back-edge is a loop iteration boundary: check the
                     // budget there, in retired-instruction units.
@@ -987,7 +994,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     .expect("a four-bit condition is one of sixteen");
                 // A byte write: the low byte becomes zero or one, the rest of
                 // the register preserved.
-                write!(d, Width::Byte, u64::from(condition.holds(&flags)));
+                write!(d, Width::Byte, u64::from(condition.holds(&flags.snapshot())));
                 if retire {
                     spent += 1;
                 }
@@ -999,7 +1006,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 // Written either way — the read of the destination for the
                 // not-taken case is what makes a 32-bit `cmov` clear the upper
                 // half whether or not it moves.
-                let value = if condition.holds(&flags) {
+                let value = if condition.holds(&flags.snapshot()) {
                     read!(a, width)
                 } else {
                     read!(d, width)
@@ -1073,14 +1080,14 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     Op::Inc | Op::Dec => 1,
                     _ => right,
                 };
-                let mut evaluated = flags;
+                let mut evaluated = flags.snapshot();
                 evaluated.record(rule, width, left, record_right, result);
                 let holds = condition.holds(&evaluated);
                 if writes_back {
                     write!(d, width, result);
                 }
                 if live_after {
-                    flags = evaluated;
+                    flags.replace(evaluated);
                 }
                 // Two guest instructions — the producer and the branch.
                 spent += 2;

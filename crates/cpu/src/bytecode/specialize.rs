@@ -13,9 +13,9 @@ unsafe extern "C" {
     #[link_name = "pop.context"]
     pub(super) fn pop_context();
     #[link_name = "read.reg"]
-    pub(super) fn read_reg(index: u64) -> u64;
+    pub(crate) fn read_reg(index: u64) -> u64;
     #[link_name = "write.reg"]
-    pub(super) fn write_reg(index: u64, value: u64);
+    pub(crate) fn write_reg(index: u64, value: u64);
 }
 
 /// Specialize one trace while retaining the existing interpreter semantics.

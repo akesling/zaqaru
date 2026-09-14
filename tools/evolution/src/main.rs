@@ -32,6 +32,7 @@ fn main() -> Result<()> {
                     "zaqaru_compiled_retired",
                     "zaqaru_region_retired",
                     "zaqaru_region_entries",
+                    "zaqaru_guard_windows",
                     "zaqaru_region_limit",
                     "weval.pending.head",
                     "weval.is.wevaled",

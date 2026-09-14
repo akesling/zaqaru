@@ -138,6 +138,7 @@ export async function demo({ compiler, template, baseline, warmup = 10000000, re
     compiledRetired: compiledRetired.toString(), stdout: stdout(successor),
     regionRetired: (next.zaqaru_region_retired?.() ?? 0n).toString(),
     regionEntries: (next.zaqaru_region_entries?.() ?? 0n).toString(),
+    guardWindows: (next.zaqaru_guard_windows?.() ?? 0n).toString(),
     breakEvenRemainingMs: baselineMs !== null && baselineMs > successorMs ? transitionMs / (1 - successorMs / baselineMs) : null,
     successorBytes: successorBytes.length,
     warmupRetired, baselineWarmupRetired, baselineMs, baselineSpeedup: baselineMs === null ? null : baselineMs / successorMs,

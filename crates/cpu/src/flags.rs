@@ -48,6 +48,8 @@ pub mod bit {
 }
 
 use crate::state::Width;
+#[cfg(all(feature = "virtual-flags", target_arch = "wasm32"))]
+mod virtualized;
 
 /// Which operation the record remembers, and hence by what rule its flags
 /// are derived.
@@ -105,6 +107,14 @@ impl Default for Flags {
 }
 
 impl Flags {
+    #[cfg(not(feature = "virtual-flags"))]
+    #[inline(always)]
+    pub(crate) fn snapshot(&self) -> Self { *self }
+
+    #[cfg(not(feature = "virtual-flags"))]
+    #[inline(always)]
+    pub(crate) fn replace(&mut self, flags: Self) { *self = flags; }
+
     /// The flags a fresh process starts with: the reserved bit set,
     /// interrupts enabled, everything else clear — 0x202, which is what
     /// Linux leaves in `eflags` at `_start`.
@@ -155,6 +165,7 @@ impl Flags {
     }
 
     /// As [`Flags::record`], for the two rules that also consume a carry.
+    #[cfg_attr(feature = "virtual-flags", inline(always))]
     pub fn record_with_carry(
         &mut self,
         rule: Rule,
@@ -180,6 +191,7 @@ impl Flags {
         self.rule = Rule::Materialized;
     }
 
+    #[cfg_attr(feature = "virtual-flags", inline(always))]
     pub fn carry(&self) -> bool {
         match self.rule {
             Rule::Materialized | Rule::Increment | Rule::Decrement => self.bits & bit::CARRY != 0,
@@ -200,6 +212,7 @@ impl Flags {
         }
     }
 
+    #[cfg_attr(feature = "virtual-flags", inline(always))]
     pub fn zero(&self) -> bool {
         match self.rule {
             Rule::Materialized => self.bits & bit::ZERO != 0,
@@ -207,6 +220,7 @@ impl Flags {
         }
     }
 
+    #[cfg_attr(feature = "virtual-flags", inline(always))]
     pub fn sign(&self) -> bool {
         match self.rule {
             Rule::Materialized => self.bits & bit::SIGN != 0,
@@ -217,6 +231,7 @@ impl Flags {
     /// Parity of the low eight bits of the result — and only the low eight,
     /// at every width, which is the architecture's rule and a recurring
     /// surprise.
+    #[cfg_attr(feature = "virtual-flags", inline(always))]
     pub fn parity(&self) -> bool {
         match self.rule {
             Rule::Materialized => self.bits & bit::PARITY != 0,
@@ -227,6 +242,7 @@ impl Flags {
     /// The carry out of bit three, which is what "adjust" means. It is the
     /// bit that binary-coded-decimal arithmetic reads and that nothing else
     /// does — but `pushf` reads it, so it is answered rather than invented.
+    #[cfg_attr(feature = "virtual-flags", inline(always))]
     pub fn adjust(&self) -> bool {
         match self.rule {
             Rule::Materialized => self.bits & bit::ADJUST != 0,
@@ -240,6 +256,7 @@ impl Flags {
         }
     }
 
+    #[cfg_attr(feature = "virtual-flags", inline(always))]
     pub fn overflow(&self) -> bool {
         let sign = self.width.sign_bit();
         match self.rule {

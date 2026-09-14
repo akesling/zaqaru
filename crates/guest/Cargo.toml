@@ -16,6 +16,9 @@ crate-type = ["staticlib"]
 disassembly = ["kernel/disassembly"]
 evolution = ["cpu/evolution"]
 regions = ["evolution", "cpu/regions"]
+guarded-stack = ["regions", "cpu/guarded-stack"]
+stack-forwarding = ["guarded-stack", "cpu/stack-forwarding"]
+virtual-flags = ["regions", "cpu/virtual-flags"]
 
 [dependencies]
 cpu = { package = "zaqaru-cpu", path = "../cpu" }
