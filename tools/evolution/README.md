@@ -1,5 +1,15 @@
 # Runtime specialization experiment
 
+The stacked [multi-trace weval experiment](../../docs/weval-ten-times.md) adds
+an opt-in `regions` build and per-region coverage counters. It records both
+incremental comparisons and regressions; a general 10× gain is not established.
+
+Additional opt-in builds accept `guarded-stack`, `stack-forwarding` (includes
+the guard), and `virtual-flags` as the third build argument. Combine experiments
+with commas, for example `build calls 40 stack-forwarding,virtual-flags`, then
+run `node 22` or `browser 22`. These are experimental alternatives, not defaults;
+see the linked experiment record for measured regressions and validation limits.
+
 This experiment discovers x86 bytecode traces while a real baked container runs,
 freezes its continuation, and produces a successor executor containing specialized
 Wasm and the interpreter fallback. The optimizer itself is a Wasm Block using

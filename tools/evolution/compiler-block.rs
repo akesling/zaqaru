@@ -163,6 +163,9 @@ fn serve() -> anyhow::Result<()> {
 
 #[no_mangle]
 pub extern "C" fn run() -> i32 {
+    std::panic::set_hook(Box::new(|info| {
+        let _ = sdk::write_typed("iso/log/error", &serde_json::to_vec(&info.to_string()).unwrap());
+    }));
     let _ = log::set_logger(&DIAGNOSTICS);
     log::set_max_level(log::LevelFilter::Warn);
     match serve() {

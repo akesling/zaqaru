@@ -11,7 +11,8 @@ case ${1:-help} in
     shift
     exec tools/microbench/experiment.sh exec bash tools/evolution/build-linux.sh "$@"
     ;;
-  node) exec node tools/evolution/test-node.mjs ;;
-  browser) exec node tools/evolution/test-browser.mjs ;;
-  *) echo 'Usage: bash tools/evolution/run.sh {prepare [STRUCTFS_REPO]|build [KERNEL SCALE]|node|browser}' ;;
+  node) shift; exec node tools/evolution/test-node.mjs "$@" ;;
+  browser) shift; exec node tools/evolution/test-browser.mjs "$@" ;;
+  *) echo 'Usage: bash tools/evolution/run.sh {prepare [STRUCTFS_REPO]|build [KERNEL SCALE [FEATURES]]|node [REGION_MEMBERS]|browser [REGION_MEMBERS]}'
+     echo 'FEATURES: evolution (default), regions, guarded-stack, stack-forwarding, virtual-flags; experiments may be comma-separated.' ;;
 esac

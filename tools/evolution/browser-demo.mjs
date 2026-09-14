@@ -22,12 +22,14 @@ export async function optimizerRequest(compiler, path, data) {
       } else if (path === 'iso/responses/read') {
         if (value.result === 'error') error = value.error.message;
         else answer = value.value;
-      } else if (path === 'iso/log/error') error = value;
+      } else if (path === 'iso/log/error') error ??= value;
       else check(path === 'iso/shutdown/complete', `unexpected optimizer write: ${path}`);
       return path;
     },
   });
-  const code = guest.run();
+  let code;
+  try { code = guest.run(); }
+  catch (cause) { throw new Error(`optimizer trapped: ${error ?? cause.message}`, { cause }); }
   check(code === 0 && !error && answer, `optimizer failed: ${error ?? code}`);
   return fromBase64(answer.wasm);
 }
@@ -62,10 +64,14 @@ function stdout(container) {
 
 // First transition proof, not yet an Assembly-management implementation. Keeping
 // this distinction explicit prevents a host-side demo becoming the architecture.
-export async function demo({ compiler, template, baseline, warmup = 10000000, log = () => {} }) {
+export async function demo({ compiler, template, baseline, warmup = 10000000, regionMembers, log = () => {} }) {
   const sourceBytes = await optimizerRequest(compiler, 'executable', { wasm: toBase64(template) });
   const source = await executor(sourceBytes, standardMounts());
   const ex = source.instance.exports;
+  if (regionMembers !== undefined) {
+    check(Number.isInteger(regionMembers) && regionMembers >= 2 && regionMembers <= 32, 'regionMembers must be 2..32');
+    check(ex.zaqaru_region_limit?.(regionMembers) === 0, 'region limit unsupported or refused');
+  }
   check(ex.zaqaru_run(BigInt(warmup)) === 0, 'workload finished before warmup');
   const warmupRetired = source.value('statistics').retired;
   const referenceSnapshot = source.snapshot();
@@ -125,10 +131,14 @@ export async function demo({ compiler, template, baseline, warmup = 10000000, lo
       .map(async ([name, bytes]) => [name, Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
         .map(b => b.toString(16).padStart(2, '0')).join('')])));
   const result = { traces, compileMs, transitionMs, successorMs, referenceMs,
+    regionMembers: regionMembers ?? 8,
     hashes,
     executionSpeedup: referenceMs / successorMs,
     includingTransition: referenceMs / (transitionMs + successorMs),
     compiledRetired: compiledRetired.toString(), stdout: stdout(successor),
+    regionRetired: (next.zaqaru_region_retired?.() ?? 0n).toString(),
+    regionEntries: (next.zaqaru_region_entries?.() ?? 0n).toString(),
+    guardWindows: (next.zaqaru_guard_windows?.() ?? 0n).toString(),
     breakEvenRemainingMs: baselineMs !== null && baselineMs > successorMs ? transitionMs / (1 - successorMs / baselineMs) : null,
     successorBytes: successorBytes.length,
     warmupRetired, baselineWarmupRetired, baselineMs, baselineSpeedup: baselineMs === null ? null : baselineMs / successorMs,

@@ -35,5 +35,5 @@ lock = root / "Cargo.lock"
 def packages():
     return {(p["name"], p["version"], p.get("checksum")) for p in tomllib.loads(lock.read_text())["package"]}
 before = packages()
-subprocess.run(["cargo", "generate-lockfile", "--offline", "--manifest-path", str(root / "Cargo.toml")], check=True)
+subprocess.run(["cargo", "metadata", "--offline", "--format-version", "1", "--manifest-path", str(root / "Cargo.toml")], check=True, stdout=subprocess.DEVNULL)
 assert packages() <= before, "Reference dependencies changed from the historical lockfile"

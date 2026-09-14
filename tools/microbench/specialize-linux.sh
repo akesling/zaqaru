@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 iterations=${1:-10000000}
+feature=${2:-specialize}
+[[ $feature == specialize || $feature == virtual-flags ]] || exit 2
 [[ $iterations =~ ^[1-9][0-9]*$ ]] || { echo 'Iterations must be positive' >&2; exit 1; }
 archive=benchmark-results/weval-v0.5.0-x86_64-linux.tar.xz
 if [[ ! -f $archive ]]; then
@@ -17,7 +19,7 @@ benchmark-results/weval-v0.5.0-x86_64-linux/weval weval -w \
     -i target/specialize-reference/wasm32-unknown-unknown/release/examples/specialize.wasm \
     -o benchmark-results/specialize-reference.wasm > benchmark-results/weval-reference.log 2>&1
 cargo build --locked --release -p zaqaru-cpu --example specialize \
-    --features specialize --target wasm32-unknown-unknown
+    --features "$feature" --target wasm32-unknown-unknown
 start=$SECONDS
 benchmark-results/weval-v0.5.0-x86_64-linux/weval weval -w --show-stats \
     -i target/wasm32-unknown-unknown/release/examples/specialize.wasm \
@@ -29,4 +31,4 @@ taskset -c 0 target/release/examples/specialize_bench \
     benchmark-results/specialized.wasm benchmark-results/specialize-reference.wasm \
     "$iterations" | tee benchmark-results/specialize.tmp.csv
 mv benchmark-results/specialize.tmp.csv benchmark-results/specialize.csv
-python3 tools/microbench/specialize-report.py "$iterations" "$specialization_seconds"
+python3 tools/microbench/specialize-report.py "$iterations" "$specialization_seconds" "$feature"

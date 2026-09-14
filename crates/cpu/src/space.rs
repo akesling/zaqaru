@@ -28,6 +28,8 @@
 //! a guest address into a pointer.
 
 use crate::state::Width;
+#[cfg(feature = "guarded-stack")]
+pub(crate) mod guarded;
 
 /// The page size everything here is denominated in. Not a tunable: it is the
 /// granularity Linux's `mprotect` works at, so the bitmaps have to match it
@@ -340,6 +342,7 @@ impl Space {
     ///
     /// The page loop is one iteration for every access that does not straddle
     /// a page boundary, which is nearly all of them.
+    #[cfg_attr(feature = "regions", inline(always))]
     fn permitted(&self, address: u64, length: u64, access: Access) -> Result<(), Fault> {
         if length == 0 {
             return Ok(());
@@ -367,6 +370,20 @@ impl Space {
                 return Ok(());
             }
         }
+        self.permitted_slow(address, length, access)
+    }
+
+    // Expose the cached-page hit to weval without cloning the full page walk
+    // at every specialized memory operation. Normal builds inline this split.
+    #[cfg_attr(feature = "regions", inline(never))]
+    #[cfg_attr(not(feature = "regions"), inline(always))]
+    fn permitted_slow(&self, address: u64, length: u64, access: Access) -> Result<(), Fault> {
+        let slot = match access {
+            Access::Read => 0,
+            Access::Write => 1,
+            Access::Fetch => 2,
+        };
+        let first = (address >> PAGE_SHIFT) as usize;
         let end = match address.checked_add(length) {
             Some(end) if end <= self.limit => end,
             // Off the end of linear memory, or wrapped. Either way the guest
@@ -440,14 +457,20 @@ impl Space {
     pub fn load(&self, address: u64, width: Width) -> Result<u64, Fault> {
         self.permitted(address, u64::from(width.bytes()), Access::Read)?;
         // SAFETY: checked immediately above.
+        Ok(unsafe { Self::load_permitted(address, width) })
+    }
+
+    /// The full access must already be known readable and in bounds.
+    #[inline(always)]
+    unsafe fn load_permitted(address: u64, width: Width) -> u64 {
         unsafe {
             let at = Self::pointer(address);
-            Ok(match width {
+            match width {
                 Width::Byte => u64::from(at.read()),
                 Width::Word => u64::from(at.cast::<u16>().read_unaligned().to_le()),
                 Width::Dword => u64::from(at.cast::<u32>().read_unaligned().to_le()),
                 Width::Qword => at.cast::<u64>().read_unaligned().to_le(),
-            })
+            }
         }
     }
 
@@ -462,6 +485,13 @@ impl Space {
         self.permitted(address, u64::from(width.bytes()), Access::Write)?;
         self.note_code_write(address, u64::from(width.bytes()));
         // SAFETY: checked immediately above.
+        unsafe { Self::store_permitted(address, width, value) };
+        Ok(())
+    }
+
+    /// The full access must be writable, with code invalidation accounted for.
+    #[inline(always)]
+    unsafe fn store_permitted(address: u64, width: Width, value: u64) {
         unsafe {
             let at = Self::pointer(address);
             match width {
@@ -471,7 +501,6 @@ impl Space {
                 Width::Qword => at.cast::<u64>().write_unaligned(value.to_le()),
             }
         }
-        Ok(())
     }
 
     /// Reads a run of bytes — a vector move, a string operation, a kernel
