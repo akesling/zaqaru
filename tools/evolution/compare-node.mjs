@@ -2,9 +2,9 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { demo } from './browser-demo.mjs';
 
-const [beforePath, afterPath, outputPath, count = '3', regionSize] = process.argv.slice(2);
+const [beforePath, afterPath, outputPath, count = '3', regionSize, beforeRegionSize] = process.argv.slice(2);
 if (!beforePath || !afterPath || !outputPath || !/^[1-9][0-9]*$/.test(count)) {
-  throw new Error('Usage: node tools/evolution/compare-node.mjs BEFORE.wasm AFTER.wasm OUTPUT.json [REPEATS] [REGION_MEMBERS]');
+  throw new Error('Usage: node tools/evolution/compare-node.mjs BEFORE.wasm AFTER.wasm OUTPUT.json [REPEATS] [AFTER_REGION_MEMBERS] [BEFORE_REGION_MEMBERS]');
 }
 const compiler = await readFile('benchmark-results/browser-compiler.wasm');
 const baseline = await readFile('benchmark-results/evolution-baseline.wasm');
@@ -17,8 +17,9 @@ const median = values => {
 for (let repeat = 0; repeat < Number(count); repeat++) {
   const pair = {};
   for (const variant of repeat % 2 ? ['after', 'before'] : ['before', 'after']) {
+    const members = variant === 'after' ? regionSize : beforeRegionSize;
     const result = await demo({ compiler, baseline, template: templates[variant], log: () => {},
-      regionMembers: variant === 'after' && regionSize !== undefined ? Number(regionSize) : undefined });
+      regionMembers: members === undefined ? undefined : Number(members) });
     samples.push({ repeat, variant, ...result });
     pair[variant] = result;
     // Preserve completed samples even if a later execution fails.

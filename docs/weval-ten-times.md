@@ -51,6 +51,34 @@ contexts distinct from destination contexts, including the missing-target case.
 Compiler panic messages and evaluation-limit warnings now pass through StructFS
 diagnostics; failures are rejected rather than accepted as measurements.
 
+## Exposing the permission-cache hit
+
+The next change separates `Space::permitted` into its cached-page fast path and
+the full permission walk. In region builds the fast path is forced inline, so
+weval sees the fixed access width and permission kind. The slow path stays out
+of line to avoid duplicating the page walk in every compiled memory operation.
+Ordinary builds inline the helper back into the existing permission function.
+The permission cache, overflow checks, fault addresses and invalidation rules
+are unchanged.
+
+With both templates configured for 22 members, three alternating Node pairs
+measured **1.231×, 1.200× and 1.009×**, median **1.200×**, relative to the region
+checkpoint. Median successor time went from 77.2 to 64.3 ms. A Chrome sample
+went from 139 to 88.7 ms, but those browser samples were not interleaved.
+The new Chrome result is only 1.21× against the historical baseline, and its
+2.68-second transition still overwhelms the short execution tail. This is an
+incremental improvement, not a 10× result or a general-container claim.
+
+The paired samples are in `benchmark-results/region-permissions-comparison.json`.
+Both ordinary (81 tests) and region (83 tests) CPU/bytecode suites passed.
+The browser continuation checks passed with both 8- and 22-member regions;
+the permission-cache candidate was checked with 22 members.
+A separate `mixed 4000000` Node check also passed output, retirement and
+continuation validation with the candidate. It measured 44.8 ms of successor
+execution, 354.2 ms of historical baseline and 2.28 s for transition (7.92×
+normalized tail speedup, 0.15× including transition). This is a single sample,
+not an incremental comparison against PR #3 or a new general 10× result.
+
 ## Reproduction and validation
 
 After preparation described in `tools/evolution/README.md`:
@@ -67,6 +95,8 @@ template before another build replaces it. Interleave two saved templates with:
 
 ```sh
 node tools/evolution/compare-node.mjs BEFORE.wasm AFTER.wasm OUTPUT.json 3 22
+# Region versus region: configure both sides explicitly.
+node tools/evolution/compare-node.mjs BEFORE.wasm AFTER.wasm OUTPUT.json 3 22 22
 ```
 
 The last argument configures the candidate region size. Each run validates its

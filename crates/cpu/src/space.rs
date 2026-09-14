@@ -340,6 +340,7 @@ impl Space {
     ///
     /// The page loop is one iteration for every access that does not straddle
     /// a page boundary, which is nearly all of them.
+    #[cfg_attr(feature = "regions", inline(always))]
     fn permitted(&self, address: u64, length: u64, access: Access) -> Result<(), Fault> {
         if length == 0 {
             return Ok(());
@@ -367,6 +368,20 @@ impl Space {
                 return Ok(());
             }
         }
+        self.permitted_slow(address, length, access)
+    }
+
+    // Expose the cached-page hit to weval without cloning the full page walk
+    // at every specialized memory operation. Normal builds inline this split.
+    #[cfg_attr(feature = "regions", inline(never))]
+    #[cfg_attr(not(feature = "regions"), inline(always))]
+    fn permitted_slow(&self, address: u64, length: u64, access: Access) -> Result<(), Fault> {
+        let slot = match access {
+            Access::Read => 0,
+            Access::Write => 1,
+            Access::Fetch => 2,
+        };
+        let first = (address >> PAGE_SHIFT) as usize;
         let end = match address.checked_add(length) {
             Some(end) if end <= self.limit => end,
             // Off the end of linear memory, or wrapped. Either way the guest
