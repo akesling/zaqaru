@@ -30,9 +30,13 @@ fn main() -> Result<()> {
                     "zaqaru_retire",
                     "zaqaru_resume",
                     "zaqaru_compiled_retired",
+                    "zaqaru_region_retired",
+                    "zaqaru_region_entries",
+                    "zaqaru_region_limit",
                     "weval.pending.head",
                     "weval.is.wevaled",
                     "weval.func.0",
+                    "weval.func.1",
                 ],
             )?;
         }

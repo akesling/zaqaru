@@ -52,7 +52,8 @@ try {
     };
     socket.addEventListener('message', listener);
   });
-  const navigation = await command('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/tools/evolution/index.html`}, sessionId);
+  const query = process.argv[2] === undefined ? '' : `?regionMembers=${encodeURIComponent(process.argv[2])}`;
+  const navigation = await command('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/tools/evolution/index.html${query}`}, sessionId);
   if (navigation.errorText) throw new Error(navigation.errorText);
   await loaded;
   const result = await command('Runtime.evaluate', {

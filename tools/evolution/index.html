@@ -5,7 +5,7 @@
 <p>The optimizer and x86 executors run locally in this browser worker.</p>
 <pre id="log"></pre>
 <script type="module">
-const worker = new Worker('./browser-worker.mjs', {type: 'module'});
+const worker = new Worker('./browser-worker.mjs' + location.search, {type: 'module'});
 worker.onmessage = ({data}) => {
   document.querySelector('#log').textContent += (data.message ?? JSON.stringify(data, null, 2)) + '\n';
   if (data.result || data.error) window.experimentResult = data;

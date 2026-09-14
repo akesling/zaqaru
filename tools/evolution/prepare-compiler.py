@@ -27,6 +27,13 @@ for module in modules:
         content = content.replace("use rayon::prelude::*;", "")
         content = content.replace(".par_iter()", ".iter()")
         content = content.replace("indicatif::ProgressBar", "crate::Progress")
+        # Preserve the evaluation-limit reason through the Block's warning
+        # channel, without dumping the entire frozen argument buffer.
+        old = 'log::info!(\n                    " -> too many blocks or values:'
+        assert content.count(old) == 1
+        content = content.replace(old, 'log::warn!(\n                    " -> too many blocks or values:')
+        content = content.replace('log::warn!("Failed to weval for directive {directive:?}");',
+                                  'log::warn!("Failed to weval for directive {}", directive.user_id);')
     (DEST / f"src/{module}.rs").write_text(content)
 for license in SOURCE.glob("LICENSE*"):
     shutil.copyfile(license, DEST / license.name)

@@ -21,6 +21,39 @@ unsafe extern "C" {
 /// Specialize one trace while retaining the existing interpreter semantics.
 #[inline(always)]
 pub fn run(code: &[u64], ip: &[u64], tcb: &mut Tcb, space: &mut Space, budget: u64) -> Leave {
+    execute(code, ip, 0, Resolver::Runloop, tcb, space, budget)
+}
+
+#[inline(always)]
+pub fn run_region(
+    code: &[u64],
+    ip: &[u64],
+    tcb: &mut Tcb,
+    space: &mut Space,
+    budget: u64,
+) -> Leave {
+    let start = code[0] as usize;
+    execute(
+        code,
+        ip,
+        start,
+        Resolver::Region(&code[1..start]),
+        tcb,
+        space,
+        budget,
+    )
+}
+
+#[inline(always)]
+fn execute(
+    code: &[u64],
+    ip: &[u64],
+    start: usize,
+    resolver: Resolver<'_>,
+    tcb: &mut Tcb,
+    space: &mut Space,
+    budget: u64,
+) -> Leave {
     let empty = Trace {
         #[cfg(feature = "evolution")]
         identity: 0,
@@ -28,5 +61,5 @@ pub fn run(code: &[u64], ip: &[u64], tcb: &mut Tcb, space: &mut Space, budget: u
         code: Vec::new(),
         ip: Vec::new(),
     };
-    run_inner::<true>(&empty, 0, tcb, space, budget, Resolver::Runloop, code, ip)
+    run_inner::<true>(&empty, start, tcb, space, budget, resolver, code, ip)
 }

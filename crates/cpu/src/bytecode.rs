@@ -36,6 +36,8 @@ use crate::space::{Fault, Space};
 use crate::state::{Tcb, Width};
 
 mod registers;
+#[cfg(feature = "specialize")]
+pub mod region;
 #[cfg(all(feature = "specialize", target_arch = "wasm32"))]
 pub mod specialize;
 #[cfg(all(feature = "evolution", target_arch = "wasm32"))]
@@ -382,6 +384,9 @@ pub enum Resolver<'a> {
     Runloop,
     /// Probe this block cache's transpiled traces, staying internal on a hit.
     Cache(&'a crate::block::BlockCache),
+    /// Constant address/offset/left/right nodes in the region experiment.
+    #[cfg(feature = "specialize")]
+    Region(&'a [u64]),
 }
 
 impl<'a> Resolver<'a> {
@@ -390,6 +395,8 @@ impl<'a> Resolver<'a> {
         match self {
             Resolver::Runloop => None,
             Resolver::Cache(cache) => cache.resolve_trace(address),
+            #[cfg(feature = "specialize")]
+            Resolver::Region(_) => None,
         }
     }
 }
@@ -422,7 +429,7 @@ pub fn run<'a>(
         loop {
             let before = tcb.retired;
             let compiled = if start == 0 {
-                evolution::dispatch(trace, tcb, space, remaining)
+                evolution::dispatch(trace, tcb, space, remaining, resolver)
             } else {
                 None
             };
@@ -596,6 +603,45 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     tcb.rip = target;
                     flush!();
                     return Leave::Preempted;
+                }
+                #[cfg(feature = "specialize")]
+                if let Resolver::Region(entries) = resolver {
+                    if space.has_dirty_code() {
+                        tcb.rip = target;
+                        flush!();
+                        return Leave::Exit;
+                    }
+                    // Keep the directory index in the evaluator's context so
+                    // every address and destination stays a known constant.
+                    let mut index = 0;
+                    let mut found = false;
+                    let length = if SPECIALIZE { specialized_code.len() } else { code.len() };
+                    registers::context::<SPECIALIZE>(length);
+                    while index < entries.len() {
+                        if target == entries[index] {
+                            pc = entries[index + 1] as usize;
+                            registers::context::<SPECIALIZE>(pc);
+                            found = true;
+                            break;
+                        }
+                        let address = entries[index];
+                        let left = entries[index + 2] as usize;
+                        let source = index;
+                        index = entries[index + 3] as usize;
+                        // Establish the fallthrough context before the fork;
+                        // otherwise LLVM can merge both edge annotations and
+                        // turn the evaluator's node index into a runtime value.
+                        registers::context::<SPECIALIZE>(length + entries.len() + 1 + source);
+                        if target < address {
+                            index = left;
+                            registers::context::<SPECIALIZE>(length + index);
+                        }
+                        registers::context::<SPECIALIZE>(length + index);
+                    }
+                    if found { continue; }
+                    tcb.rip = target;
+                    flush!();
+                    return Leave::Exit;
                 }
                 match resolver.resolve(target) {
                     Some(next) => {

@@ -5,7 +5,7 @@
 //! The compiler must preserve that ABI when carrying a frozen continuation into
 //! a successor. They are never transferable handles between arbitrary Blocks.
 
-use super::{Leave, Trace};
+use super::{Leave, Resolver, Trace};
 use crate::{space::Space, state::Tcb};
 use std::collections::BTreeMap;
 
@@ -19,6 +19,8 @@ struct Binding {
     visits: u64,
     retired: u64,
     compiled: Option<Runner>,
+    #[cfg(feature = "regions")]
+    region: Option<(super::region::Region, Vec<(u64, u64)>)>,
 }
 
 #[repr(C)]
@@ -38,6 +40,9 @@ static mut HEAD: *mut Request = core::ptr::null_mut();
 static mut WEVALED: u8 = 0;
 static mut PREPARED: bool = false;
 static mut COMPILED_RETIRED: u64 = 0;
+static mut REGION_RETIRED: u64 = 0;
+static mut REGION_ENTRIES: u64 = 0;
+static mut REGION_LIMIT: u32 = 8;
 static mut NEXT_IDENTITY: u64 = 1;
 static mut GENERATION: u64 = 1;
 #[derive(Clone, Copy)]
@@ -72,9 +77,34 @@ pub extern "C" fn specialized() -> *mut u8 {
 pub extern "C" fn target() -> Runner {
     generic
 }
+#[unsafe(export_name = "weval.func.1")]
+pub extern "C" fn region_target() -> Runner { generic_region }
+
+unsafe extern "C" fn generic_region(
+    out: *mut Leave, code: *const u64, len: u32, ip: *const u64,
+    tcb: *mut Tcb, space: *mut Space, budget: u64,
+) {
+    unsafe {
+        out.write(super::specialize::run_region(
+            core::slice::from_raw_parts(code, len as usize),
+            core::slice::from_raw_parts(ip, len as usize),
+            &mut *tcb, &mut *space, budget,
+        ));
+    }
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn zaqaru_compiled_retired() -> u64 {
     unsafe { COMPILED_RETIRED }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn zaqaru_region_retired() -> u64 { unsafe { REGION_RETIRED } }
+#[unsafe(no_mangle)]
+pub extern "C" fn zaqaru_region_entries() -> u64 { unsafe { REGION_ENTRIES } }
+#[unsafe(no_mangle)]
+pub extern "C" fn zaqaru_region_limit(limit: u32) -> i32 {
+    if unsafe { PREPARED } || !(2..=32).contains(&limit) { return -1; }
+    unsafe { REGION_LIMIT = limit; }
+    0
 }
 
 unsafe extern "C" fn generic(
@@ -130,6 +160,8 @@ fn lookup(trace: &Trace) -> *mut Binding {
                 visits: 0,
                 retired: 0,
                 compiled: None,
+                #[cfg(feature = "regions")]
+                region: None,
             }),
         );
     }
@@ -175,23 +207,40 @@ pub(super) fn dispatch(
     tcb: &mut Tcb,
     space: &mut Space,
     budget: u64,
+    _resolver: Resolver<'_>,
 ) -> Option<Leave> {
     let binding = unsafe { lookup(trace).as_mut() }?;
     binding.visits = binding.visits.saturating_add(1);
     let runner = binding.compiled?;
+    let (code, ip) = (&binding.code, &binding.ip);
+    #[cfg(feature = "regions")]
+    let (code, ip) = if let Some((region, members)) = &binding.region {
+        // Every member must still name the immutable trace used at freeze.
+        // A missing, remapped or re-decoded member conservatively falls back.
+        // Stores to marked code exit before any subsequent guest instruction.
+        if space.has_dirty_code() || !members.iter().all(|&(entry, identity)| {
+            _resolver.resolve(entry).is_some_and(|t| t.identity == identity)
+        }) { return None; }
+        (&region.code, &region.ip)
+    } else { (code, ip) };
     let before = tcb.retired;
     let mut result = core::mem::MaybeUninit::uninit();
     unsafe {
         runner(
             result.as_mut_ptr(),
-            binding.code.as_ptr(),
-            binding.code.len() as u32,
-            binding.ip.as_ptr(),
+            code.as_ptr(),
+            code.len() as u32,
+            ip.as_ptr(),
             tcb,
             space,
             budget,
         );
         COMPILED_RETIRED += tcb.retired - before;
+        #[cfg(feature = "regions")]
+        if binding.region.is_some() {
+            REGION_RETIRED += tcb.retired - before;
+            REGION_ENTRIES += 1;
+        }
         Some(result.assume_init())
     }
 }
@@ -221,13 +270,29 @@ pub fn prepare() -> u32 {
     let bindings = unsafe { &mut *(&raw mut BINDINGS) };
     let mut hot: Vec<_> = bindings.values_mut().filter(|b| b.visits >= 4).collect();
     hot.sort_by_key(|b| core::cmp::Reverse((b.retired, b.visits)));
+    #[cfg(feature = "regions")]
+    if hot.len() >= 2 {
+        // Bounded experiment: one root and a configurable set of hot members.
+        // Other roots retain single-trace compilation as a control/fallback.
+        let members: Vec<_> = hot.iter().take(unsafe { REGION_LIMIT } as usize).collect();
+        let identities = members.iter().map(|b| (b.ip[0], b.verified_identity)).collect();
+        let inputs: Vec<_> = members.iter().map(|b| (b.ip[0], b.code.as_slice(), b.ip.as_slice())).collect();
+        let region = super::region::Region::new(&inputs);
+        hot[0].region = Some((region, identities));
+    }
     let mut count = 0;
     for binding in hot.into_iter().take(32) {
         let mut args = Vec::new();
+        let (code, ip, function) = (&binding.code, &binding.ip, generic as Runner);
+        #[cfg(feature = "regions")]
+        let (code, ip, function) = match &binding.region {
+            Some((region, _)) => (&region.code, &region.ip, generic_region as Runner),
+            None => (code, ip, function),
+        };
         arg(&mut args, 0, 255, 0); // dynamic result destination
-        buffer(&mut args, &binding.code);
-        arg(&mut args, 1, 0, binding.code.len() as u64);
-        buffer(&mut args, &binding.ip);
+        buffer(&mut args, code);
+        arg(&mut args, 1, 0, code.len() as u64);
+        buffer(&mut args, ip);
         for _ in 0..3 {
             arg(&mut args, 0, 255, 0);
         }
@@ -239,7 +304,7 @@ pub fn prepare() -> u32 {
                 prev: core::ptr::null_mut(),
                 id: count,
                 globals: 0,
-                function: generic,
+                function,
                 arguments,
                 length,
                 destination: &mut binding.compiled,

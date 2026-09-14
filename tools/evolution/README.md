@@ -1,5 +1,9 @@
 # Runtime specialization experiment
 
+The stacked [multi-trace weval experiment](../../docs/weval-ten-times.md) adds
+an opt-in `regions` build and per-region coverage counters. It records both
+incremental comparisons and regressions; a general 10× gain is not established.
+
 This experiment discovers x86 bytecode traces while a real baked container runs,
 freezes its continuation, and produces a successor executor containing specialized
 Wasm and the interpreter fallback. The optimizer itself is a Wasm Block using

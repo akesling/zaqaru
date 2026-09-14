@@ -2,6 +2,8 @@
 set -euo pipefail
 kernel=${1:-alu}
 scale=${2:-4000000}
+feature=${3:-evolution}
+[[ $feature == evolution || $feature == regions ]] || exit 2
 [[ $kernel =~ ^[a-z_]+$ && $scale =~ ^[1-9][0-9]*$ ]] || exit 2
 baseline=benchmark-results/baseline-2x.zaqaru
 if ! echo "cf2c14d9c51cbe9bebfe7297dcba71452deaba1bb68b1ce3fa502ab917fdc5c8  $baseline" | sha256sum --check --status; then
@@ -11,7 +13,7 @@ if ! echo "cf2c14d9c51cbe9bebfe7297dcba71452deaba1bb68b1ce3fa502ab917fdc5c8  $ba
   )
   cp target/evolution-baseline/release/zaqaru "$baseline"
 fi
-cargo build --locked --release -p zaqaru-guest --features evolution --target wasm32-unknown-unknown
+cargo build --locked --release -p zaqaru-guest --features "$feature" --target wasm32-unknown-unknown
 cargo build --locked --release --manifest-path tools/evolution/Cargo.toml --target-dir /work/target
 cargo build --locked --release --manifest-path benchmark-results/browser-compiler/Cargo.toml \
   --target wasm32-unknown-unknown --target-dir /work/target/browser-compiler
