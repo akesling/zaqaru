@@ -3,7 +3,7 @@ set -euo pipefail
 kernel=${1:-alu}
 scale=${2:-4000000}
 feature=${3:-evolution}
-[[ $feature =~ ^(evolution|regions|guarded-stack|stack-forwarding|virtual-flags)(,(guarded-stack|stack-forwarding|virtual-flags))*$ ]] || exit 2
+[[ $feature =~ ^(evolution|regions|guarded-stack|stack-forwarding|virtual-flags|shared-exit|direct-transfers)(,(guarded-stack|stack-forwarding|virtual-flags|shared-exit|direct-transfers))*$ ]] || exit 2
 [[ $kernel =~ ^[a-z_]+$ && $scale =~ ^[1-9][0-9]*$ ]] || exit 2
 baseline=benchmark-results/baseline-2x.zaqaru
 if ! echo "cf2c14d9c51cbe9bebfe7297dcba71452deaba1bb68b1ce3fa502ab917fdc5c8  $baseline" | sha256sum --check --status; then

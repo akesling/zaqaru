@@ -2,6 +2,7 @@
 //! portable optimizer Block, never in a native process launched by an Assembly.
 #[allow(dead_code)] // checkpoint is also compiled into the portable optimizer.
 mod artifact;
+mod profile;
 #[cfg(test)]
 mod tests;
 use anyhow::{Result, ensure};
@@ -45,7 +46,11 @@ fn main() -> Result<()> {
             ensure!(args.len() == 4, "executable INPUT OUTPUT");
             std::fs::write(&args[3], artifact::executable(&std::fs::read(&args[2])?)?)?;
         }
-        _ => anyhow::bail!("expected bake or executable"),
+        Some("profile") => {
+            ensure!((3..=4).contains(&args.len()), "profile INPUT [FUNCTION_INDEX]");
+            profile::print(&std::fs::read(&args[2])?, args.get(3).map(|s| s.parse()).transpose()?)?;
+        }
+        _ => anyhow::bail!("expected bake, executable or profile"),
     }
     Ok(())
 }
