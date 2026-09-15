@@ -2,7 +2,7 @@
 set -euo pipefail
 iterations=${1:-10000000}
 feature=${2:-specialize}
-[[ $feature == specialize || $feature == virtual-flags ]] || exit 2
+[[ $feature =~ ^(specialize|virtual-flags|shared-exit)(,(virtual-flags|shared-exit))*$ ]] || exit 2
 [[ $iterations =~ ^[1-9][0-9]*$ ]] || { echo 'Iterations must be positive' >&2; exit 1; }
 archive=benchmark-results/weval-v0.5.0-x86_64-linux.tar.xz
 if [[ ! -f $archive ]]; then

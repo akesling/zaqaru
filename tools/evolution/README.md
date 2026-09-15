@@ -1,5 +1,45 @@
 # Runtime specialization experiment
 
+For first-use versus warmed execution and generated-code inspection, see
+[the warmed benchmark](../../docs/warmed-specialization.md). It reuses one
+compiled module per variant, restores fresh validated continuations, alternates
+variants, and records all raw samples. Ordinary browser settings are used.
+
+```sh
+bash tools/evolution/run.sh build calls 40 stack-forwarding,virtual-flags
+bash tools/evolution/run.sh capture benchmark-results/evolution-template.wasm \
+  benchmark-results/warm-control 22 benchmark-results/evolution-baseline.wasm
+bash tools/evolution/run.sh warm-browser benchmark-results/warm-browser.json \
+  benchmark-results/warm-control/baseline.json benchmark-results/warm-control/manifest.json
+bash tools/evolution/run.sh warm-node benchmark-results/warm-node.json \
+  benchmark-results/warm-control/manifest.json --profile
+bash tools/evolution/run.sh profile benchmark-results/warm-control/successor.wasm
+```
+
+`capture` runs the existing Wasm compiler and continuation validation, saving a
+hashed successor, its initial local mounts and expected final state. An optional
+baseline produces `baseline.wasm` and `baseline.json` too. Keep each capture in a
+separate directory. `warm-node` and `warm-browser` accept 1–4 manifests followed
+by `--warmups=N` (default 5) and `--samples=N` (default 7). Results distinguish
+initial module compilation, preparation of each fresh instance, first execution,
+warmup runs and measured runs. Baseline preparation boots to the recorded quantum;
+successor preparation resumes its frozen state. Pairwise ratios use time per
+retired instruction when those boundaries differ by at most one quantum.
+
+Warmup is disposable local execution, with no live network mounts. It is a
+measurement of code reuse, not automatic production activation. No browser
+compiler flags are required. The benchmark checks output, status, retirement and
+final process state on every run, plus compiled/region counters on successors.
+`--profile` is Node-only and records ten additional runs per variant in separate
+`.cpuprofile` files **after** timing; profiling can change engine tiering.
+
+The native `profile` helper reports static Wasm operators, declared locals,
+loads/stores, branches and calls by function. With a function index it also
+prints callees, an opcode histogram and byte-offset disassembly. Static counts
+include cold fault/exit paths and do not establish dynamic cost or native spills.
+Build the native helper through `build` before using it; it runs in the existing
+Docker environment and adds no browser import or runtime dependency.
+
 The stacked [multi-trace weval experiment](../../docs/weval-ten-times.md) adds
 an opt-in `regions` build and per-region coverage counters. It records both
 incremental comparisons and regressions; a general 10× gain is not established.

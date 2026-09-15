@@ -1,5 +1,9 @@
 # docs
 
+- [warmed-specialization.md](warmed-specialization.md) — repeated browser
+  continuations, compiler-tier sensitivity, emitted-code profiles and follow-up
+  compiler experiments after PR #4.
+
 - [Optimization report](reports/optimization.html) — standalone HTML summary of
   the benchmark work, engine improvements, browser specialization and remaining limits.
 - [weval-ten-times.md](weval-ten-times.md) — the next stacked experiment:

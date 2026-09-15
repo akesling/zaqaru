@@ -74,6 +74,8 @@ pub enum Op {
     /// Leave the trace: `rip = regs[d]`, hand back to the run loop. The
     /// out-of-trace branch, the indirect jump, the `call`, the `ret` — every
     /// transfer whose target the trace does not contain. Retires.
+    /// A region may set IMMEDIATE and put a proven member offset in IMM;
+    /// this retains transfer budget/dirty-code checks but skips resolution.
     ExitTo = 0,
     /// Run one guest instruction — the one at the guest address in the
     /// following word — through the interpreter, then re-enter the trace at
@@ -553,6 +555,22 @@ fn run_inner<'a, const SPECIALIZE: bool>(
             tcb.flags = flags.snapshot();
         }};
     }
+    // Share the state-materialization epilogue across specialization PCs.
+    // A separate context makes cold fault/preemption exits converge without
+    // merging interpreter PCs that still need constant dispatch. Normal builds
+    // retain their existing returns; the experiment affects SPECIALIZE only.
+    macro_rules! finish {
+        ($exit:lifetime, $leave:expr) => {{
+            if SPECIALIZE && cfg!(feature = "shared-exit") {
+                let leave = $leave;
+                // No u64 bytecode stream in wasm32 can reach this PC.
+                registers::context::<SPECIALIZE>(u32::MAX as usize);
+                break $exit leave;
+            }
+            flush!();
+            return $leave;
+        }};
+    }
     // Self-modifying code: a store that landed on a page some cached block —
     // possibly this very trace — was decoded from must stop execution, so the
     // run loop's drain sees current bytes before the next fetch, exactly as
@@ -562,11 +580,10 @@ fn run_inner<'a, const SPECIALIZE: bool>(
     // fall-through exit stub (the store was the block's last instruction), the
     // stub already sets `rip` to the right place, so leaving is its job.
     macro_rules! break_on_dirty {
-        () => {
+        ($exit:lifetime) => {
             if space.has_dirty_code() && ip!(pc) != ip!(pc - 1) {
                 tcb.rip = ip!(pc);
-                flush!();
-                return Leave::Exit;
+                finish!($exit, Leave::Exit);
             }
         };
     }
@@ -576,7 +593,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
     // runtime value, preventing dispatch specialization. These are compile-time
     // no-ops in the normal engine.
     registers::enter::<SPECIALIZE>();
-    loop {
+    let leave = 'execute: loop {
         registers::context::<SPECIALIZE>(pc);
         let word = word!(pc);
         let op = match Op::from_byte((word >> field::OP) as u8) {
@@ -608,15 +625,19 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 let target = regs.get(d);
                 if spent >= budget {
                     tcb.rip = target;
-                    flush!();
-                    return Leave::Preempted;
+                    finish!('execute, Leave::Preempted);
                 }
                 #[cfg(feature = "specialize")]
                 if let Resolver::Region(entries) = resolver {
                     if space.has_dirty_code() {
                         tcb.rip = target;
-                        flush!();
-                        return Leave::Exit;
+                        finish!('execute, Leave::Exit);
+                    }
+                    #[cfg(feature = "direct-transfers")]
+                    if (word >> field::IMMEDIATE) & 1 != 0 {
+                        pc = imm as usize;
+                        registers::context::<SPECIALIZE>(pc);
+                        continue;
                     }
                     // Keep the directory index in the evaluator's context so
                     // every address and destination stays a known constant.
@@ -647,8 +668,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     }
                     if found { continue; }
                     tcb.rip = target;
-                    flush!();
-                    return Leave::Exit;
+                    finish!('execute, Leave::Exit);
                 }
                 match resolver.resolve(target) {
                     Some(next) => {
@@ -657,8 +677,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                             // Enter generated code through the outer engine,
                             // with registers and retirement fully materialized.
                             tcb.rip = target;
-                            flush!();
-                            return Leave::Exit;
+                            finish!('execute, Leave::Exit);
                         }
                         #[cfg(all(feature = "evolution", target_arch = "wasm32"))]
                         if !SPECIALIZE {
@@ -672,8 +691,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     }
                     None => {
                         tcb.rip = target;
-                        flush!();
-                        return Leave::Exit;
+                        finish!('execute, Leave::Exit);
                     }
                 }
             }
@@ -685,8 +703,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 pc += 1;
                 registers::context::<SPECIALIZE>(pc);
                 tcb.rip = address;
-                flush!();
-                return Leave::Defer { resume: pc };
+                finish!('execute, Leave::Defer { resume: pc });
             }
             Op::Br => {
                 // The guest `jmp` retires; then, on a back-edge, the budget is
@@ -700,8 +717,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 if target <= pc && spent >= budget {
                     // Resume where execution is: at the branch target.
                     tcb.rip = ip!(target);
-                    flush!();
-                    return Leave::Preempted;
+                    finish!('execute, Leave::Preempted);
                 }
                 pc = target;
                 registers::context::<SPECIALIZE>(pc);
@@ -718,8 +734,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     // budget there, in retired-instruction units.
                     if target <= pc && spent >= budget {
                         tcb.rip = ip!(target);
-                        flush!();
-                        return Leave::Preempted;
+                        finish!('execute, Leave::Preempted);
                     }
                     pc = target;
                     registers::context::<SPECIALIZE>(pc);
@@ -820,8 +835,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     Ok(value) => write!(d, width, value),
                     Err(fault) => {
                         tcb.rip = ip!(pc - 1);
-                        flush!();
-                        return Leave::Fault(fault);
+                        finish!('execute, Leave::Fault(fault));
                     }
                 }
                 if retire {
@@ -834,13 +848,12 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 let value = read!(b, width);
                 if let Err(fault) = space.store(address, width, value) {
                     tcb.rip = ip!(pc - 1);
-                    flush!();
-                    return Leave::Fault(fault);
+                    finish!('execute, Leave::Fault(fault));
                 }
                 if retire {
                     spent += 1;
                 }
-                break_on_dirty!();
+                break_on_dirty!('execute);
             }
             Op::Widen | Op::WidenSigned => {
                 let width = width_of(word);
@@ -868,14 +881,13 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     .wrapping_sub(u64::from(width.bytes()));
                 if let Err(fault) = space.store(at, width, value) {
                     tcb.rip = ip!(pc - 1);
-                    flush!();
-                    return Leave::Fault(fault);
+                    finish!('execute, Leave::Fault(fault));
                 }
                 regs.set(crate::state::STACK_POINTER, at);
                 if retire {
                     spent += 1;
                 }
-                break_on_dirty!();
+                break_on_dirty!('execute);
             }
             Op::Pop => {
                 let width = width_of(word);
@@ -890,8 +902,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     }
                     Err(fault) => {
                         tcb.rip = ip!(pc - 1);
-                        flush!();
-                        return Leave::Fault(fault);
+                        finish!('execute, Leave::Fault(fault));
                     }
                 }
                 if retire {
@@ -1094,8 +1105,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 if holds {
                     if target <= pc && spent >= budget {
                         tcb.rip = ip!(target);
-                        flush!();
-                        return Leave::Preempted;
+                        finish!('execute, Leave::Preempted);
                     }
                     pc = target;
                     registers::context::<SPECIALIZE>(pc);
@@ -1109,8 +1119,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 // and it did not retire, so re-interpreting it is exact.
                 if divisor == 0 {
                     tcb.rip = ip!(pc - 1);
-                    flush!();
-                    return Leave::Defer { resume: pc };
+                    finish!('execute, Leave::Defer { resume: pc });
                 }
                 let bits = u64::from(width.bits());
                 let low = regs.get(0) & width.mask(); // RAX
@@ -1139,8 +1148,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 };
                 if overflows {
                     tcb.rip = ip!(pc - 1);
-                    flush!();
-                    return Leave::Defer { resume: pc };
+                    finish!('execute, Leave::Defer { resume: pc });
                 }
                 write!(0, width, width.truncate(quotient as u64)); // RAX = quotient
                 write!(2, width, width.truncate(remainder as u64)); // RDX = remainder
@@ -1158,8 +1166,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     let mut bytes = [0u8; 16];
                     if let Err(fault) = space.read(address, &mut bytes) {
                         tcb.rip = ip!(pc - 1);
-                        flush!();
-                        return Leave::Fault(fault);
+                        finish!('execute, Leave::Fault(fault));
                     }
                     bytes
                 } else if matches!(op, Op::VecStore) {
@@ -1173,8 +1180,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                         let address = regs.get(a).wrapping_add(imm as i32 as i64 as u64);
                         if let Err(fault) = space.write(address, &source) {
                             tcb.rip = ip!(pc - 1);
-                            flush!();
-                            return Leave::Fault(fault);
+                            finish!('execute, Leave::Fault(fault));
                         }
                     }
                     Op::VecMov => tcb.vectors[d] = vector_words(&source),
@@ -1215,8 +1221,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     Ok(value) => value,
                     Err(fault) => {
                         tcb.rip = ip!(pc - 1);
-                        flush!();
-                        return Leave::Fault(fault);
+                        finish!('execute, Leave::Fault(fault));
                     }
                 };
                 let sub = (word >> field::CONDITION) & 0xf;
@@ -1237,13 +1242,12 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 }
                 if let Err(fault) = space.store(address, width, result) {
                     tcb.rip = ip!(pc - 1);
-                    flush!();
-                    return Leave::Fault(fault);
+                    finish!('execute, Leave::Fault(fault));
                 }
                 if retire {
                     spent += 1;
                 }
-                break_on_dirty!();
+                break_on_dirty!('execute);
             }
             Op::LoadX => {
                 let width = width_of(word);
@@ -1256,8 +1260,7 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                     Ok(value) => write!(d, width, value),
                     Err(fault) => {
                         tcb.rip = ip!(pc - 1);
-                        flush!();
-                        return Leave::Fault(fault);
+                        finish!('execute, Leave::Fault(fault));
                     }
                 }
                 if retire {
@@ -1274,16 +1277,17 @@ fn run_inner<'a, const SPECIALIZE: bool>(
                 let value = read!(d, width);
                 if let Err(fault) = space.store(address, width, value) {
                     tcb.rip = ip!(pc - 1);
-                    flush!();
-                    return Leave::Fault(fault);
+                    finish!('execute, Leave::Fault(fault));
                 }
                 if retire {
                     spent += 1;
                 }
-                break_on_dirty!();
+                break_on_dirty!('execute);
             }
         }
-    }
+    };
+    flush!();
+    leave
 }
 
 /// The sixteen bytes of a 128-bit XMM register, little-endian — the order a

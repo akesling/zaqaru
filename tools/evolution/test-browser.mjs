@@ -6,6 +6,28 @@ import { resolve, extname, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { once } from 'node:events';
 const root = resolve('.');
+const args = process.argv.slice(2);
+const warm = args[0] === '--warm';
+let query;
+let output = 'benchmark-results/evolution-browser.json';
+if (warm) {
+  args.shift();
+  output = args.shift();
+  const manifests = args.filter(arg => !arg.startsWith('--'));
+  if (!output || !manifests.length || args.some(arg => arg.startsWith('--') && !/^--(warmups|samples)=[0-9]+$/.test(arg))) {
+    throw new Error('Usage: node tools/evolution/test-browser.mjs --warm OUTPUT.json MANIFEST... [--warmups=5] [--samples=7]');
+  }
+  const paths = manifests.map(path => {
+    const absolute = resolve(path);
+    if (!absolute.startsWith(root + sep)) throw new Error('manifest outside repository');
+    return '/' + absolute.slice(root.length + 1).split(sep).join('/');
+  });
+  query = '?' + new URLSearchParams({ manifests: JSON.stringify(paths),
+    warmups: args.find(arg => arg.startsWith('--warmups='))?.split('=')[1] ?? '5',
+    samples: args.find(arg => arg.startsWith('--samples='))?.split('=')[1] ?? '7' });
+} else {
+  query = args[0] === undefined ? '' : `?regionMembers=${encodeURIComponent(args[0])}`;
+}
 const server = createServer(async (req, res) => {
   try {
     const path = resolve(root, '.' + new URL(req.url, 'http://localhost').pathname);
@@ -52,7 +74,6 @@ try {
     };
     socket.addEventListener('message', listener);
   });
-  const query = process.argv[2] === undefined ? '' : `?regionMembers=${encodeURIComponent(process.argv[2])}`;
   const navigation = await command('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/tools/evolution/index.html${query}`}, sessionId);
   if (navigation.errorText) throw new Error(navigation.errorText);
   await loaded;
@@ -62,10 +83,15 @@ try {
   }, sessionId);
   if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
   const value = result.result.value;
-  console.log(JSON.stringify(value, null, 2));
-  await writeFile('benchmark-results/evolution-browser.json', JSON.stringify(value, null, 2));
-  if (value.result) await writeFile(`benchmark-results/evolution-browser-${value.result.stdout.split(' ')[0]}.json`, JSON.stringify(value.result, null, 2));
-  if (value.result) await writeFile(`benchmark-results/evolution-browser-${value.result.stdout.split(' ')[0]}-${value.result.totalRetired}.json`, JSON.stringify(value.result, null, 2));
+  console.log(JSON.stringify(warm && value.result ? {
+    engine: value.result.engine,
+    variants: value.result.variants.map(v => ({ name: v.name, firstMs: v.runs[0].executionMs,
+      medianExecutionMs: v.medianExecutionMs, medianInstantiationMs: v.medianInstantiationMs })),
+    pairedSpeedups: value.result.pairedSpeedups,
+  } : value, null, 2));
+  await writeFile(output, JSON.stringify(value, null, 2));
+  if (!warm && value.result) await writeFile(`benchmark-results/evolution-browser-${value.result.stdout.split(' ')[0]}.json`, JSON.stringify(value.result, null, 2));
+  if (!warm && value.result) await writeFile(`benchmark-results/evolution-browser-${value.result.stdout.split(' ')[0]}-${value.result.totalRetired}.json`, JSON.stringify(value.result, null, 2));
   if (value.error) throw new Error(value.error);
 } finally {
   socket?.close();

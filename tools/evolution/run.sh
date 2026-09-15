@@ -13,6 +13,11 @@ case ${1:-help} in
     ;;
   node) shift; exec node tools/evolution/test-node.mjs "$@" ;;
   browser) shift; exec node tools/evolution/test-browser.mjs "$@" ;;
+  capture) shift; exec node tools/evolution/capture-node.mjs "$@" ;;
+  warm-node) shift; exec node tools/evolution/warm-node.mjs "$@" ;;
+  warm-browser) shift; exec node tools/evolution/test-browser.mjs --warm "$@" ;;
+  profile) shift; exec tools/microbench/experiment.sh exec target/release/zaqaru-evolution profile "$@" ;;
   *) echo 'Usage: bash tools/evolution/run.sh {prepare [STRUCTFS_REPO]|build [KERNEL SCALE [FEATURES]]|node [REGION_MEMBERS]|browser [REGION_MEMBERS]}'
-     echo 'FEATURES: evolution (default), regions, guarded-stack, stack-forwarding, virtual-flags; experiments may be comma-separated.' ;;
+     echo 'Additional commands: capture TEMPLATE OUTPUT_DIR [REGION_MEMBERS] [BASELINE], warm-node OUTPUT.json MANIFEST..., warm-browser OUTPUT.json MANIFEST..., profile MODULE [FUNCTION_INDEX]'
+     echo 'FEATURES: evolution (default), regions, guarded-stack, stack-forwarding, virtual-flags, shared-exit, direct-transfers; experiments may be comma-separated.' ;;
 esac

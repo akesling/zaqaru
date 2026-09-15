@@ -64,7 +64,7 @@ function stdout(container) {
 
 // First transition proof, not yet an Assembly-management implementation. Keeping
 // this distinction explicit prevents a host-side demo becoming the architecture.
-export async function demo({ compiler, template, baseline, warmup = 10000000, regionMembers, log = () => {} }) {
+export async function demo({ compiler, template, baseline, warmup = 10000000, regionMembers, log = () => {}, onArtifact }) {
   const sourceBytes = await optimizerRequest(compiler, 'executable', { wasm: toBase64(template) });
   const source = await executor(sourceBytes, standardMounts());
   const ex = source.instance.exports;
@@ -89,6 +89,10 @@ export async function demo({ compiler, template, baseline, warmup = 10000000, re
     stackPointer: frozen.stackPointer, pages: sparse(frozen.memory),
   });
   const compileMs = performance.now() - started;
+  // Save external state before the validation run consumes the continuation.
+  // This mount capture is included in transition time; the artifact-writing
+  // hook below runs after all measurements.
+  const artifactMounts = onArtifact ? frozen.mounts.save() : null;
   const successor = await executor(successorBytes, frozen.mounts);
   const next = successor.instance.exports;
   check(next.zaqaru_run(-1n) === 3, 'successor did not preserve frozen state');
@@ -114,8 +118,11 @@ export async function demo({ compiler, template, baseline, warmup = 10000000, re
   check(compiledRetired > 0n, 'successor never executed generated code');
   let baselineMs = null;
   let baselineWarmupRetired = null;
+  let baselineArtifact;
   if (baseline) {
-    const historical = await executor(baseline, standardMounts());
+    const mounts = standardMounts();
+    const savedMounts = onArtifact ? mounts.save() : null;
+    const historical = await executor(baseline, mounts);
     check(historical.instance.exports.zaqaru_run(BigInt(warmupRetired)) === 0, 'historical baseline ended during warmup');
     baselineWarmupRetired = historical.value('statistics').retired;
     const begin = performance.now();
@@ -125,6 +132,11 @@ export async function demo({ compiler, template, baseline, warmup = 10000000, re
     check(historical.value('statistics').retired === successor.value('statistics').retired, 'historical retirement differs');
     check(Math.abs(baselineWarmupRetired - warmupRetired) <= 100100,
       `warmup drift exceeds one scheduler quantum: ${warmupRetired} vs ${baselineWarmupRetired}`);
+    if (onArtifact) baselineArtifact = { wasm: baseline, mounts: savedMounts,
+      expected: { status: successorStatus, stdout: stdout(historical),
+        totalRetired: historical.value('statistics').retired,
+        processes: historical.value('processes') },
+      warmupTarget: warmupRetired, warmupRetired: baselineWarmupRetired };
   }
   const hashes = Object.fromEntries(await Promise.all(
     Object.entries({compiler, template, baseline, successor: successorBytes}).filter(([, bytes]) => bytes)
@@ -150,5 +162,15 @@ export async function demo({ compiler, template, baseline, warmup = 10000000, re
     engine: globalThis.navigator?.userAgent ?? 'unknown',
     note: 'Single tail measurement after warmup. Historical warmup may differ by one scheduler quantum; normalizedBaselineSpeedup corrects for retired work. executionSpeedup uses an exact paired experimental continuation. Transition includes freeze, optimization and successor instantiation. Not a general or end-to-end speedup claim.' };
   log(JSON.stringify(result));
+  if (onArtifact) await onArtifact({
+    wasm: successorBytes, mounts: artifactMounts,
+    expected: { status: successorStatus, stdout: stdout(reference),
+      totalRetired: reference.value('statistics').retired,
+      processes: reference.value('processes'),
+      compiledRetired: result.compiledRetired, regionRetired: result.regionRetired,
+      regionEntries: result.regionEntries },
+    measurement: result,
+    baselineArtifact,
+  });
   return result;
 }

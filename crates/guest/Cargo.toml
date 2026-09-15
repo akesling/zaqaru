@@ -19,6 +19,8 @@ regions = ["evolution", "cpu/regions"]
 guarded-stack = ["regions", "cpu/guarded-stack"]
 stack-forwarding = ["guarded-stack", "cpu/stack-forwarding"]
 virtual-flags = ["regions", "cpu/virtual-flags"]
+shared-exit = ["regions", "cpu/shared-exit"]
+direct-transfers = ["regions", "cpu/direct-transfers"]
 
 [dependencies]
 cpu = { package = "zaqaru-cpu", path = "../cpu" }
