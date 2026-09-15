@@ -9,7 +9,42 @@ workflow runs `web/demo.sh`, checks the snapshot answers `GET /` with
 Django's page (`check-demo.mjs`), and deploys it beside the page and the
 landing page in `web/pages/`. Nothing built is committed.
 
-To make the demo locally, which wants docker and about a minute:
+To build and serve the same debugger demo locally in one command:
+
+```sh
+bash web/serve.sh
+```
+
+The server starts and prints its full URL immediately. Open it while the demo
+builds: a waiting page reloads automatically once the snapshot is validated.
+The page shows the current stage, elapsed time and latest boot progress; the
+terminal prints a status update every ten seconds even during compression.
+Brotli quality 10 displays a rough two-minute estimate, not a measured percentage
+or a guaranteed completion time.
+Then press **Send**. An optional port argument changes
+the default 8000. Ctrl-C stops the server. This needs Docker running, Node and
+Python 3. Rust, the Wasm linker and the Linux native build run inside the existing
+amd64 Docker toolchain, including on Apple Silicon; no host Rust installation is
+needed. Node boots and validates the generated Wasm locally.
+The first build and snapshot compression can take several minutes. Subsequent
+launches reuse the validated module and compressed snapshot without Docker or
+Node execution. Local source/build inputs and generated artifacts are checked by
+content hash; changed inputs, missing files or damaged artifacts trigger a rebuild.
+The cache record is written only after validation succeeds. Artifacts from the
+older script require one build to establish this record.
+
+```sh
+bash web/demo.sh                 # build everything, including compression; exit
+bash web/serve.sh                # serve cached artifacts; build only if needed
+bash web/serve.sh 8080           # choose a different port
+bash web/serve.sh --rebuild      # explicitly rebuild, then serve
+```
+
+Cached serving needs only Python 3. A rebuild also needs Docker and Node.
+Remote image tags and package indexes are not polled on launch; `--rebuild`
+reruns the build, subject to Docker's normal layer caching.
+
+To build the assets and serve them separately:
 
     web/demo.sh                           # bakes demo/hello-django, boots it under Node, writes the snapshot
     python3 -m http.server -d . 8000

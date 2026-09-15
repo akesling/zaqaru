@@ -36,6 +36,7 @@ const quietInstructions = Number(option("quiet-instructions", 2000000));
 const brotli = args.includes("--brotli") ? Number(option("brotli", "9")) || 9 : null;
 
 const started = performance.now();
+console.error('demo-progress: Loading Wasm and booting the Django container');
 const module = await WebAssembly.compile(readFileSync(modulePath));
 const fresh = await Container.instantiate(module, standardMounts());
 const freshMemory = new Uint8Array(fresh.memory.buffer).slice();
@@ -80,6 +81,7 @@ if (finished !== null) {
 // the pooled page buffers are zeroed, the decompressed files' buffers are
 // left out and refilled by whoever continues from the file, and guest pages
 // no process maps are left out since they are filled before reuse.
+console.error('demo-progress: Preparing the booted memory snapshot');
 const { flushed, pooled, cache, cacheRanges, gaps } = prepare(container);
 const memory = new Uint8Array(container.memory.buffer);
 const pages = changedSince(freshMemory, memory);
@@ -97,10 +99,12 @@ const file = encode({
 // gzip, or brotli wrapped with the inflated length (see brotli.js): about
 // a fifth smaller, at the cost of the page inflating it itself.
 const compressing = performance.now();
+console.error(`demo-progress: Compressing ${(file.length / 1048576).toFixed(1)} MB with ${brotli ? `Brotli quality ${brotli}` : 'gzip'}${brotli === 10 ? ' — rough estimate: about 2 minutes, varies by machine' : ''}`);
 const compressed = brotli
   ? wrap(brotliCompressSync(file, { params: { [constants.BROTLI_PARAM_QUALITY]: brotli, [constants.BROTLI_PARAM_LGWIN]: 24, [constants.BROTLI_PARAM_SIZE_HINT]: file.length } }), file.length)
   : await gzip(file);
 const compressedIn = performance.now() - compressing;
+console.error('demo-progress: Writing the compressed snapshot');
 writeFileSync(outPath, compressed);
 console.error(
   `preboot: quiet at ${retired.toLocaleString()} instructions after ${((performance.now() - started) / 1000).toFixed(0)} s; ` +
