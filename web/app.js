@@ -608,7 +608,9 @@ function makeTerminalPanel() {
   const element = document.createElement("section");
   element.className = "panel terminal";
   element.id = "terminal";
-  element.innerHTML = `<h2><span class="path">port ${terminalPort}</span> — a session in the container<span class="tools"><button id="term-machine" type="button" title="the processes, files and timeline behind this session">show the machine</button></span></h2>
+  // Titled by what is at the other end, once it says (see `terminalWrite`);
+  // until then, all the page knows is the port.
+  element.innerHTML = `<h2><span class="path" id="term-title">port ${terminalPort}</span><span id="term-sub"> — a session in the container</span><span class="tools"><button id="term-machine" type="button" title="the processes, files and timeline behind this session">show the machine</button></span></h2>
     <pre id="term-out"></pre>
     <form id="term-form"><span class="prompt">›</span><input id="term-in" type="text" autocomplete="off" spellcheck="false" placeholder="humility tasks"></form>`;
   $("panels").appendChild(element);
@@ -641,7 +643,24 @@ function openTerminal() {
   $("term-in").focus();
 }
 
+/// What arrives may hold a title for the session — OSC 0 or 2, the escape a
+/// program titles its terminal window with: `ESC ] 0 ; title BEL`, or `ST`
+/// in place of the BEL. It names the panel and is not printed. A sequence
+/// split across two arrivals waits for the rest.
+let terminalPending = "";
 function terminalWrite(text) {
+  text = terminalPending + text;
+  terminalPending = "";
+  const unfinished = text.lastIndexOf("\x1b]");
+  if (unfinished >= 0 && !/[\x07]|\x1b\\/.test(text.slice(unfinished))) {
+    terminalPending = text.slice(unfinished);
+    text = text.slice(0, unfinished);
+  }
+  text = text.replace(/\x1b\]([02]);([^\x07\x1b]*)(?:\x07|\x1b\\)/g, (_, kind, title) => {
+    $("term-title").textContent = title;
+    $("term-sub").textContent = "";
+    return "";
+  });
   const out = $("term-out");
   out.textContent += text;
   out.scrollTop = out.scrollHeight;

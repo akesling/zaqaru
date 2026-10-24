@@ -403,6 +403,8 @@ try {
     await until(`document.readyState === "complete" && !!window.zaqaruDebug && window.zaqaruDebug.live === true`, 180000);
     const greeting = await until(`(() => { const t = ${term}; return t.endsWith("$ ") ? t : ""; })()`, 120000);
     check("the terminal's session greets with a prompt", /Hubris/.test(greeting) && /humility tasks/.test(greeting), greeting.slice(0, 200));
+    const title = await evaluate(`document.querySelector("#terminal h2").textContent`);
+    check("the session titles its panel, and the title is not printed", /^humility — Hubris on an STM32G031 Nucleo/.test(title) && !greeting.includes("\x1b") && !greeting.includes("]0;"), title);
     const opening = await evaluate(`document.body.classList.contains("opening") && document.body.classList.contains("bench")`);
     check("the page opens on the terminal and the board", opening === true, String(opening));
     const asked = Date.now();

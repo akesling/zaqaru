@@ -96,6 +96,10 @@ const HELP: &str = "\
 
 const PROMPT: &[u8] = b"$ ";
 
+/// What the session is, as a terminal's title: OSC 0, the escape a program
+/// sets its window's title with, which a terminal shows and does not print.
+const TITLE: &[u8] = b"\x1b]0;humility \xe2\x80\x94 Hubris on an STM32G031 Nucleo\x07";
+
 pub(crate) fn accept_requests(listener: TcpListener, door: Arc<FrontDoor>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -112,6 +116,7 @@ fn session(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
     // session nobody types into costs one parked thread.
     let mut lines = BufReader::new(stream.try_clone()?).take(1 << 20);
     let mut out = stream;
+    out.write_all(TITLE)?;
     out.write_all(BANNER.as_bytes())?;
     out.write_all(PROMPT)?;
     let mut line = String::new();
