@@ -256,6 +256,38 @@ export class Edge {
       else this.waiting.push({ port, request, resolve, halfClose });
     });
   }
+  /// Opens a connection to `port` that stays open, as a terminal's does.
+  /// What the guest writes reaches `received` as it is written, and
+  /// `ended` is told once, when the guest closes. Answers a handle whose
+  /// `send(bytes)` delivers more to the guest and whose `close()` is the
+  /// page's end of file. Before the port is listened on, the connection
+  /// waits, and what is sent waits with it.
+  open(port, { received, ended }) {
+    if (!this.published.has(port)) throw `port ${port} is not published`;
+    const connection = { id: null, incoming: new Uint8Array(0), outgoing: [], closed: false, received, ended };
+    const start = () => {
+      connection.id = this.first + this.connections.length;
+      this.connections.push(connection);
+      this.events.push(`open ${connection.id} ${port} 127.0.0.1:${40000 + connection.id}`);
+      if (connection.incoming.length) this.events.push(`data ${connection.id}`);
+      if (connection.eof) this.events.push(`eof ${connection.id}`);
+    };
+    if (this.listening.has(port)) start();
+    else this.waiting.push({ port, start });
+    return {
+      send: (more) => {
+        const joined = new Uint8Array(connection.incoming.length + more.length);
+        joined.set(connection.incoming);
+        joined.set(more, connection.incoming.length);
+        connection.incoming = joined;
+        if (connection.id !== null) this.events.push(`data ${connection.id}`);
+      },
+      close: () => {
+        connection.eof = true;
+        if (connection.id !== null) this.events.push(`eof ${connection.id}`);
+      },
+    };
+  }
   connect(port, request, resolve, halfClose) {
     const id = this.first + this.connections.length;
     this.connections.push({ incoming: request.slice(), outgoing: [], resolve, closed: false });
@@ -290,16 +322,26 @@ export class Edge {
         this.listening.add(port);
         const arrived = this.waiting.filter((w) => w.port === port);
         this.waiting = this.waiting.filter((w) => w.port !== port);
-        for (const { request, resolve, halfClose } of arrived) this.connect(port, request, resolve, halfClose);
+        for (const waiting of arrived) {
+          if (waiting.start) waiting.start();
+          else this.connect(port, waiting.request, waiting.resolve, waiting.halfClose);
+        }
       }
       return segmentsOf(["iso", "net", published ? "listener" : "loopback", String(port)]);
     }
     if (what === "conn") {
       const connection = this.connections[Number(which) - this.first];
       if (!connection) throw "a connection that is not open";
-      if (leaf === "tx") connection.outgoing.push(data.slice());
-      else if (leaf === "ctl") {
-        if (!connection.closed) {
+      if (leaf === "tx") {
+        if (connection.received) connection.received(data.slice());
+        else connection.outgoing.push(data.slice());
+      } else if (leaf === "ctl") {
+        if (connection.received) {
+          if (!connection.closed) {
+            connection.closed = true;
+            connection.ended?.();
+          }
+        } else if (!connection.closed) {
           connection.closed = true;
           const total = connection.outgoing.reduce((n, part) => n + part.length, 0);
           const response = new Uint8Array(total);

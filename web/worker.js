@@ -24,9 +24,12 @@
 //               { type: "seek", at, context }           context: { pid, tid, path }
 //               { type: "read", id, path }              one path, at the instant in view
 //               { type: "request", id, port, request }  live: through the edge
+//               { type: "open", id, port }               live: a connection that stays open
+//               { type: "write", id, data }              live: more for an open connection
 // Messages out: { type: "loaded", ... }  { type: "progress", ... }
 //               { type: "state", ... }   { type: "value", id, path, value | error }
 //               { type: "response", id, response }
+//               { type: "stream", id, data | ended }      what an open connection's guest wrote
 //               { type: "error", message }
 
 import { Container, Edge, KIND, MountTable, parseTape, standardMounts, text } from "./zaqaru.js";
@@ -346,6 +349,21 @@ function request(id, port, body) {
     .catch((why) => postMessage({ type: "response", id, error: String(why) }));
 }
 
+/// Live: a connection that stays open, as a terminal's does. What the guest
+/// writes is posted as the frontier runs into it.
+const streams = new Map();
+function openStream(id, port) {
+  if (!edge) return postMessage({ type: "stream", id, ended: true, error: "not a live run" });
+  const handle = edge.open(port, {
+    received: (data) => postMessage({ type: "stream", id, data: text(data) }),
+    ended: () => {
+      streams.delete(id);
+      postMessage({ type: "stream", id, ended: true });
+    },
+  });
+  streams.set(id, handle);
+}
+
 onmessage = async (event) => {
   const message = event.data;
   try {
@@ -354,6 +372,8 @@ onmessage = async (event) => {
     else if (message.type === "seek") await seek(message.at, message.context);
     else if (message.type === "read") readOne(message.id, message.path);
     else if (message.type === "request") request(message.id, message.port, message.request);
+    else if (message.type === "open") openStream(message.id, message.port);
+    else if (message.type === "write") streams.get(message.id)?.send(new TextEncoder().encode(message.data));
   } catch (why) {
     postMessage({ type: "error", message: String(why?.stack ?? why) });
   }

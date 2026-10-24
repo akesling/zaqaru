@@ -2,10 +2,11 @@
 // the run loads, a seek lands on the instruction, the panels fill in,
 // clicking a syscall seeks to it, a live server answers through the edge, a
 // snapshot continues, and — when web/demo.sh has been run — Django answers
-// and is seekable.
+// and is seekable; when demo/hubris/build.sh has, Humility reads Hubris's
+// tasks off the board the kernel runs.
 //
 //   node web/browser-test.mjs [--browser chrome|firefox] [--binary path]
-//                             [--driver geckodriver] [--only replay|live|snapshot|django]
+//                             [--driver geckodriver] [--only replay|live|snapshot|django|hubris]
 //
 // Chrome is driven over the DevTools protocol, Firefox over WebDriver
 // through geckodriver. A Firefox installed as a snap wants the snap's own
@@ -29,6 +30,7 @@ const driver = option("driver", "geckodriver");
 const runs = (scenario) => only === null || only === scenario;
 const types = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm", ".bin": "application/octet-stream", ".snapshot": "application/octet-stream", ".txt": "text/plain" };
 const demo = existsSync(join(root, "web/demo/hello-django.snapshot"));
+const hubris = existsSync(join(root, "web/demo/hubris.wasm"));
 
 const server = createServer(async (request, response) => {
   const path = normalize(decodeURIComponent(new URL(request.url, "http://x").pathname));
@@ -391,6 +393,49 @@ try {
     const focusedSomething = await evaluate(`document.querySelector(".panel.focused")?.dataset.pattern ?? document.querySelector(".panel.focused")?.id ?? ""`);
     check("clicking it lights the panel that holds what it names", /files|descriptors|net/.test(focusedSomething), focusedSomething);
   } else if (runs("django")) console.log("     (no web/demo/hello-django.snapshot: the django scenario is skipped; make it with web/demo.sh)");
+
+  // The Hubris bench, when it has been made: a board the kernel runs, and a
+  // terminal in session with Humility beside it.
+  if (hubris && runs("hubris")) {
+    const term = `document.getElementById("term-out").textContent`;
+    const type = (line) => evaluate(`document.getElementById("term-in").value = ${JSON.stringify(line)}; document.getElementById("term-form").requestSubmit()`);
+    await navigate(`http://127.0.0.1:${port}/web/?module=demo/hubris.wasm&live=80&terminal=80`);
+    await until(`document.readyState === "complete" && !!window.zaqaruDebug && window.zaqaruDebug.live === true`, 180000);
+    const greeting = await until(`(() => { const t = ${term}; return t.endsWith("$ ") ? t : ""; })()`, 120000);
+    check("the terminal's session greets with a prompt", /Hubris/.test(greeting) && /humility tasks/.test(greeting), greeting.slice(0, 200));
+    const opening = await evaluate(`document.body.classList.contains("opening") && document.body.classList.contains("bench")`);
+    check("the page opens on the terminal and the board", opening === true, String(opening));
+    const asked = Date.now();
+    await type("humility tasks");
+    const tasks = await until(`(() => { const t = ${term}; return /RUNNING[\\s\\S]*\\$ $/.test(t) ? t : ""; })()`, 300000);
+    check("humility, through the kernel's probe, lists Hubris's tasks", /pong/.test(tasks) && /idle\s+0\s+5 RUNNING/.test(tasks), tasks.slice(-400));
+    console.log(`     humility tasks answered in ${((Date.now() - asked) / 1000).toFixed(1)} s`);
+    // The board is a path in the container's store, so it has a panel
+    // without the page being told about boards — and it stays current while
+    // the page plays.
+    const firstPanel = await until(`(() => { const b = document.querySelector('[data-pattern="board"] .body')?.textContent ?? ""; return /stm32g031/.test(b) ? b : ""; })()`, 120000);
+    check("the board has a panel, read from the store", /running/.test(firstPanel) && /pc0x/.test(firstPanel), firstPanel.slice(0, 300));
+    const led = await evaluate(`!!document.querySelector('[data-pattern="board"] .led')`);
+    check("the board panel draws the LED", led === true, String(led));
+    const before = await evaluate(`Number(/([\\d.]+) s simulated/.exec(document.querySelector('[data-pattern="board"] .body').textContent)?.[1] ?? 0)`);
+    await type("humility hiffy -c UserLeds.led_toggle -a index=0");
+    const hiffy = await until(`(() => { const t = ${term}; return /led_toggle\\(\\) => \\(\\)[\\s\\S]*\\$ $/.test(t) ? t : ""; })()`, 300000);
+    check("a hiffy call through the terminal reaches the board", /UserLeds\.led_toggle\(\) => \(\)/.test(hiffy), hiffy.slice(-200));
+    const after = await until(`(() => { const s = Number(/([\\d.]+) s simulated/.exec(document.querySelector('[data-pattern="board"] .body').textContent)?.[1] ?? 0); return s > ${before} ? s : 0; })()`, 60000);
+    check("the board panel keeps up as the run goes on", after > before, `${before} -> ${after}`);
+    const consoleText = await evaluate(`document.getElementById("stderr").textContent`);
+    check("the board's events reach the console", /\[board\s+[\d.]+ ms\] GPIOC/.test(consoleText), consoleText.slice(0, 200));
+    // And the slider seeks the board too: it is kernel state, so a
+    // checkpoint holds it and re-execution replays its clock.
+    await evaluate(`document.getElementById("play").textContent === "pause" && document.getElementById("play").click()`);
+    await until(`!window.zaqaruDebug.busy`);
+    await evaluate(`document.getElementById("term-machine").click()`);
+    const middle = await evaluate(`Math.floor((window.zaqaruDebug.origin + window.zaqaruDebug.frontier) / 2)`);
+    await evaluate(`window.zaqaruDebug.seek(${middle})`);
+    await until(`!window.zaqaruDebug.busy && window.zaqaruDebug.current === ${middle}`, 180000);
+    const earlier = await evaluate(`Number(/([\\d.]+) s simulated/.exec(document.querySelector('[data-pattern="board"] .body')?.textContent ?? "")?.[1] ?? -1)`);
+    check("seeking back shows the board as it was then", earlier >= 0 && earlier < after, `${earlier} at ${middle.toLocaleString()} vs ${after} at the frontier`);
+  } else if (runs("hubris")) console.log("     (no web/demo/hubris.wasm: the hubris scenario is skipped; make it with demo/hubris/build.sh)");
 } catch (why) {
   console.log("FAIL " + why);
   failures++;

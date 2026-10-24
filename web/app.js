@@ -194,6 +194,13 @@ worker.onmessage = (event) => {
       status(`${where} — send the request · loaded in ${(message.loading / 1000).toFixed(1)} s${message.inflated ? ` (${(message.inflated / 1000).toFixed(1)} s inflating)` : ""}`);
       // Nothing has happened yet: the edge box alone, until something has.
       if (message.published.length) document.body.classList.add("opening");
+      // A terminal: open its session now, and run, so that whatever
+      // answers on the port greets it.
+      if (terminalPort) {
+        document.body.classList.add("bench");
+        openTerminal();
+        if (!playing && finished === null) $("play").click();
+      }
     } else {
       $("status").textContent = `${total.toLocaleString()} instructions · ${timeline.length} syscalls · ${exchanges.length} exchanges · ${message.checkpoints.length} checkpoints holding ${mb(message.held)} · ${message.bytecode ? "bytecode" : "interpreter"} · loaded in ${(message.loading / 1000).toFixed(1)} s`;
     }
@@ -228,6 +235,12 @@ worker.onmessage = (event) => {
         else stop();
       } else seek(current + playing);
     }
+    return;
+  }
+  if (message.type === "stream") {
+    if (message.id !== terminalId) return;
+    if (message.data) terminalWrite(message.data);
+    if (message.ended) terminalWrite(`\n[the session ended${message.error ? `: ${message.error}` : ""}]\n`);
     return;
   }
   if (message.type === "value") {
@@ -505,7 +518,7 @@ function go(at, focus) {
 // are. Which panels stand in the open, which fold under "the machine" and
 // which under "kernel internals" is the one opinion the page keeps.
 
-const OPEN = ["processes", FILES, DESCRIPTORS, "net"];
+const OPEN = ["board", "processes", FILES, DESCRIPTORS, "net"];
 const MACHINE = [
   "processes/{pid}/threads/{tid}/registers",
   "processes/{pid}/threads/{tid}/disassembly",
@@ -547,6 +560,8 @@ function buildPanels() {
   const readable = Object.entries(meta?.paths ?? {})
     .filter(([pattern, lens]) => lens.readable && pattern !== "meta" && !pattern.startsWith("meta/"))
     .map(([pattern]) => pattern);
+  // A session with the container, when the page was asked for one.
+  if (terminalPort) makeTerminalPanel();
   for (const pattern of OPEN) if (readable.includes(pattern)) makePanel(pattern, pattern, $("panels"));
   // The host's side of the boundary, which is not a path of the
   // container's store but is what the page is to it: its edge, its console.
@@ -575,6 +590,61 @@ function makeEdgePanel() {
     event.preventDefault();
     send(Number($("port").value), $("request").value.replace(/\\n/g, "\n").replace(/\\r/g, "\r"));
   };
+}
+
+// ---- the terminal -------------------------------------------------------------
+//
+// With `&terminal=PORT`, a session with whatever listens on that port in the
+// container: one connection, held open, a line at a time. What the guest
+// writes appears as it is written — which is as the frontier runs into it,
+// so the page plays while a session is open.
+
+const terminalPort = Number(new URLSearchParams(location.search).get("terminal")) || null;
+let terminalId = null;
+const terminalHistory = [];
+let terminalRecall = 0;
+
+function makeTerminalPanel() {
+  const element = document.createElement("section");
+  element.className = "panel terminal";
+  element.id = "terminal";
+  element.innerHTML = `<h2><span class="path">port ${terminalPort}</span> — a session in the container<span class="tools"><button id="term-machine" type="button" title="the processes, files and timeline behind this session">show the machine</button></span></h2>
+    <pre id="term-out"></pre>
+    <form id="term-form"><span class="prompt">›</span><input id="term-in" type="text" autocomplete="off" spellcheck="false" placeholder="humility tasks"></form>`;
+  $("panels").appendChild(element);
+  $("term-form").onsubmit = (event) => {
+    event.preventDefault();
+    const line = $("term-in").value;
+    $("term-in").value = "";
+    if (line.trim() && terminalHistory[terminalHistory.length - 1] !== line) terminalHistory.push(line);
+    terminalRecall = terminalHistory.length;
+    // The session does not echo, as a terminal's line discipline would.
+    terminalWrite(line + "\n");
+    worker.postMessage({ type: "write", id: terminalId, data: line + "\n" });
+    if (!playing && finished === null) $("play").click();
+  };
+  $("term-in").onkeydown = (event) => {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    terminalRecall = Math.max(0, Math.min(terminalHistory.length, terminalRecall + (event.key === "ArrowUp" ? -1 : 1)));
+    $("term-in").value = terminalHistory[terminalRecall] ?? "";
+  };
+  $("term-machine").onclick = () => leaveOpening();
+  $("term-out").onclick = () => {
+    if (!window.getSelection().toString()) $("term-in").focus();
+  };
+}
+
+function openTerminal() {
+  terminalId = nextRequest++;
+  worker.postMessage({ type: "open", id: terminalId, port: terminalPort });
+  $("term-in").focus();
+}
+
+function terminalWrite(text) {
+  const out = $("term-out");
+  out.textContent += text;
+  out.scrollTop = out.scrollHeight;
 }
 
 function makeConsolePanel() {
@@ -654,6 +724,25 @@ function processLabel(p) {
 }
 
 const renderers = {
+  // A board on the container's bench: its LED drawn, and the core's state.
+  board(value, panel) {
+    const on = value.led === "on";
+    const registers = Object.entries(value.registers ?? {})
+      .map(([name, held]) => `<div><span class="key">${escape(name)}</span>${escape(held)}</div>`)
+      .join("");
+    const exceptions = Object.entries(value.exceptions ?? {})
+      .map(([name, count]) => `${escape(name)} ${count.toLocaleString()}`)
+      .join(" · ");
+    panel.body.innerHTML = `<div class="board">
+      <div class="led${on ? " on" : ""}" title="the user LED, PC6, active low"></div>
+      <div><b>${escape(value.chip)}</b> · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated</div>
+      <div>LED ${escape(value.led ?? "never driven")} · ${value.faults} faults · probe ${escape(value.probe)}${value.debugger ? " · debugger attached" : ""}</div>
+      <div class="dim">${escape(value.image)} · ${value.instructions.toLocaleString()} instructions · ${escape(value.mode)} mode, ${value.privileged ? "privileged" : "unprivileged"}</div>
+      <div class="dim">${exceptions}</div>
+      <div class="registers">${registers}</div>
+    </div>`;
+  },
+
   processes(value, panel, state) {
     const s = values.statistics?.value;
     const running = s?.current;
