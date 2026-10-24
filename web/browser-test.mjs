@@ -406,6 +406,10 @@ try {
     const title = await evaluate(`document.querySelector("#terminal h2").textContent`);
     check("the session titles its panel, and the title is not printed", /^humility — Hubris on an STM32G031 Nucleo/.test(title) && !greeting.includes("\x1b") && !greeting.includes("]0;"), title);
     const opening = await evaluate(`document.body.classList.contains("opening") && document.body.classList.contains("bench")`);
+    // The terminal's text uses the panel's whole width, here and once the
+    // rest of the machine is open beside it.
+    const fills = `(() => { const out = document.getElementById("term-out").getBoundingClientRect().width; const form = document.getElementById("term-form").getBoundingClientRect().width; return Math.abs(out - form) < 2 ? "" : out + " of " + form; })()`;
+    check("the terminal's text fills its panel", (await evaluate(fills)) === "", await evaluate(fills));
     check("the page opens on the terminal and the board", opening === true, String(opening));
     const asked = Date.now();
     await type("humility tasks");
@@ -432,6 +436,7 @@ try {
     await evaluate(`document.getElementById("play").textContent === "pause" && document.getElementById("play").click()`);
     await until(`!window.zaqaruDebug.busy`);
     await evaluate(`document.getElementById("term-machine").click()`);
+    check("and still fills it beside the machine", (await evaluate(fills)) === "", await evaluate(fills));
     const middle = await evaluate(`Math.floor((window.zaqaruDebug.origin + window.zaqaruDebug.frontier) / 2)`);
     await evaluate(`window.zaqaruDebug.seek(${middle})`);
     await until(`!window.zaqaruDebug.busy && window.zaqaruDebug.current === ${middle}`, 180000);

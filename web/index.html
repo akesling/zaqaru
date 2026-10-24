@@ -26,6 +26,10 @@
   #store { background: Canvas; overflow: auto; min-height: 0; padding: 6px 10px; }
   h2 { margin: 0 0 4px; font-size: 11px; font-weight: 600; opacity: .7; text-transform: uppercase; letter-spacing: .04em; position: sticky; top: 0; background: Canvas; z-index: 1; }
   h2 .path { text-transform: none; letter-spacing: 0; font-weight: 600; }
+  /* A heading holds its own floated tools. Left to hang below it, a button
+     taller than the heading's line narrows a scrolling body beneath it by
+     the button's whole width — the terminal lost a third of its own. */
+  h2 { display: flow-root; }
   h2 .tools { float: right; font-weight: normal; }
   h2 .tools button { font: inherit; font-size: 11px; padding: 0 4px; opacity: .8; }
   h2 .tools button.on { background: var(--accent); color: white; }
