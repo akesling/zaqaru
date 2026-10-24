@@ -803,6 +803,28 @@ export class Container {
     return text(all.subarray(0, end));
   }
 
+  /// The pages of the guest block written since the last call, as a bitmap
+  /// (bit `page % 32` of word `page / 32`), copied out; null from a module
+  /// that keeps no such log.
+  written() {
+    const exported = this.instance.exports.zaqaru_written;
+    if (!exported) return null;
+    const pointer = exported();
+    const count = new DataView(this.memory.buffer).getUint32(pointer, true);
+    return new Uint32Array(this.memory.buffer, pointer + 4, count).slice();
+  }
+
+  /// The memory only the guest writes and the memory the kernel never
+  /// writes again, as runs of whole pages, `[start, end)`: `{ guest, frozen }`.
+  pageLayout() {
+    const layout = this.value("layout");
+    const page = (address) => Number(BigInt(address)) / 4096;
+    const runs = (ranges) =>
+      ranges.map(({ start, end }) => [Math.ceil(page(start)), Math.floor(page(end))]).filter(([start, end]) => start < end);
+    const guest = [layout.guest_block, ...(layout.program_region ? [layout.program_region] : [])];
+    return { guest: runs(guest), frozen: runs(layout.frozen ?? []) };
+  }
+
   get stackPointer() {
     return this.instance.exports.__stack_pointer.value;
   }
