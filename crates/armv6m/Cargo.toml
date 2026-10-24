@@ -1,0 +1,19 @@
+[package]
+name = "zaqaru-armv6m"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "An ARMv6-M machine: a Cortex-M0+ interpreter and enough of an STM32G031 to boot Hubris"
+
+[lib]
+name = "armv6m"
+
+[[bin]]
+name = "zaqaru-m0"
+path = "src/bin/m0/main.rs"
+
+[dev-dependencies]
+# The ISA tests assemble their programs with clang and read the labels back
+# out of the object's symbol table, rather than checking in hand-encoded
+# halfwords nobody can read.
+object = "0.40.0"

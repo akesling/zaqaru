@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/armv6m",
     "crates/bake",
     "crates/brotli",
     "crates/cli",
@@ -43,4 +44,10 @@ opt-level = 2
 # after every edit and one nobody runs. `debug-assertions` is untouched, so
 # every `debug_assert!` in the engine still fires.
 [profile.dev.package.zaqaru-cpu]
+opt-level = 3
+
+# The same bargain for the Cortex-M0+ interpreter: a Hubris boot retires
+# millions of instructions, and a test that runs one should not be an order
+# of magnitude slower than the binary.
+[profile.dev.package.zaqaru-armv6m]
 opt-level = 3
