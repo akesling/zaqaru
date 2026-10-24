@@ -1,14 +1,16 @@
-//! `zaqaru-m0 door`: a socket that runs Humility for whoever asks.
+//! `zaqaru-m0 door`: a terminal session with Humility on the bench.
 //!
 //! ```sh
 //! zaqaru-m0 door --archive build-….zip --probe 127.0.0.1:3333 --listen 0.0.0.0:80
 //! ```
 //!
-//! A line such as `tasks` (or `GET /tasks`, from a browser or curl) runs
-//! `humility tasks` against the probe and sends back what it printed, one
-//! command per connection, one at a time. `board` answers the board's own
-//! state: under `serve` from the board thread, and on its own — beside a
-//! board zaqaru's kernel runs — from `/proc/board`.
+//! Each connection is a session: a banner, a `$ ` prompt, and a line at a
+//! time. `humility …` runs Humility against the probe, its output streamed
+//! into the connection as it prints; `board` shows the board's own state —
+//! under `serve` from the board thread, and on its own, beside a board
+//! zaqaru's kernel runs, from `/proc/board`; `help` lists what to try;
+//! `exit` ends the session. There is no shell behind it: these are the
+//! things a bench with a probe on it is for, and nothing else runs.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -44,7 +46,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("zaqaru-m0: humility on {listen}, against the probe on {probe} (send a command, e.g. \"tasks\")");
+    println!("zaqaru-m0: a humility session on {listen}, against the probe on {probe}");
     let status = || std::fs::read_to_string("/proc/board").ok();
     accept_requests(listener, Arc::new(FrontDoor::new(humility, archive, probe, Box::new(status))));
     ExitCode::SUCCESS
@@ -72,117 +74,124 @@ impl FrontDoor {
     }
 }
 
-const HELP: &str = "\
-This is an STM32G031 Nucleo running Hubris, emulated, with Humility on the
-bench beside it. Send a Humility command, one per connection:
-
-    tasks              the tasks, their state, and what they are waiting on
-    tasks -s           ...and each task's stack
-    map                the memory regions each task can reach
-    manifest           what the archive says was built
-    readvar -l         the kernel's and tasks' variables
-    hiffy -l           the Idol interfaces hiffy can call
-    hiffy -c UserLeds.led_toggle -a index=0
-                       toggle the board's LED, through hiffy and the LED task
-    board              the board itself: LED, time, faults
-
-Over HTTP the words are the path: GET /tasks, GET /hiffy/-c/UserLeds.led_toggle/-a/index=0
+const BANNER: &str = "\
+An STM32G031 Nucleo running Hubris, emulated in zaqaru's kernel, with its
+debug probe on 127.0.0.1:3333 and Humility attached through it.
+Try `humility tasks`, or `help` for more.
 ";
+
+const HELP: &str = "\
+    humility tasks          the tasks, their state, and what each waits on
+    humility tasks -s pong  a task's stack, unwound through its frames
+    humility map            the memory each task can reach, from the archive
+    humility readvar TICKS  a kernel variable, read live
+    humility ringbuf        the ring buffers
+    humility hiffy -l       the Idol interfaces hiffy can call
+    humility hiffy -c UserLeds.led_toggle -a index=0
+                            an IPC call made on the board: toggles the LED
+    humility manifest       what the archive says was built
+    board                   the board itself: state, time, LED, faults
+    exit                    end the session
+";
+
+const PROMPT: &[u8] = b"$ ";
 
 pub(crate) fn accept_requests(listener: TcpListener, door: Arc<FrontDoor>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let door = door.clone();
         std::thread::spawn(move || {
-            let _ = serve_request(stream, &door);
+            let _ = session(stream, &door);
         });
     }
 }
 
-fn serve_request(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
+/// One terminal: a line at a time until `exit` or the other end closes.
+fn session(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
     // No read timeout: zaqaru's kernel refuses SO_RCVTIMEO outright, and a
-    // client that connects and says nothing costs one parked thread.
-    let mut reader = BufReader::new(stream.try_clone()?).take(64 * 1024);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let (http, args) = parse_request(&line);
-    if http {
-        // The headers say nothing a command needs.
-        let mut header = String::new();
-        while reader.read_line(&mut header)? > 0 && header.trim_end() != "" {
-            header.clear();
-        }
-    }
-
+    // session nobody types into costs one parked thread.
+    let mut lines = BufReader::new(stream.try_clone()?).take(1 << 20);
     let mut out = stream;
-    if http {
-        out.write_all(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n")?;
-    }
-    match args.first().map(String::as_str) {
-        None | Some("help") => out.write_all(HELP.as_bytes())?,
-        Some("board" | "status") => match (door.status)() {
-            Some(status) => out.write_all(status.as_bytes())?,
-            None => out.write_all(b"no board answered\n")?,
-        },
-        Some(_) => {
-            let _turn = door.one_at_a_time.lock().unwrap_or_else(|e| e.into_inner());
-            out.write_all(format!("$ humility {}\n", args.join(" ")).as_bytes())?;
-            let mut command = Command::new(&door.humility);
-            command
-                .args(&args)
-                .env("HUMILITY_PROBE", format!("gdb:{}", door.gdb))
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(OwnedFd::from(out.try_clone()?)))
-                .stderr(Stdio::from(OwnedFd::from(out.try_clone()?)));
-            if let Some(archive) = &door.archive {
-                command.env("HUMILITY_ARCHIVE", archive);
-            }
-            match command.status() {
-                Ok(status) if status.success() => {}
-                Ok(status) => out.write_all(format!("({status})\n").as_bytes())?,
-                Err(e) => out.write_all(format!("can't run {}: {e}\n", door.humility).as_bytes())?,
-            }
+    out.write_all(BANNER.as_bytes())?;
+    out.write_all(PROMPT)?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line)? == 0 {
+            break;
         }
+        let words = split(line.trim());
+        match words.first().map(String::as_str) {
+            None => {}
+            Some("exit" | "quit" | "logout") => break,
+            Some("help") => out.write_all(HELP.as_bytes())?,
+            Some("board") => match (door.status)() {
+                Some(status) => out.write_all(status.as_bytes())?,
+                None => out.write_all(b"no board answered\n")?,
+            },
+            Some("humility") => door.humility(&words[1..], &out)?,
+            Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, help and exit\n").as_bytes())?,
+        }
+        out.write_all(PROMPT)?;
     }
     out.shutdown(Shutdown::Both)
 }
 
-/// A request's words: a line of them, or an HTTP request's path split at
-/// its slashes. A leading `humility` is optional.
-fn parse_request(line: &str) -> (bool, Vec<String>) {
-    let line = line.trim_end();
-    let (http, mut words): (bool, Vec<String>) = match line.strip_prefix("GET ") {
-        Some(rest) => {
-            let path = rest.split(' ').next().unwrap_or("/");
-            let path = path.split('?').next().unwrap_or("");
-            (true, path.split('/').filter(|w| !w.is_empty()).map(percent_decode).collect())
+impl FrontDoor {
+    /// Runs Humility with `args`, its output going straight into the
+    /// session, so it arrives as Humility prints it.
+    fn humility(&self, args: &[String], out: &TcpStream) -> std::io::Result<()> {
+        let _turn = self.one_at_a_time.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new(&self.humility);
+        command
+            .args(args)
+            .env("HUMILITY_PROBE", format!("gdb:{}", self.gdb))
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(OwnedFd::from(out.try_clone()?)))
+            .stderr(Stdio::from(OwnedFd::from(out.try_clone()?)));
+        if let Some(archive) = &self.archive {
+            command.env("HUMILITY_ARCHIVE", archive);
         }
-        None => (false, line.split_whitespace().map(String::from).collect()),
-    };
-    if words.first().map(String::as_str) == Some("humility") {
-        words.remove(0);
+        let mut out = out;
+        match command.status() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => out.write_all(format!("({status})\n").as_bytes()),
+            Err(e) => out.write_all(format!("can't run {}: {e}\n", self.humility).as_bytes()),
+        }
     }
-    (http, words)
 }
 
-fn percent_decode(word: &str) -> String {
-    let bytes = word.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let decoded = (bytes[i] == b'%')
-            .then(|| word.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()))
-            .flatten();
-        match decoded {
-            Some(b) => {
-                out.push(b);
-                i += 3;
+/// A line's words: split at whitespace, with `'…'` and `"…"` holding
+/// spaces together, as a shell would for the arguments Humility takes.
+fn split(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote = None;
+    for c in line.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.get_or_insert_default().push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                word.get_or_insert_default();
             }
-            None => {
-                out.push(bytes[i]);
-                i += 1;
-            }
+            (None, c) if c.is_whitespace() => words.extend(word.take()),
+            (None, c) => word.get_or_insert_default().push(c),
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    words.extend(word);
+    words
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split;
+
+    #[test]
+    fn a_line_splits_as_a_shell_would() {
+        assert_eq!(split("humility tasks -s pong"), ["humility", "tasks", "-s", "pong"]);
+        assert_eq!(split("  hiffy -c 'UserLeds.led_toggle' -a \"index=0\" "), ["hiffy", "-c", "UserLeds.led_toggle", "-a", "index=0"]);
+        assert_eq!(split("say 'two words' ''"), ["say", "two words", ""]);
+        assert!(split("   ").is_empty());
+    }
 }
