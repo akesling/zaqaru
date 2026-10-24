@@ -73,7 +73,13 @@ git -C "$work/humility" checkout -q --force --detach "$humility_commit"
 git -C "$work/humility" clean -q -fd
 git -C "$work/humility" apply "$here/humility-gdb-probe.patch"
 [ "$native" = 1 ] && rustup toolchain install 1.98.1 --profile minimal >/dev/null
-linux 'cd "$W/humility" && cargo +1.98.1 build --release --no-default-features -p humility-bin \
+# Built as tight as Cargo's profile allows, from the environment so that
+# Humility's own manifest is untouched: every command is one interpreted run
+# of it, so its instructions are the bench's latency. (2% fewer than its own
+# release profile, measured; it catches no panics, so abort loses nothing.)
+linux 'cd "$W/humility" && CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+  CARGO_PROFILE_RELEASE_PANIC=abort CARGO_PROFILE_RELEASE_DEBUG=false \
+  cargo +1.98.1 build --release --no-default-features -p humility-bin \
   && strip -o "$W/bench/humility" target/release/humility'
 
 echo "build: zaqaru and zaqaru-m0"
