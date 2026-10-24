@@ -411,6 +411,21 @@ try {
     const fills = `(() => { const out = document.getElementById("term-out").getBoundingClientRect().width; const form = document.getElementById("term-form").getBoundingClientRect().width; return Math.abs(out - form) < 2 ? "" : out + " of " + form; })()`;
     check("the terminal's text fills its panel", (await evaluate(fills)) === "", await evaluate(fills));
     check("the page opens on the terminal and the board", opening === true, String(opening));
+    // Focus: the terminal alone, at the size of the window, and back.
+    await evaluate(`document.querySelector("#terminal h2 .focus").click()`);
+    const whole = await evaluate(`(() => { const r = document.getElementById("terminal").getBoundingClientRect(); return r.width > innerWidth - 40 && r.height > innerHeight - 40; })()`);
+    check("⤢ focuses the terminal at the size of the window", whole === true, String(whole));
+    await evaluate(`document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }))`);
+    const back = await evaluate(`(() => { const t = document.getElementById("terminal"); return !t.classList.contains("maximized") && t.getBoundingClientRect().width < innerWidth - 40; })()`);
+    check("and Esc gives the page back", back === true, String(back));
+    // Resizing: a size set from the corner sticks, past the height cap an
+    // unsized panel has, and a double-click on its heading undoes it.
+    await evaluate(`document.querySelector('[data-pattern="board"]').style.height = "700px"`);
+    const kept = await until(`(() => { const p = document.querySelector('[data-pattern="board"]'); return Math.round(p.getBoundingClientRect().height) === 700 && p.style.flex.startsWith("0 0") ? "kept" : ""; })()`, 10000);
+    check("a resized panel keeps its size", kept === "kept", String(kept));
+    await evaluate(`document.querySelector('[data-pattern="board"] h2').dispatchEvent(new MouseEvent("dblclick", { bubbles: true }))`);
+    const undone = await evaluate(`(() => { const p = document.querySelector('[data-pattern="board"]'); return p.style.height === "" && p.getBoundingClientRect().height < 700; })()`);
+    check("a double-click on its heading gives it back its own size", undone === true, String(undone));
     const asked = Date.now();
     await type("humility tasks");
     const tasks = await until(`(() => { const t = ${term}; return /RUNNING[\\s\\S]*\\$ $/.test(t) ? t : ""; })()`, 300000);

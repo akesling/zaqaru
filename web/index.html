@@ -39,8 +39,15 @@
   #pathbar button { font: inherit; }
   #answer { max-height: 12em; overflow: auto; border: 1px solid var(--line); padding: 4px 6px; margin-bottom: 8px; }
   #answer:empty { display: none; }
-  #panels, #machine .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(26em, 1fr)); gap: 8px; }
-  .panel { border: 1px solid var(--line); padding: 4px 8px; max-height: 26em; overflow: auto; min-width: 0; }
+  /* Panels wrap rather than sit in fixed columns, so one resized from its
+     corner keeps its size and the rest reflow around it. */
+  #panels, #machine .grid, #internals .grid { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
+  .panel { border: 1px solid var(--line); padding: 4px 8px; max-height: 26em; overflow: auto; min-width: 0; flex: 1 1 26em; resize: both; box-sizing: border-box; }
+  /* Focused: one panel alone, at the size of the window. */
+  .panel.maximized { position: fixed; inset: 10px; z-index: 50; width: auto !important; height: auto !important; max-height: none !important; resize: none; background: Canvas; box-shadow: 0 8px 40px #0009; display: flex; flex-direction: column; }
+  .panel.maximized > .body, .panel.maximized > .raw, .panel.maximized #term-out, .panel.maximized #stdout { flex: 1 1 auto; min-height: 0; max-height: none; overflow: auto; }
+  .panel.maximized #term-form { flex: none; }
+  h2 .tools button.focus { font-size: 13px; line-height: 1; padding: 0 5px; }
   .panel .raw { display: none; }
   .panel.raw .body { display: none; }
   .panel.raw .raw { display: block; }
@@ -72,7 +79,9 @@
   body.opening #timeline { visibility: hidden; }
   /* A bench: the terminal and the board, side by side, until the machine is asked for. */
   body.bench #edge { display: none; }
-  body.opening.bench #panels { display: grid; grid-template-columns: minmax(0, 2fr) minmax(18em, 1fr); max-width: 84em; margin: 5vh auto 0; align-items: start; }
+  body.opening.bench #panels { display: flex; flex-wrap: wrap; max-width: 84em; margin: 5vh auto 0; align-items: flex-start; }
+  body.opening.bench #terminal { flex: 2 1 36em; }
+  body.opening.bench #panels > .panel[data-pattern="board"] { flex: 1 1 18em; }
   body.opening.bench #panels > #terminal:not(#edge), body.opening.bench #panels > .panel[data-pattern="board"]:not(#edge) { display: block; }
   .panel.terminal { max-height: none; }
   #term-out { min-height: 18em; max-height: 60vh; overflow: auto; }

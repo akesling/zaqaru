@@ -541,6 +541,7 @@ function makePanel(pattern, title, into) {
     event.target.classList.toggle("on");
   };
   into.appendChild(element);
+  equipPanel(element);
   const panel = {
     element,
     body: element.querySelector(".body"),
@@ -586,6 +587,7 @@ function makeEdgePanel() {
     </form>
     <div id="responses"></div>`;
   $("panels").appendChild(element);
+  equipPanel(element);
   $("send-form").onsubmit = (event) => {
     event.preventDefault();
     send(Number($("port").value), $("request").value.replace(/\\n/g, "\n").replace(/\\r/g, "\r"));
@@ -614,6 +616,7 @@ function makeTerminalPanel() {
     <pre id="term-out"></pre>
     <form id="term-form"><span class="prompt">›</span><input id="term-in" type="text" autocomplete="off" spellcheck="false" placeholder="humility tasks"></form>`;
   $("panels").appendChild(element);
+  equipPanel(element);
   $("term-form").onsubmit = (event) => {
     event.preventDefault();
     const line = $("term-in").value;
@@ -666,12 +669,73 @@ function terminalWrite(text) {
   out.scrollTop = out.scrollHeight;
 }
 
+// ---- sizing and focus ---------------------------------------------------------
+//
+// Every panel resizes from its corner, and the others reflow around it; a
+// double-click on its heading gives it back its own size. ⤢ focuses one
+// panel: that panel alone, at the size of the window, until ⤢ again or Esc.
+
+// The browser writes a resized panel's size into its style. Once it has,
+// that size is the panel's: it stops growing and shrinking with its row,
+// and the height cap that keeps an unsized panel short no longer applies.
+const resized = new ResizeObserver((entries) => {
+  for (const { target } of entries) {
+    if ((target.style.width || target.style.height) && !target.classList.contains("maximized")) {
+      target.style.flex = "0 0 auto";
+      target.style.maxHeight = "none";
+    }
+  }
+});
+
+function equipPanel(element) {
+  const heading = element.querySelector("h2");
+  let tools = heading.querySelector(".tools");
+  if (!tools) {
+    tools = document.createElement("span");
+    tools.className = "tools";
+    heading.appendChild(tools);
+  }
+  const focus = document.createElement("button");
+  focus.type = "button";
+  focus.className = "focus";
+  focus.textContent = "⤢";
+  focus.title = "focus: this panel alone, at the size of the window (Esc to return)";
+  focus.onclick = (event) => {
+    event.stopPropagation();
+    maximize(element.classList.contains("maximized") ? null : element);
+  };
+  tools.prepend(focus);
+  heading.title = "double-click to give the panel back its own size";
+  heading.ondblclick = (event) => {
+    if (event.target.closest("button")) return;
+    for (const property of ["width", "height", "flex", "maxHeight"]) element.style[property] = "";
+  };
+  resized.observe(element);
+}
+
+/// Focuses `element`, or none.
+function maximize(element) {
+  for (const open of document.querySelectorAll(".panel.maximized")) {
+    open.classList.remove("maximized");
+    open.querySelector("h2 .focus").textContent = "⤢";
+  }
+  if (!element) return;
+  element.classList.add("maximized");
+  element.querySelector("h2 .focus").textContent = "⤡";
+  if (element.id === "terminal") $("term-in").focus();
+}
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && document.querySelector(".panel.maximized")) maximize(null);
+});
+
 function makeConsolePanel() {
   const element = document.createElement("section");
   element.className = "panel";
   element.id = "console";
   element.innerHTML = `<h2><span class="path">/iso/console</span> — what the container wrote</h2><pre id="stdout"></pre><pre id="stderr" style="opacity:.7"></pre>`;
   $("panels").appendChild(element);
+  equipPanel(element);
 }
 
 /// Any value, as a tree of keys and values.
