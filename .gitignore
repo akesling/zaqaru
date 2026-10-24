@@ -12,3 +12,8 @@
 /web/demo
 /_site
 /web/brotli.wasm
+
+# Builds for linux/amd64 from a non-Linux host, made in a container; see
+# demo/hubris.
+/target-linux
+/target-profile
