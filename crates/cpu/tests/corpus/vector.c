@@ -252,6 +252,19 @@ long probe_saturating(long a, long b)
 	return added[0] + subtracted[3] + added_unsigned[6];
 }
 
+long probe_sum_of_absolute_differences(long a, long b)
+{
+	/* psadbw: what an Adler-32 or a deflate match finder reaches for. Each
+	 * half's eight byte differences, summed into that half's low word. */
+	v2di left = { a, a ^ b };
+	v2di right = { b, ~a };
+	v2di sums;
+	__asm__ volatile("psadbw %[right], %[out]"
+			 : [out] "=x"(sums)
+			 : [right] "x"(right), "0"(left));
+	return sums[0] * 3 + sums[1];
+}
+
 long probe_aligned_and_unaligned_moves(long a, long b)
 {
 	static v2di aligned[4] __attribute__((aligned(16)));

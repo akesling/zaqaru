@@ -867,6 +867,25 @@ impl Cpu<'_> {
                 self.set_vector(number, result);
                 Step::Retired
             }
+            Mnemonic::Psadbw => {
+                // Each half's eight byte pairs, their absolute differences
+                // summed into the low word of that half's quadword, and the
+                // rest of the quadword zeroed: a reduction across lanes, so
+                // not a lane-for-lane operation either.
+                let (number, left, right) = self.vector_operands(instruction)?;
+                let mut result = 0u128;
+                for half in 0..2u32 {
+                    let sum: u64 = (0..8u32)
+                        .map(|byte| {
+                            let shift = half * 64 + byte * 8;
+                            u64::from(((left >> shift) as u8).abs_diff((right >> shift) as u8))
+                        })
+                        .sum();
+                    result |= u128::from(sum) << (half * 64);
+                }
+                self.set_vector(number, result);
+                Step::Retired
+            }
             Mnemonic::Pavgb => self.packed_binary(instruction, Lane::Byte, |a, b| (a + b + 1) >> 1)?,
             Mnemonic::Pavgw => self.packed_binary(instruction, Lane::Word, |a, b| (a + b + 1) >> 1)?,
             Mnemonic::Pminub => self.packed_binary(instruction, Lane::Byte, |a, b| a.min(b))?,
