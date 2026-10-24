@@ -1,0 +1,6 @@
+# The board on this container's bench, which zaqaru's kernel runs: an
+# STM32G031 Nucleo, its flash the Hubris image, its debug probe a GDB
+# server on loopback that Humility attaches to.
+chip   stm32g031
+image  /hubris/final.bin
+probe  127.0.0.1:3333
