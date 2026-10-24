@@ -68,6 +68,9 @@ fi
 # The work directory is this script's: put the checkout back to the pinned
 # commit and the patch on it, whatever a previous run left.
 git -C "$work/humility" checkout -q --force --detach "$humility_commit"
+# Untracked files too — the patch adds one — but not ignored ones, which
+# are the build cache.
+git -C "$work/humility" clean -q -fd
 git -C "$work/humility" apply "$here/humility-gdb-probe.patch"
 [ "$native" = 1 ] && rustup toolchain install 1.98.1 --profile minimal >/dev/null
 linux 'cd "$W/humility" && cargo +1.98.1 build --release --no-default-features -p humility-bin \
