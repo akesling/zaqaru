@@ -790,10 +790,20 @@ impl Emitter {
     }
 
     fn emit_lea(&mut self, quick: &Quick) -> Option<()> {
+        // A 16-bit `lea` merges into the register's low half, which the
+        // interpreter has and this does not.
+        if quick.width == Width::Word {
+            return None;
+        }
+        // A 32-bit `lea` is the low half of the sum, zero-extended: the
+        // carry out of bit 31 that the 64-bit sum below keeps is exactly
+        // what `lea 0x1fff126c(%rsi), %eax` drops, and a jump-table index
+        // computed that way lands four gigabytes past its table.
+        let narrow = quick.width == Width::Dword;
         let dst = self.register(quick.destination)?;
         let (base, disp) = self.address(quick)?;
         if disp == 0 {
-            self.push(encode(Op::Mov, dst.number, base, 0, Width::Qword, false, false, true, 0, 0));
+            self.push(encode(Op::Mov, dst.number, base, 0, Width::Qword, false, false, !narrow, 0, 0));
         } else {
             // `regs[dst] = regs[base] + sign_extend(disp)`. There is no zero
             // register to feed `Lea`'s index, so the displacement — which is
@@ -802,7 +812,10 @@ impl Emitter {
             // modifier, since `lea` touches no flags.)
             let scratch = self.temp();
             self.li(scratch, disp as i64 as u64, false);
-            self.push(encode(Op::Add, dst.number, base, scratch, Width::Qword, false, true, true, 0, 0));
+            self.push(encode(Op::Add, dst.number, base, scratch, Width::Qword, false, true, !narrow, 0, 0));
+        }
+        if narrow {
+            self.push(encode(Op::Narrow, dst.number, dst.number, 0, Width::Qword, false, true, true, 0, 0));
         }
         Some(())
     }

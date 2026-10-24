@@ -41,7 +41,12 @@ impl Guest {
     /// different bases (from the arena's own bump allocator), so parallel
     /// tests never collide — the reason a fixed base and a global lock are
     /// both unnecessary.
-    fn at(base: u64, build: impl FnOnce(&mut CodeAssembler, u64)) -> Self {
+    ///
+    /// `cache` decides which engine a run through [`Engine::run`] uses: the
+    /// reference must be [`BlockCache::interpreting`], because the default
+    /// cache transpiles every block it fetches, and a reference that runs
+    /// the bytecode agrees with the bytecode whatever it computes.
+    fn at(base: u64, cache: BlockCache, build: impl FnOnce(&mut CodeAssembler, u64)) -> Self {
         let arena = Arena::at(base, LENGTH);
         let limit = arena.limit();
         let mut space = Space::new(arena.limit());
@@ -51,7 +56,7 @@ impl Guest {
         build(&mut assembler, entry);
         let code = assembler.assemble(entry).expect("assemble");
         space.write(entry, &code).expect("place the program");
-        let mut cache = BlockCache::new();
+        let mut cache = cache;
         cache.drain_invalidations(&mut space);
         let mut tcb = Tcb::new();
         tcb.rip = entry;
@@ -156,12 +161,12 @@ fn agree(build: impl Fn(&mut CodeAssembler, u64) + Copy) -> Outcome {
         probe.base()
     };
     let reference = {
-        let mut guest = Guest::at(base, build);
+        let mut guest = Guest::at(base, BlockCache::interpreting(), build);
         let outcome = Engine::run(&mut guest.tcb, &mut guest.space, &mut guest.cache, QUANTUM);
         guest.snapshot(outcome)
     };
     let bytecode = {
-        let mut guest = Guest::at(base, build);
+        let mut guest = Guest::at(base, BlockCache::new(), build);
         let outcome = run_bytecode(&mut guest);
         guest.snapshot(outcome)
     };
@@ -437,6 +442,40 @@ fn lea_with_displacement_agrees() {
         a.lea(rcx, qword_ptr(rbx - 16)).unwrap();
         a.lea(rbx, qword_ptr(rbx + 8)).unwrap(); // dest == base
         a.lea(rdx, qword_ptr(rbx + rax * 4 + 32)).unwrap(); // with index too
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn lea_into_a_32_bit_register_agrees() {
+    // A 32-bit `lea` drops the carry out of bit 31 and zero-extends. rustc
+    // emits exactly this to bias a `match` on a u32 into a jump-table index:
+    // 0xE000_ED94 + 0x1FFF_126C is 0x1_0000_0000, so the index is 0, and a
+    // 64-bit sum indexes four gigabytes past the table.
+    agree(|a, _| {
+        a.mov(rsi, 0xE000_ED94u64).unwrap();
+        a.lea(eax, dword_ptr(rsi + 0x1FFF_126C)).unwrap();
+        a.mov(rbx, 0xFFFF_FFFF_0000_0001u64).unwrap();
+        a.lea(ecx, dword_ptr(rbx)).unwrap(); // no displacement: a move, narrowed
+        a.mov(rdx, u64::MAX).unwrap();
+        a.lea(dx, word_ptr(rbx + 2)).unwrap(); // 16 bits: merges into the low half
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn a_jump_table_index_from_a_32_bit_lea_agrees() {
+    // The shape rustc gives `match addr { 0xE000_ED94 => …, … }`: bias with a
+    // 32-bit `lea`, bound-check, and index a table of 32-bit offsets.
+    agree(|a, entry| {
+        let mut out = a.create_label();
+        a.mov(rsi, 0xE000_ED94u64).unwrap();
+        a.mov(rcx, entry + 0x1000).unwrap();
+        a.lea(eax, dword_ptr(rsi + 0x1FFF_126C)).unwrap();
+        a.cmp(eax, 0xC).unwrap();
+        a.ja(out).unwrap();
+        a.movsxd(rdx, dword_ptr(rcx + rax * 4)).unwrap();
+        a.set_label(&mut out).unwrap();
         a.syscall().unwrap();
     });
 }
