@@ -785,7 +785,7 @@ fn attach_endpoint(rings: &mut crate::ring::Rings, receive: u32, transmit: u32) 
 }
 
 /// The endpoint a released socket had, if any, no longer names its rings.
-fn detach_endpoint(rings: &mut crate::ring::Rings, retired: Option<Endpoint>) {
+pub(crate) fn detach_endpoint(rings: &mut crate::ring::Rings, retired: Option<Endpoint>) {
     if let Some(endpoint) = retired {
         rings.detach(endpoint.receive);
         rings.detach(endpoint.transmit);

@@ -39,6 +39,9 @@ pub const URANDOM_DEVICE: (u32, u32) = (1, 9);
 pub mod view {
     /// `/proc/self/maps`, rendered from the VMA tree.
     pub const MAPS: u64 = 1;
+    /// `/proc/board`, the board on the container's bench (see
+    /// `crate::board`), rendered from its state.
+    pub const BOARD: u64 = 2;
 }
 
 /// Linux's packed `dev_t`: minor's low eight bits, major's twelve above
@@ -129,9 +132,10 @@ pub fn dev() -> Vec<u8> {
     ])
 }
 
-/// `/proc`: `self/exe`, `self/maps`, and nothing else.
+/// `/proc`: `self/exe`, `self/maps`, `board`, and nothing else.
 ///
-/// `self/exe` and `self/maps`, and nothing else yet. What is absent is
+/// `self/exe` and `self/maps`, and nothing else yet of Linux's; `board` is
+/// this kernel's own, and reads `ENODEV` in a container without one. What is absent is
 /// absent: `stat("/proc/self/status")` is `ENOENT`, which is what a
 /// filesystem says about a name it does not have.
 ///
@@ -150,7 +154,7 @@ pub fn proc(executable: &[u8]) -> Vec<u8> {
     let mut inodes: Vec<Inode> = Vec::new();
     let mut strings = Strings::default();
 
-    // 0: the root, 1: `self`, 2: `exe`, 3: `maps`.
+    // 0: the root, 1: `self`, 2: `exe`, 3: `maps`, 4: `board`.
     inodes.push(directory(0));
     inodes.push(directory(0));
     inodes.push(Inode {
@@ -171,6 +175,14 @@ pub fn proc(executable: &[u8]) -> Vec<u8> {
         nlink: 1,
         ..blank()
     });
+    inodes.push(Inode {
+        mode: file_type::REGULAR | 0o444,
+        size: 0,
+        payload: view::BOARD,
+        flags: inode_flags::GENERATED,
+        nlink: 1,
+        ..blank()
+    });
 
     let mut dirents = Vec::new();
     // The root's array, then `self`'s.
@@ -178,7 +190,10 @@ pub fn proc(executable: &[u8]) -> Vec<u8> {
     write_entries(
         &mut dirents,
         &mut strings,
-        &[(b"self", 1, directory_entry_type::DIRECTORY)],
+        &[
+            (b"self", 1, directory_entry_type::DIRECTORY),
+            (b"board", 4, directory_entry_type::REGULAR),
+        ],
     );
     let self_payload = dirents.len() as u64;
     write_entries(
@@ -190,7 +205,7 @@ pub fn proc(executable: &[u8]) -> Vec<u8> {
         ],
     );
     inodes[0].payload = root_payload;
-    inodes[0].size = (4 + 12) as u64;
+    inodes[0].size = (4 + 12 * 2) as u64;
     inodes[0].nlink = 3; // `.`, `..`, and `self`
     inodes[1].payload = self_payload;
     inodes[1].size = (4 + 12 * 2) as u64;

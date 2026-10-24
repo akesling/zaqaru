@@ -659,6 +659,10 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// because a port table is network-namespace state and a namespace
     /// spans processes. See [`crate::socket`].
     pub sockets: crate::socket::Shared,
+    /// The board on the container's bench, if the image asked for one —
+    /// container state like the socket arena, and shared for the same
+    /// reason. See [`crate::board`].
+    pub board: crate::board::Shared,
     /// Every `eventfd`, shared for the same reason: a copy of a
     /// notification notifies nobody.
     pub events: crate::eventfd::Shared,
@@ -927,6 +931,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             parent_death_signal: 0,
             rings: crate::ring::Shared::default(),
             sockets: crate::socket::Shared::default(),
+            board: crate::board::Shared::default(),
             events: crate::eventfd::Shared::default(),
             epolls: crate::poll::Held::default(),
             clock: 1,
@@ -1339,6 +1344,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // above, once per descriptor the copied table holds.
             rings: crate::ring::Shared::clone(&self.rings),
             sockets: crate::socket::Shared::clone(&self.sockets),
+            board: crate::board::Shared::clone(&self.board),
             events: crate::eventfd::Shared::clone(&self.events),
             // Copied, and marked: a registration names a description, and
             // a description is an index into a table the child has its own
@@ -1465,6 +1471,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // so must what is behind them.
             rings: crate::ring::Shared::clone(&self.rings),
             sockets: crate::socket::Shared::clone(&self.sockets),
+            board: crate::board::Shared::clone(&self.board),
             events: crate::eventfd::Shared::clone(&self.events),
             // The same process, so not inherited: `execve` keeps the
             // descriptor table it did not close, and the indices with it.

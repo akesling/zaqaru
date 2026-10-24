@@ -22,6 +22,7 @@
 //! implementation over the host imports, are the `guest` crate's.
 
 pub mod abi;
+pub mod board;
 pub mod errno;
 
 /// Whether the module's allocator zeroes what it frees. Set by the kernel

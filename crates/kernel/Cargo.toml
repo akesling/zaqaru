@@ -26,6 +26,9 @@ cpu = { package = "zaqaru-cpu", path = "../cpu" }
 # length the index already knows, and the hasher is a dependency the
 # module does not need.
 ruzstd = { version = "0.9", default-features = false }
+# The board an image can ask for (see `board`): a Cortex-M0+ and the
+# peripherals around it, run by the kernel beside the processes.
+armv6m = { package = "zaqaru-armv6m", path = "../armv6m" }
 
 [dev-dependencies]
 # A cycle Cargo allows, and the honest one: the kernel's tests drive real

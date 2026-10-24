@@ -505,6 +505,8 @@ impl<'a, S: Store + Clone> System<'a, S> {
         if why == Yield::Quantum && self.slice == 0 {
             self.current().kernel.pump(None);
             self.current().kernel.refresh_timebase();
+            // The board, if there is one, up to the clock just read.
+            self.current().kernel.service_board();
             self.take_shutdown();
             // And the container's own store: whatever the outside asked
             // since the last slice. Kernel state only, like the pump.
@@ -669,11 +671,21 @@ impl<'a, S: Store + Clone> System<'a, S> {
         if self.stopping && self.anything_runnable() {
             return true;
         }
+        // The board runs while the processes wait, and what it answers a
+        // debugger is what a parked process is waiting *for*: if it moved
+        // bytes, somebody may be runnable now, and that is not idle.
+        if self.current().kernel.service_board() {
+            return true;
+        }
+        // A running board is a deadline of its own: the container wakes to
+        // move it on even when no process has anything to wait for.
+        let board = self.current().kernel.board_wake();
         let deadline = self
             .containers
             .iter()
             .filter(|container| container.status.is_none())
             .filter_map(|container| container.process.earliest_deadline())
+            .chain(board)
             .min();
         // Something outside may still change things. A container with a
         // listener the host answers for is *at rest*, not deadlocked, and

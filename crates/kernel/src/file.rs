@@ -946,6 +946,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     ) -> Result<u64, Errno> {
         let rendered = match view {
             crate::synthetic::view::MAPS => self.render_maps(),
+            crate::synthetic::view::BOARD => match &*self.board.borrow() {
+                crate::board::Slot::Present(board) => board.status(),
+                _ => return Err(Errno::NoDevice),
+            },
             // A view nothing renders would read as an empty file, which is
             // a plausible wrong answer to a program asking about the kernel.
             _ => return Err(Errno::NoDevice),
