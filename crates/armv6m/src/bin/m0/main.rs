@@ -12,8 +12,10 @@
 //!
 //! `zaqaru-m0 serve` runs the same machine as a board on a bench instead:
 //! in real time, behind a GDB server a debugger or Humility can attach to.
-//! See [`serve`].
+//! See [`serve`]. `zaqaru-m0 door` is only that front door, for a board
+//! something else runs — zaqaru's kernel, chiefly. See [`door`].
 
+mod door;
 mod serve;
 
 use std::process::ExitCode;
@@ -29,6 +31,7 @@ pub(crate) const CYCLES_PER_MS: u64 = 16_000;
 pub(crate) fn usage() -> ExitCode {
     eprintln!("usage: zaqaru-m0 <final.bin> [--ms N] [--quiet]");
     eprintln!("       zaqaru-m0 serve <final.bin> [--gdb ADDR] [--listen ADDR] [--archive ZIP] [--board FILE]");
+    eprintln!("       zaqaru-m0 door [--listen ADDR] [--probe ADDR] [--archive ZIP] [--humility PATH]");
     ExitCode::from(2)
 }
 
@@ -36,6 +39,9 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1).peekable();
     if args.next_if(|a| a == "serve").is_some() {
         return serve::main(args.collect());
+    }
+    if args.next_if(|a| a == "door").is_some() {
+        return door::main(args.collect());
     }
     let mut image = None;
     let mut ms: u64 = 2000;

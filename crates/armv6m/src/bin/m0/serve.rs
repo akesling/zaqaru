@@ -23,18 +23,18 @@
 //! The board's state — LED, time, faults — is also written to `--board`
 //! whenever it changes, as a file anything can read.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::fd::OwnedFd;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use armv6m::gdb::{self, Debugger, Response};
 use armv6m::scs::exception;
 use armv6m::{Event, Machine, Outcome};
 
+use crate::door::{FrontDoor, accept_requests};
 use crate::{CYCLES_PER_MS, describe, ms_at, usage};
 
 /// How long the board sleeps between catching up with the wall clock when
@@ -132,8 +132,12 @@ pub fn main(args: Vec<String>) -> ExitCode {
         // Humility connects to the probe locally whatever address it
         // listens on.
         let gdb = options.gdb.replace("0.0.0.0", "127.0.0.1");
-        let door_state =
-            Arc::new(FrontDoor { humility: options.humility.clone(), archive: options.archive.clone(), gdb, one_at_a_time: Mutex::new(()), tx });
+        let status = move || {
+            let (reply, answer) = mpsc::channel();
+            tx.send(Message::Status(reply)).ok()?;
+            answer.recv().ok()
+        };
+        let door_state = Arc::new(FrontDoor::new(options.humility.clone(), options.archive.clone(), gdb, Box::new(status)));
         std::thread::spawn(move || accept_requests(door, door_state));
     }
 
@@ -405,131 +409,4 @@ fn read_packets(id: usize, stream: TcpStream, tx: Sender<Message>) {
 
 fn closed(id: usize, tx: &Sender<Message>) {
     let _ = tx.send(Message::Closed { id });
-}
-
-struct FrontDoor {
-    humility: String,
-    archive: Option<String>,
-    gdb: String,
-    /// The probe has one debugger at a time, so Humility runs one at a time.
-    one_at_a_time: Mutex<()>,
-    tx: Sender<Message>,
-}
-
-const HELP: &str = "\
-This is an STM32G031 Nucleo running Hubris, emulated, with Humility on the
-bench beside it. Send a Humility command, one per connection:
-
-    tasks              the tasks, their state, and what they are waiting on
-    tasks -s           ...and each task's stack
-    map                the memory regions each task can reach
-    manifest           what the archive says was built
-    readvar -l         the kernel's and tasks' variables
-    hiffy -l           the Idol interfaces hiffy can call
-    hiffy -c UserLeds.led_toggle -a index=0
-                       toggle the board's LED, through hiffy and the LED task
-    board              the board itself: LED, time, faults
-
-Over HTTP the words are the path: GET /tasks, GET /hiffy/-c/UserLeds.led_toggle/-a/index=0
-";
-
-fn accept_requests(listener: TcpListener, door: Arc<FrontDoor>) {
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let door = door.clone();
-        std::thread::spawn(move || {
-            let _ = serve_request(stream, &door);
-        });
-    }
-}
-
-fn serve_request(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
-    // No read timeout: zaqaru's kernel refuses SO_RCVTIMEO outright, and a
-    // client that connects and says nothing costs one parked thread.
-    let mut reader = BufReader::new(stream.try_clone()?).take(64 * 1024);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let (http, args) = parse_request(&line);
-    if http {
-        // The headers say nothing a command needs.
-        let mut header = String::new();
-        while reader.read_line(&mut header)? > 0 && header.trim_end() != "" {
-            header.clear();
-        }
-    }
-
-    let mut out = stream;
-    if http {
-        out.write_all(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n")?;
-    }
-    match args.first().map(String::as_str) {
-        None | Some("help") => out.write_all(HELP.as_bytes())?,
-        Some("board" | "status") => {
-            let (reply, answer) = mpsc::channel();
-            let _ = door.tx.send(Message::Status(reply));
-            if let Ok(status) = answer.recv() {
-                out.write_all(status.as_bytes())?;
-            }
-        }
-        Some(_) => {
-            let _turn = door.one_at_a_time.lock().unwrap_or_else(|e| e.into_inner());
-            out.write_all(format!("$ humility {}\n", args.join(" ")).as_bytes())?;
-            let mut command = Command::new(&door.humility);
-            command
-                .args(&args)
-                .env("HUMILITY_PROBE", format!("gdb:{}", door.gdb))
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(OwnedFd::from(out.try_clone()?)))
-                .stderr(Stdio::from(OwnedFd::from(out.try_clone()?)));
-            if let Some(archive) = &door.archive {
-                command.env("HUMILITY_ARCHIVE", archive);
-            }
-            match command.status() {
-                Ok(status) if status.success() => {}
-                Ok(status) => out.write_all(format!("({status})\n").as_bytes())?,
-                Err(e) => out.write_all(format!("can't run {}: {e}\n", door.humility).as_bytes())?,
-            }
-        }
-    }
-    out.shutdown(Shutdown::Both)
-}
-
-/// A request's words: a line of them, or an HTTP request's path split at
-/// its slashes. A leading `humility` is optional.
-fn parse_request(line: &str) -> (bool, Vec<String>) {
-    let line = line.trim_end();
-    let (http, mut words): (bool, Vec<String>) = match line.strip_prefix("GET ") {
-        Some(rest) => {
-            let path = rest.split(' ').next().unwrap_or("/");
-            let path = path.split('?').next().unwrap_or("");
-            (true, path.split('/').filter(|w| !w.is_empty()).map(percent_decode).collect())
-        }
-        None => (false, line.split_whitespace().map(String::from).collect()),
-    };
-    if words.first().map(String::as_str) == Some("humility") {
-        words.remove(0);
-    }
-    (http, words)
-}
-
-fn percent_decode(word: &str) -> String {
-    let bytes = word.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let decoded = (bytes[i] == b'%')
-            .then(|| word.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()))
-            .flatten();
-        match decoded {
-            Some(b) => {
-                out.push(b);
-                i += 3;
-            }
-            None => {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
