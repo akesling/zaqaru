@@ -302,6 +302,55 @@ impl Board {
         }
     }
 
+    /// The board's state as the container's store serves it: what the
+    /// page's board panel shows.
+    pub fn json(&self) -> String {
+        use crate::system::server::quoted;
+        let m = &self.machine;
+        let cpu = &m.cpu;
+        let hex = |value: u32| quoted(&format!("0x{value:08x}"));
+        let mut registers: Vec<String> = (0..13).map(|n| format!(r#""r{n}":{}"#, hex(cpu.r[n]))).collect();
+        registers.push(format!(r#""sp":{}"#, hex(cpu.sp())));
+        registers.push(format!(r#""lr":{}"#, hex(cpu.r[14])));
+        registers.push(format!(r#""pc":{}"#, hex(cpu.pc)));
+        registers.push(format!(r#""xpsr":{}"#, hex(cpu.xpsr())));
+        registers.push(format!(r#""msp":{}"#, hex(cpu.msp)));
+        registers.push(format!(r#""psp":{}"#, hex(cpu.psp)));
+        let exceptions: Vec<String> = m
+            .taken
+            .iter()
+            .enumerate()
+            .filter(|&(_, &count)| count > 0)
+            .map(|(n, count)| format!("{}:{count}", quoted(&armv6m::scs::exception::name(n as u32))))
+            .collect();
+        let probe = match &self.probe {
+            Address::Inet { address, port } => {
+                format!("{}.{}.{}.{}:{port}", address >> 24, address >> 16 & 0xff, address >> 8 & 0xff, address & 0xff)
+            }
+            _ => String::new(),
+        };
+        format!(
+            r#"{{"chip":{},"image":{},"state":{},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"faults":{},"probe":{},"debugger":{},"exceptions":{{{}}},"registers":{{{}}}}}"#,
+            quoted(&self.chip),
+            quoted(&self.image),
+            quoted(if self.debugger.halted { "halted" } else { "running" }),
+            quoted(&format!("{:?}", cpu.mode)),
+            cpu.privileged(),
+            m.cycles as f64 / (CYCLES_PER_MICROSECOND * 1000) as f64,
+            m.retired,
+            match self.led {
+                Some(true) => quoted("on"),
+                Some(false) => quoted("off"),
+                None => "null".into(),
+            },
+            self.faults,
+            quoted(&probe),
+            self.client.is_some(),
+            exceptions.join(","),
+            registers.join(","),
+        )
+    }
+
     /// The board's state, as the console's `board` command and the store
     /// show it.
     pub fn status(&self) -> String {
