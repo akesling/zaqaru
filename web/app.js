@@ -20,7 +20,8 @@
 const worker = new Worker("./worker.js", { type: "module" });
 const $ = (id) => document.getElementById(id);
 
-const LIVE_TICK = 4000000; // instructions per advance while playing live
+const LIVE_TICK = 4000000; // instructions per advance while playing a tape
+const FOLLOW_MS = 100; // live: how often the panels follow the running frontier
 
 let live = false;
 let origin = 0;
@@ -33,6 +34,8 @@ let exchanges = []; // { op, path, syscall, bytes, text, error } per host exchan
 let events = []; // the two merged, as the timeline shows them
 let spans = []; // { sent, answered } per request answered through the edge
 let playing = null;
+let checkpointing = null; // live: what checkpoints are costing, from the worker
+let lastState = 0; // when the last state was drawn, by the page's clock
 let current = 0;
 let busy = false;
 let queued = null;
@@ -65,6 +68,18 @@ function seek(at) {
   worker.postMessage({ type: "seek", at, context });
 }
 
+/// Live: the panels at the frontier, wherever it has got to by the time the
+/// worker reads them — never an instant behind it, which would be a
+/// restore and a re-execution for a view that is stale on arrival.
+function follow() {
+  if (busy) {
+    queued = { follow: true };
+    return;
+  }
+  busy = true;
+  worker.postMessage({ type: "seek", at: null, context });
+}
+
 function advance(by) {
   if (busy) {
     queued = { advance: by };
@@ -79,6 +94,7 @@ function drain() {
   const next = queued;
   queued = null;
   if (next.seek !== undefined) seek(next.seek);
+  else if (next.follow) follow();
   else advance(next.advance);
   return true;
 }
@@ -101,11 +117,35 @@ function status(extra = "") {
       `${(frontier - origin).toLocaleString()} instructions`,
       `${timeline.length} syscalls`,
       `${exchanges.length} exchanges`,
+      checkpointing ? `checkpoints ${checkpointShare().toFixed(0)}% of run time` : "",
       extra,
       finished !== null ? `exited ${finished}` : "",
     ].filter(Boolean);
     $("status").textContent = parts.join(" · ");
+    $("ckstat").textContent = checkpointCost();
   }
+}
+
+const seconds = (ms) => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+
+function checkpointShare() {
+  const c = checkpointing;
+  return c && c.ran + c.spent ? (100 * c.spent) / (c.ran + c.spent) : 0;
+}
+
+/// What live checkpoints cost, in run time, and what they buy: how far a
+/// seek may have to re-execute.
+function checkpointCost() {
+  const c = checkpointing;
+  if (!c) return "";
+  const share = checkpointShare();
+  const replay = c.rate ? ` (~${seconds(c.widest / c.rate)})` : "";
+  return `${c.count} taken · ${seconds(c.lastCost)} the last · ${share.toFixed(0)}% of run time · a seek replays ≤ ${(c.widest / 1e6).toFixed(1)}M instructions${replay}`;
+}
+
+/// Tells the worker how to space live checkpoints, from the controls.
+function sendCheckpointing() {
+  worker.postMessage({ type: "checkpointing", every: Number($("every").value), budget: Number($("budget").value) / 100 });
 }
 
 // ---- names and colours ---------------------------------------------------------
@@ -211,7 +251,11 @@ worker.onmessage = (event) => {
     return;
   }
   if (message.type === "progress") {
-    busy = false;
+    // A reply to `advance`, or the running frontier reporting on its own,
+    // which the page answers by drawing the frontier now and then — and
+    // the worker does not wait for.
+    if (message.reply) busy = false;
+    if (message.checkpointing) checkpointing = { ...message.checkpointing, count: message.checkpoints };
     frontier = message.frontier;
     finished = message.finished;
     timeline.push(...message.timeline);
@@ -222,19 +266,20 @@ worker.onmessage = (event) => {
     rebuildEvents();
     renderEvents(true);
     drawLanes();
+    // Whether the panels were following the frontier, before a finish stops the play.
+    const following = playing !== null;
     if (finished !== null) stop();
-    if (!drain()) seek(frontier);
+    if (message.reply) {
+      if (!drain()) seek(frontier);
+    } else if (following && (message.stopped || finished !== null)) follow();
+    else if (following && !busy && performance.now() - lastState >= FOLLOW_MS) follow();
     return;
   }
   if (message.type === "state") {
     busy = false;
+    lastState = performance.now();
     render(message);
-    if (!drain() && playing) {
-      if (live) {
-        if (finished === null) advance(LIVE_TICK);
-        else stop();
-      } else seek(current + playing);
-    }
+    if (!drain() && playing && !live) seek(current + playing);
     return;
   }
   if (message.type === "stream") {
@@ -678,14 +723,22 @@ function terminalWrite(text) {
 // The browser writes a resized panel's size into its style. Once it has,
 // that size is the panel's: it stops growing and shrinking with its row,
 // and the height cap that keeps an unsized panel short no longer applies.
-const resized = new ResizeObserver((entries) => {
-  for (const { target } of entries) {
-    if ((target.style.width || target.style.height) && !target.classList.contains("maximized")) {
-      target.style.flex = "0 0 auto";
-      target.style.maxHeight = "none";
-    }
+// Watched both ways: a size written that the cap kept the panel from
+// taking changes no size, so the resize alone would never be seen.
+function keepSize(target) {
+  if ((target.style.width || target.style.height) && !target.classList.contains("maximized") && target.style.flex !== "0 0 auto") {
+    target.style.flex = "0 0 auto";
+    target.style.maxHeight = "none";
   }
-});
+}
+const resizes = new ResizeObserver((entries) => entries.forEach(({ target }) => keepSize(target)));
+const restyles = new MutationObserver((records) => records.forEach(({ target }) => keepSize(target)));
+const resized = {
+  observe(element) {
+    resizes.observe(element);
+    restyles.observe(element, { attributes: true, attributeFilter: ["style"] });
+  },
+};
 
 function equipPanel(element) {
   const heading = element.querySelector("h2");
@@ -935,6 +988,10 @@ function concreteOf(pattern) {
 
 function render(state) {
   current = state.at;
+  if (live && current > frontier) {
+    frontier = current;
+    $("slider").max = frontier;
+  }
   values = state.values;
   learnNames(values.processes?.value?.processes);
   $("slider").value = current;
@@ -1133,6 +1190,7 @@ $("pathbar").onsubmit = async (event) => {
 // ---- controls ----------------------------------------------------------------
 
 function stop() {
+  if (playing && live) worker.postMessage({ type: "pause" });
   playing = null;
   $("play").textContent = "play";
 }
@@ -1147,9 +1205,11 @@ $("play").onclick = () => {
   if (live && finished !== null) return;
   playing = Number($("speed").value);
   $("play").textContent = "pause";
-  if (live) advance(LIVE_TICK);
+  if (live) worker.postMessage({ type: "run" });
   else seek(current + playing);
 };
+$("budget").onchange = sendCheckpointing;
+$("every").onchange = () => live && sendCheckpointing();
 $("back").onclick = () => go(current - 1, null);
 $("forward").onclick = () => { stop(); leaveOpening(); if (live && current === frontier) advance(1); else seek(current + 1); };
 $("prev").onclick = () => {
@@ -1181,7 +1241,8 @@ async function loadFiles(moduleFile, tapeFile, snapshotFile, every) {
   const tape = tapeFile ? await tapeFile.arrayBuffer() : null;
   const snapshot = snapshotFile ? await snapshotFile.arrayBuffer() : null;
   const publish = $("publish").value.split(",").map((s) => Number(s.trim())).filter(Boolean);
-  worker.postMessage({ type: "load", module, tape, snapshot, checkpointEvery: every, publish }, [module, tape, snapshot].filter(Boolean));
+  const budget = Number($("budget").value) / 100;
+  worker.postMessage({ type: "load", module, tape, snapshot, checkpointEvery: every, budget, publish }, [module, tape, snapshot].filter(Boolean));
 }
 $("load").onclick = () => {
   const module = $("module").files[0];
@@ -1257,13 +1318,15 @@ window.zaqaruDebug = {
 
 // `?module=…&tape=…` replays from URLs on the same origin; `?module=…&live=8080`
 // runs live with those ports published; `&snapshot=…` starts from a booted
-// container; `&every=…` sets the checkpoint interval.
+// container; `&every=…` sets the checkpoint interval, and `&budget=…` the
+// most of a live run's time, in percent, checkpoints may take.
 const params = new URLSearchParams(location.search);
 if (params.get("module")) {
   $("status").textContent = "fetching…";
   if (params.get("live") !== null) $("publish").value = params.get("live");
   const every = Number(params.get("every") ?? (params.get("snapshot") ? 20000000 : $("every").value));
   $("every").value = every;
+  if (params.get("budget")) $("budget").value = params.get("budget");
   const fetchOptional = (name) => (params.get(name) ? fetch(params.get(name)).then((r) => (r.ok ? r.blob() : Promise.reject(`${params.get(name)}: ${r.status}`))) : Promise.resolve(null));
   Promise.all([fetch(params.get("module")).then((r) => r.blob()), fetchOptional("tape"), fetchOptional("snapshot")])
     .then(([m, t, s]) => loadFiles(m, t, s, every))

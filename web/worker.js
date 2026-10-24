@@ -6,9 +6,16 @@
 // checkpointing as it goes, and every instant is then a seek. Without one —
 // live — the container runs against JavaScript's own clock and entropy and
 // an edge the page can send requests through; everything the host answers
-// is recorded, the frontier advances as the page asks, checkpoints are
-// taken on the way, and a seek behind the frontier restores a checkpoint
-// and re-executes against the recording. With a snapshot file (see
+// is recorded, the frontier advances — on its own while the page plays,
+// never waiting on the page to draw — checkpoints are taken on the way,
+// and a seek behind the frontier restores a checkpoint and re-executes
+// against the recording.
+//
+// A checkpoint costs what comparing memory costs, a few milliseconds to a
+// few tens, and a seek re-executes from the one before it. So live
+// checkpoints are spaced by two settings: at least `every` instructions
+// apart, and far enough apart in run time that taking them costs at most
+// `budget` of it. The progress reports say what that is costing. With a snapshot file (see
 // `snapshot.js`), the live run starts from a container somebody already
 // booted, and its history begins there.
 //
@@ -20,7 +27,9 @@
 // change here.
 //
 // Messages in:  { type: "load", module, tape | null, snapshot | null, checkpointEvery, publish }
-//               { type: "advance", by }                 live: run the frontier on
+//               { type: "advance", by }                 live: run the frontier on by `by`, and report
+//               { type: "run" } / { type: "pause" }      live: run the frontier on until paused
+//               { type: "checkpointing", every, budget } live: how far apart checkpoints are
 //               { type: "seek", at, context }           context: { pid, tid, path }
 //               { type: "read", id, path }              one path, at the instant in view
 //               { type: "request", id, port, request }  live: through the edge
@@ -42,6 +51,10 @@ let live = null; // the frontier container, in live mode
 let edge = null;
 let checkpoints = null;
 let checkpointEvery = 2000000;
+let budget = 0.1; // live: the most of run time checkpoints may take
+let running = false; // live: the frontier is running on its own
+let ran = 0; // live: ms spent running the container
+let ranSinceCheckpoint = 0; // the same, since the last checkpoint
 let viewer = null; // the container standing at the last seek
 let origin = 0; // where history begins: 0, or a snapshot's instant
 let inflated = 0; // ms spent inflating the snapshot
@@ -103,10 +116,11 @@ function describe(container) {
   return { meta, interface: manifest?.paths ?? {} };
 }
 
-async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBytes, checkpointEvery: every, publish }) {
+async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBytes, checkpointEvery: every, budget: asked, publish }) {
   const started = performance.now();
   module = await WebAssembly.compile(moduleBytes);
   checkpointEvery = every ?? 2000000;
+  budget = asked ?? budget;
   checkpoints = new Checkpoints();
   timelineSeen = 0;
   traceSeen = 0;
@@ -212,6 +226,70 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
   });
 }
 
+/// Live: whether a checkpoint is due at the frontier: `every` instructions
+/// since the last, and enough run time since it that the last one's cost is
+/// within the budget.
+function checkpointDue() {
+  const last = checkpoints.entries.at(-1);
+  if (frontier < last.at + checkpointEvery) return false;
+  const cost = checkpoints.estimate ?? 0;
+  return budget >= 1 || cost <= (budget / (1 - budget)) * ranSinceCheckpoint;
+}
+
+function checkpoint() {
+  checkpoints.add(frontier, live);
+  ranSinceCheckpoint = 0;
+}
+
+/// Live: one slice of the frontier, at most `by` instructions; answers the
+/// turn's kind.
+function slice(by) {
+  const began = performance.now();
+  const turn = live.step(frontier + by);
+  const retired = live.value("statistics").retired;
+  const took = performance.now() - began;
+  ran += took;
+  ranSinceCheckpoint += took;
+  frontier = retired;
+  if (turn.kind === KIND.FINISHED) {
+    finished = turn.status;
+    checkpoint();
+  } else if (checkpointDue()) checkpoint();
+  return turn.kind;
+}
+
+/// What the page is told as the frontier moves.
+function progress(extra = {}) {
+  const { timeline, trace, exchanges } = growth(live);
+  const last = checkpoints.entries.at(-1);
+  postMessage({
+    type: "progress",
+    frontier,
+    finished,
+    timeline,
+    trace,
+    exchanges,
+    stdout: console_(live, "stdout"),
+    listening: edge ? [...edge.listening] : [],
+    checkpoints: checkpoints.length,
+    held: checkpoints.held,
+    // What checkpoints cost and buy: the time taken against the time run,
+    // and how far a seek may have to re-execute, in instructions and at
+    // the rate the frontier has been running.
+    checkpointing: {
+      every: checkpointEvery,
+      budget,
+      spent: checkpoints.spent,
+      ran,
+      lastCost: checkpoints.lastCost ?? 0,
+      gap: frontier - last.at,
+      widest: checkpoints.widest(frontier),
+      rate: ran ? (frontier - origin) / ran : 0,
+    },
+    ...extra,
+  });
+}
+
 /// Live: runs the frontier on by `by` instructions, checkpointing on the
 /// way, and reports what happened. Returns early on an idle container: the
 /// page may have a request to deliver, and spinning on a parked machine
@@ -220,39 +298,57 @@ async function advance(by) {
   if (!live || finished !== null) return;
   const target = frontier + by;
   let idles = 0;
-  for (;;) {
-    const turn = live.step(target);
-    const retired = live.value("statistics").retired;
-    if (turn.kind === KIND.FINISHED) {
-      finished = turn.status;
-      frontier = retired;
-      break;
-    }
-    frontier = retired;
-    if (turn.kind === KIND.IDLE) {
-      idles++;
-      if (idles > 20) break;
-      await sleep(5);
-      continue;
-    }
-    if (frontier >= checkpoints.at(checkpoints.length - 1) + checkpointEvery) checkpoints.add(frontier, live);
-    break;
+  while (finished === null && frontier < target) {
+    if (slice(target - frontier) !== KIND.IDLE) break;
+    if (++idles > 20) break;
+    await sleep(5);
   }
-  if (finished !== null) checkpoints.add(frontier, live);
-  const { timeline, trace, exchanges } = growth(live);
-  postMessage({
-    type: "progress",
-    frontier,
-    finished,
-    idle: idles > 20,
-    timeline,
-    trace,
-    exchanges,
-    stdout: console_(live, "stdout"),
-    listening: edge ? [...edge.listening] : [],
-    checkpoints: checkpoints.length,
-    held: checkpoints.held,
-  });
+  progress({ idle: idles > 20, reply: true });
+}
+
+// A turn of the event loop and no more: setTimeout clamps to 4 ms once
+// nested, and a message to oneself does not.
+const channel = new MessageChannel();
+const yielded = [];
+channel.port1.onmessage = () => yielded.shift()?.();
+const yieldNow = () => new Promise((resolve) => (yielded.push(resolve), channel.port2.postMessage(null)));
+
+const SLICE_MS = 8; // how long one slice should run, between messages
+const REPORT_MS = 50; // how often the page hears of the frontier
+
+/// Live, playing: runs the frontier until paused or finished, a slice at a
+/// time, sized to take about `SLICE_MS`, so a keystroke or a seek waits at
+/// most that long. Reports at most every `REPORT_MS`, and never waits for
+/// the page to draw what it reported.
+let runs = 0; // which run() is the current one: a pause and a play can overlap the last
+async function run() {
+  if (running || !live) return;
+  running = true;
+  const mine = ++runs;
+  let size = 1000000;
+  let reported = 0;
+  try {
+    while (running && runs === mine && finished === null) {
+      const began = performance.now();
+      const from = frontier;
+      const kind = slice(size);
+      const took = performance.now() - began;
+      if (kind === KIND.IDLE) {
+        if (performance.now() - reported >= REPORT_MS) (progress({ idle: true }), (reported = performance.now()));
+        await sleep(5);
+        continue;
+      }
+      // A slice that ended early, idle or not, says nothing about the rate.
+      if (took > 0.5 && frontier - from >= size) size = Math.max(100000, Math.min(4 * size, 20000000, Math.round((size * SLICE_MS) / took)));
+      if (performance.now() - reported >= REPORT_MS) (progress(), (reported = performance.now()));
+      await yieldNow();
+    }
+  } finally {
+    if (runs === mine) {
+      running = false;
+      progress({ stopped: true });
+    }
+  }
 }
 
 /// One read of the container in view: `{ pattern, value }` or
@@ -277,8 +373,9 @@ function instantiate(pattern, fill) {
 }
 
 /// Stands a container at `at`: the frontier itself when asked for the
-/// frontier, otherwise a restored checkpoint run exactly to the instant.
+/// frontier, or for null, which is wherever the frontier is now; otherwise a restored checkpoint run exactly to the instant.
 async function stand(at) {
+  if (live && at === null) at = frontier;
   if (at < origin) at = origin;
   if (live && at >= frontier) {
     viewer = live;
@@ -345,7 +442,12 @@ function request(id, port, body) {
   const sent = frontier;
   edge
     .request(port, new TextEncoder().encode(body))
-    .then((response) => postMessage({ type: "response", id, response: text(response), sent, answered: frontier }))
+    .then((response) => {
+      // The page places the answer on its timeline, so the timeline up to
+      // it goes first: a running frontier would otherwise report it later.
+      progress();
+      postMessage({ type: "response", id, response: text(response), sent, answered: frontier });
+    })
     .catch((why) => postMessage({ type: "response", id, error: String(why) }));
 }
 
@@ -369,6 +471,12 @@ onmessage = async (event) => {
   try {
     if (message.type === "load") await load(message);
     else if (message.type === "advance") await advance(message.by);
+    else if (message.type === "run") run().catch((why) => postMessage({ type: "error", message: String(why?.stack ?? why) }));
+    else if (message.type === "pause") running = false;
+    else if (message.type === "checkpointing") {
+      if (message.every !== undefined) checkpointEvery = message.every;
+      if (message.budget !== undefined) budget = message.budget;
+    }
     else if (message.type === "seek") await seek(message.at, message.context);
     else if (message.type === "read") readOne(message.id, message.path);
     else if (message.type === "request") request(message.id, message.port, message.request);

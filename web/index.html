@@ -12,7 +12,8 @@
   #controls { display: contents; }
   #controls.hidden { display: none; }
   #status { opacity: .8; }
-  #timeline { padding: 6px 12px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+  #timeline { padding: 6px 12px; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  #ckstat { opacity: .7; }
   #track { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 10em; }
   #slider { width: 100%; margin: 0; }
   #lanes { width: 100%; height: 12px; display: block; }
@@ -140,7 +141,7 @@
     <label>tape <input id="tape" type="file"></label>
     <label>snapshot <input id="snapshot" type="file"></label>
     <label>live ports <input id="publish" type="text" value="8080" style="width:6em"></label>
-    <label>checkpoint every <input id="every" type="number" value="2000000" step="1000000" style="width:9em"></label>
+    <label title="the fewest instructions between two checkpoints">checkpoint every <input id="every" type="number" value="2000000" step="1000000" style="width:9em"></label>
     <button id="load">load</button>
   </span>
   <span id="status">choose a module and a tape to replay, a module alone to run live, or a module and a snapshot to continue a booted one; or pass ?module=…&amp;tape=…, ?module=…&amp;live=8080, ?module=…&amp;snapshot=…&amp;live=80</span>
@@ -157,6 +158,7 @@
   <label>step <select id="speed"><option value="10000">10k</option><option value="100000" selected>100k</option><option value="1000000">1M</option><option value="10000000">10M</option></select></label>
   <button id="pin" title="pin this instant: every panel then shows what changed since">pin</button>
   <span id="pinned"></span>
+  <span id="checkpointing" title="live: checkpoints are what a seek restores before re-executing to the instant asked for. Taking one compares memory against the last, so they are spaced at least 'checkpoint every' instructions apart, and further when needed to keep them within this share of the run's time; closer checkpoints make seeks re-execute less.">checkpoints ≤ <input id="budget" type="number" min="1" max="100" value="10" style="width:4em">% of run time <span id="ckstat"></span></span>
 </div>
 <main>
   <section id="events-panel">
