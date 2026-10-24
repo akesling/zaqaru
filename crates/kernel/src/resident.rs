@@ -199,6 +199,7 @@ pub(crate) fn claim(token: Token, start: u64, end: u64) {
             // SAFETY: a page the caller is mapping, which the mapping rows
             // have already grown memory to cover.
             unsafe { resident(page).fill(0) };
+            cpu::space::note_written(page);
             held.set_owner(page, token);
         }
     });
@@ -239,6 +240,7 @@ pub(crate) fn activate(token: Token) {
             // SAFETY: a page this process maps, inside memory that was
             // grown to hold it when the mapping was made.
             unsafe { resident(page).copy_from_slice(&bytes[..]) };
+            cpu::space::note_written(page);
             held.set_owner(page, token);
             held.pool.push(bytes);
         }

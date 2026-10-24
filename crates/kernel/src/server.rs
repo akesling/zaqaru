@@ -38,7 +38,7 @@ use super::System;
 macro_rules! interface {
     ($disassembly:literal) => {
         concat!(
-            r#"{"name":"zaqaru-container","version":"0.1.0","serialization":"application/json","paths":{"statistics":{"read":"instructions retired and accelerated, blocks decoded, the current pid"},"processes":{"read":"every process — pid, parent, the path it was started from and its comm — and its threads, with what each is parked on"},"processes/{pid}/threads/{tid}/registers":{"read":"the general registers, rip, the segment base and the flags of one thread"},"processes/{pid}/maps":{"read":"the process's memory map, as /proc/self/maps renders it"},"processes/{pid}/descriptors":{"read":"the process's open descriptors, each with the path it was opened by"},"processes/{pid}/files/{path}":{"read":"the process's view of the filesystem at a path: a directory's entries, a file's contents, a symlink's target"},"net":{"read":"every socket in the container: listeners, connections and what is queued each way, and which processes hold each"},"board":{"read":"the board on the container's bench, if the image asked for one: running or halted, simulated time, the LED, faults, exceptions taken, and the core's registers"},"processes/{pid}/memory/{address}/{length}":{"read":"up to 4096 bytes of the running process's memory, hex"},"processes/{pid}/mapped":{"read":"the pages the process can reach, as [start, end) runs"},"cache":{"read":"the running process's block cache"},"layout":{"read":"where the guest block is in linear memory"},"caches":{"read":"what the kernel keeps that a snapshot need not: decompressed files, decoded blocks, pooled page buffers"},"caches/blocks":{"read":"every process's block cache: live blocks and bytes","write":"`flush`: throw every block cache away, zeroing what is freed"},"caches/decompressed":{"read":"every decompressed file's buffer: address and length","write":"`refill`: decompress every cached file again into its buffer"},"caches/pool":{"read":"pooled page buffers","write":"`zero`: zero the pooled buffers"},"meta/":{"read":"which paths are readable"}"#,
+            r#"{"name":"zaqaru-container","version":"0.1.0","serialization":"application/json","paths":{"statistics":{"read":"instructions retired and accelerated, blocks decoded, the current pid"},"processes":{"read":"every process — pid, parent, the path it was started from and its comm — and its threads, with what each is parked on"},"processes/{pid}/threads/{tid}/registers":{"read":"the general registers, rip, the segment base and the flags of one thread"},"processes/{pid}/maps":{"read":"the process's memory map, as /proc/self/maps renders it"},"processes/{pid}/descriptors":{"read":"the process's open descriptors, each with the path it was opened by"},"processes/{pid}/files/{path}":{"read":"the process's view of the filesystem at a path: a directory's entries, a file's contents, a symlink's target"},"net":{"read":"every socket in the container: listeners, connections and what is queued each way, and which processes hold each"},"board":{"read":"the board on the container's bench, if the image asked for one: running or halted, simulated time, the LED, faults, exceptions taken, and the core's registers"},"processes/{pid}/memory/{address}/{length}":{"read":"up to 4096 bytes of the running process's memory, hex"},"processes/{pid}/mapped":{"read":"the pages the process can reach, as [start, end) runs"},"cache":{"read":"the running process's block cache"},"layout":{"read":"where the guest block and the program region below the module's data are in linear memory, and the ranges the kernel never writes again"},"caches":{"read":"what the kernel keeps that a snapshot need not: decompressed files, decoded blocks, pooled page buffers"},"caches/blocks":{"read":"every process's block cache: live blocks and bytes","write":"`flush`: throw every block cache away, zeroing what is freed"},"caches/decompressed":{"read":"every decompressed file's buffer: address and length","write":"`refill`: decompress every cached file again into its buffer"},"caches/pool":{"read":"pooled page buffers","write":"`zero`: zero the pooled buffers"},"meta/":{"read":"which paths are readable"}"#,
             $disassembly,
             "}}"
         )
@@ -181,7 +181,17 @@ impl<'a, S: Store + Clone> System<'a, S> {
             ["layout"] => {
                 let start = self.current().kernel.machine.guest_base();
                 let end = start.saturating_add(crate::syscall::GUEST_ADDRESS_SPACE);
-                Ok(format!(r#"{{"guest_block":{{"start":"{start:#x}","end":"{end:#x}"}}}}"#))
+                let mut out = format!(r#"{{"guest_block":{{"start":"{start:#x}","end":"{end:#x}"}},"#);
+                if let Some((low, high)) = crate::image::program_region() {
+                    let _ = write!(out, r#""program_region":{{"start":"{low:#x}","end":"{high:#x}"}},"#);
+                }
+                out.push_str(r#""frozen":["#);
+                for (index, (address, length)) in crate::image::frozen().into_iter().enumerate() {
+                    let comma = if index == 0 { "" } else { "," };
+                    let _ = write!(out, r#"{comma}{{"start":"{address:#x}","end":"{:#x}"}}"#, address + length);
+                }
+                out.push_str("]}");
+                Ok(out)
             }
             ["caches"] => {
                 let files = crate::image::decompressed_cache();

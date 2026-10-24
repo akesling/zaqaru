@@ -258,6 +258,34 @@ pub unsafe extern "C" fn manifest() -> i32 {
     text.as_ptr() as usize as i32
 }
 
+/// The pages of the guest block written since the last call, for a host
+/// that keeps checkpoints of memory: a page this leaves out holds what it
+/// held at the previous call, so a checkpoint need compare only these and
+/// the module's own memory outside the block.
+///
+/// Answers the address of a `u32` count of words, then that many `u32`
+/// words of bitmap, bit `page % 32` of word `page / 32`. The buffer is
+/// reused, so it is good until the next call. The first call's answer
+/// covers everything since boot.
+///
+/// # Safety
+/// As [`zaqaru_run`]: between turns, one call at a time.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zaqaru_written() -> i32 {
+    static mut WORDS: Vec<u64> = Vec::new();
+    static mut ANSWER: Vec<u32> = Vec::new();
+    let words = unsafe { &mut *(&raw mut WORDS) };
+    let answer = unsafe { &mut *(&raw mut ANSWER) };
+    cpu::space::take_written(words);
+    answer.clear();
+    answer.push((words.len() * 2) as u32);
+    for word in words.iter() {
+        answer.push(*word as u32);
+        answer.push((*word >> 32) as u32);
+    }
+    answer.as_ptr() as usize as i32
+}
+
 /// Whether the host asked for a run without the bytecode accelerator.
 fn interpret_only(store: &mut HostStore) -> bool {
     let mut answer = Vec::new();

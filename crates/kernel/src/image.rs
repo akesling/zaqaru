@@ -936,3 +936,45 @@ pub fn baked() -> Result<Image<'static>, ImageError> {
 pub fn baked() -> Result<Image<'static>, ImageError> {
     unreachable!("the linked image exists only inside the wasm module")
 }
+
+/// The region below the module's data that the bake leaves to a program
+/// stating its own addresses, `(start, end)`: from the top of the shadow
+/// stack to where the linker started the module's data. Nothing but the
+/// guest is ever there.
+#[cfg(target_arch = "wasm32")]
+pub fn program_region() -> Option<(usize, usize)> {
+    unsafe extern "C" {
+        static __stack_high: u8;
+        static __global_base: u8;
+    }
+    let low = &raw const __stack_high as usize;
+    let high = &raw const __global_base as usize;
+    (low < high).then_some((low, high))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn program_region() -> Option<(usize, usize)> {
+    None
+}
+
+/// The ranges of linear memory, `(address, length)`, that the kernel never
+/// writes again: the linked image, and every decompressed file's buffer,
+/// which holds the same bytes from the moment it is cached (a refill writes
+/// them again, unchanged). For a host comparing memory against a copy it
+/// already holds.
+pub fn frozen() -> Vec<(usize, usize)> {
+    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))]
+    let mut ranges = decompressed_cache().ranges;
+    #[cfg(target_arch = "wasm32")]
+    // SAFETY: as in `baked`; the header was validated when the image was
+    // first parsed, and an image that failed never booted a container.
+    unsafe {
+        let index_start = &raw const IMAGE_INDEX;
+        let header = core::slice::from_raw_parts(index_start, HEADER_SIZE);
+        if let (Ok(index), Ok(blob)) = (index_length(header), blob_length(header)) {
+            ranges.push((index_start as usize, index));
+            ranges.push((&raw const IMAGE_BLOB as usize, blob));
+        }
+    }
+    ranges
+}

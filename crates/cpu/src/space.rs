@@ -18,6 +18,11 @@
 //!   on every store. It is what makes self-modifying code and runtime code
 //!   generation *correct* rather than forbidden.
 //!
+//! And one more, shared by every address space on the thread rather than
+//! kept by each: the pages written since the host last asked (see
+//! [`take_written`]), which is what lets a debugger's checkpoint copy what
+//! changed instead of comparing the whole guest block to find it.
+//!
 //! **This module is the choke point for guest memory, and that is a
 //! correctness property, not a style rule.** The set of writers to guest
 //! memory is closed — the interpreter's stores, the kernel's helpers, and
@@ -26,6 +31,8 @@
 //! that reaches around this module is a silent staleness bug, so reaching
 //! around it should be structurally hard: nothing outside this module turns
 //! a guest address into a pointer.
+
+use std::cell::{Cell, RefCell};
 
 use crate::state::Width;
 
@@ -164,13 +171,16 @@ pub struct Space {
     /// list into the block cache before the next instruction is fetched, so
     /// no stale byte is ever executed.
     dirty: Vec<u64>,
-    /// The last single page a store confirmed holds no code, or `u64::MAX`.
+    /// The last single page a store confirmed holds no code and recorded as
+    /// written, with the written log's epoch above bit 32, or `u64::MAX`.
     /// A store's code-page test is a bitmap lookup on every store, wasted on
     /// the stack and heap pages a program writes almost all of the time; a
     /// program's stores have strong page locality, so remembering the last
     /// clean page and skipping the lookup when the next store lands on it
-    /// removes that cost from the common case. Made stale only by
-    /// [`Space::mark_code`], the one place a page turns into code.
+    /// removes that cost from the common case. Made stale by
+    /// [`Space::mark_code`], the one place a page turns into code, and by
+    /// [`take_written`], which starts a new epoch so that the first store
+    /// to every page after it is recorded again.
     last_clean: u64,
     /// The last single page each access kind — read, write, fetch — confirmed
     /// permitted, or `u64::MAX`. A guest's loads and stores have strong page
@@ -231,6 +241,8 @@ impl Space {
         self.writable.reserve(pages);
         self.executable.reserve(pages);
         self.code.reserve(pages);
+        // The written log is sized here too, so that no store allocates.
+        WRITTEN.with_borrow_mut(|written| written.reserve(pages));
     }
 
     /// Gives a page-aligned range a protection, as `mmap` and `mprotect` do.
@@ -282,7 +294,7 @@ impl Space {
     pub fn mark_code(&mut self, page: u64) {
         self.code.set(page as usize, true);
         // The clean-page cache must not name a page that just became code.
-        if page == self.last_clean {
+        if page == self.last_clean & PAGE_BITS {
             self.last_clean = u64::MAX;
         }
     }
@@ -694,7 +706,8 @@ impl Space {
         }
     }
 
-    /// Queues the pages of a store for invalidation, if any holds code.
+    /// Queues the pages of a store for invalidation, if any holds code, and
+    /// records them as written.
     #[inline]
     fn note_code_write(&mut self, address: u64, length: u64) {
         if length == 0 {
@@ -703,11 +716,14 @@ impl Space {
         let first = address >> PAGE_SHIFT;
         let last = (address + length - 1) >> PAGE_SHIFT;
         // The common case: the whole access is on one page. Skip the code
-        // bitmap when that page is the one a store last found clean.
+        // bitmap, and the written log, when that page is the one a store
+        // last found clean in this epoch.
         if first == last {
-            if first == self.last_clean {
+            let stamped = first | EPOCH.get();
+            if stamped == self.last_clean {
                 return;
             }
+            note_written(first);
             if self.code.get(first as usize) {
                 // Cleared here rather than at the drain: the page is queued,
                 // so a second store to it before the cache catches up has
@@ -716,16 +732,57 @@ impl Space {
                 self.dirty.push(first);
             }
             // Clean now, whether it was code and cleared or never code.
-            self.last_clean = first;
+            self.last_clean = stamped;
             return;
         }
         for page in first as usize..=last as usize {
+            note_written(page as u64);
             if self.code.get(page) {
                 self.code.set(page, false);
                 self.dirty.push(page as u64);
             }
         }
     }
+}
+
+/// The page bits of [`Space::last_clean`], below its epoch.
+const PAGE_BITS: u64 = 0xffff_ffff;
+
+thread_local! {
+    /// Pages written since the last [`take_written`], one bit each.
+    static WRITTEN: RefCell<Bitmap> = const { RefCell::new(Bitmap { words: Vec::new() }) };
+    /// The written log's epoch, shifted above the page bits, ready to stamp
+    /// a page number with.
+    static EPOCH: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Records that `page` has been written to.
+///
+/// Every writer in this module calls it, through `note_code_write`; it is
+/// public for the one writer to guest memory that is not here — the page
+/// residency table, which moves a process's bytes in and out of the pages
+/// it owns — so that the log is a log of every byte that changed.
+#[inline]
+pub fn note_written(page: u64) {
+    WRITTEN.with_borrow_mut(|written| written.set(page as usize, true));
+}
+
+/// The pages written since the last call, as a bitmap of `u64` words — bit
+/// `page % 64` of word `page / 64` — into `into`, and a fresh log begun.
+///
+/// For a host that keeps copies of memory: a page this does not name holds
+/// what it held at the previous call. The log knows nothing of writes that
+/// do not pass through here, which is to say the module's own heap — the
+/// guest block is the only memory it speaks for.
+pub fn take_written(into: &mut Vec<u64>) {
+    WRITTEN.with_borrow_mut(|written| {
+        into.clear();
+        into.extend_from_slice(&written.words);
+        written.words.fill(0);
+    });
+    // Every space's clean-page cache names a page in the old epoch, so the
+    // next store anywhere is recorded again.
+    EPOCH.set(EPOCH.get().wrapping_add(1 << 32));
 }
 
 #[cfg(test)]
@@ -964,5 +1021,42 @@ mod tests {
                 access: Access::Fetch
             })
         );
+    }
+
+    fn written_pages() -> Vec<u64> {
+        let mut words = Vec::new();
+        take_written(&mut words);
+        let mut pages = Vec::new();
+        for (index, word) in words.iter().enumerate() {
+            for bit in 0..64 {
+                if word & (1 << bit) != 0 {
+                    pages.push(index as u64 * 64 + bit);
+                }
+            }
+        }
+        pages
+    }
+
+    #[test]
+    fn every_page_written_is_logged_once_per_take() {
+        // The clean-page cache must not hide a page's first store after a
+        // take: the store before the take and the store after it hit the
+        // same page, and the second is the one a checkpoint would miss.
+        let arena = Arena::new(0x4_0000);
+        let mut space = space(&arena);
+        let page = arena.base() >> PAGE_SHIFT;
+        written_pages();
+        space.store(arena.base(), Width::Dword, 1).unwrap();
+        space.store(arena.base() + 4, Width::Dword, 2).unwrap();
+        assert_eq!(written_pages(), vec![page]);
+        assert_eq!(written_pages(), Vec::<u64>::new(), "nothing since");
+        space.store(arena.base() + 8, Width::Dword, 3).unwrap();
+        assert_eq!(written_pages(), vec![page], "the same page, after a take");
+        // A straddling write, a fill and a kernel placement each log every
+        // page they touch.
+        space.write(arena.base() + PAGE_SIZE - 2, &[1, 2, 3, 4]).unwrap();
+        space.fill(arena.base() + 3 * PAGE_SIZE, 2 * PAGE_SIZE, 0).unwrap();
+        space.place(arena.base() + 6 * PAGE_SIZE, &[9]).unwrap();
+        assert_eq!(written_pages(), vec![page, page + 1, page + 3, page + 4, page + 6]);
     }
 }
