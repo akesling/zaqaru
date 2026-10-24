@@ -72,6 +72,7 @@ pub mod number {
     pub const RT_SIGRETURN: i64 = 15;
     pub const SIGALTSTACK: i64 = 131;
     pub const SOCKET: i64 = 41;
+    pub const SCHED_YIELD: i64 = 24;
     pub const SCHED_GETAFFINITY: i64 = 204;
     pub const MBIND: i64 = 237;
     pub const SET_MEMPOLICY: i64 = 238;
@@ -214,6 +215,7 @@ pub mod number {
             RT_SIGRETURN => "rt_sigreturn",
             SIGALTSTACK => "sigaltstack",
             SOCKET => "socket",
+            SCHED_YIELD => "sched_yield",
             SCHED_GETAFFINITY => "sched_getaffinity",
             MBIND => "mbind",
             SET_MEMPOLICY => "set_mempolicy",
@@ -2339,6 +2341,12 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::GETSOCKOPT => self.getsockopt(arguments),
             number::SENDTO | number::RECVFROM => self.send_receive(number, arguments),
             number::SENDMSG | number::RECVMSG => self.send_receive_message(number, arguments),
+            // `sched_yield`: done. Linux returns at once when nothing else
+            // is runnable, and here nothing else is ever runnable *now* —
+            // the loop preempts by retired instructions, not by request, so
+            // a yield cannot move another thread's turn earlier. What it
+            // costs a spin-wait built on it is the rest of its quantum.
+            number::SCHED_YIELD => Outcome::Done(0),
             number::SCHED_GETAFFINITY => self.sched_getaffinity(arguments),
             number::MBIND | number::SET_MEMPOLICY | number::GET_MEMPOLICY => {
                 Outcome::Done(Errno::NoSys.as_result())
