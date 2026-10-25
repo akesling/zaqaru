@@ -202,7 +202,13 @@ impl Board {
             Outcome::Budget | Outcome::Asleep | Outcome::Halted => {}
             Outcome::SystemReset => self.take_reset(),
             outcome => {
-                self.console.push(format!("{} halted: {outcome:?}", self.stamp()));
+                // A halt a debugger with halting debug on asked for — its
+                // breakpoint, or a flash algorithm returning to one — is the
+                // debugger's business, and a flash writes one per page; a
+                // lockup is everyone's.
+                if !self.machine.debug.enabled || matches!(outcome, Outcome::Lockup { .. }) {
+                    self.console.push(format!("{} halted: {outcome:?}", self.stamp()));
+                }
                 if let Some(stop) = self.debugger.stopped(outcome) {
                     self.reply(&gdb::frame(&stop));
                 }
@@ -319,6 +325,11 @@ impl Board {
             self.machine.resume();
             self.rebase(self.now);
         }
+    }
+
+    /// Brings the board up to `now`, as the next service would.
+    pub fn catch_up(&mut self, now: u64) {
+        self.advance(now);
     }
 
     /// A read of the USB probe's provider paths: see [`crate::usb`].

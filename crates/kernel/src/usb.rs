@@ -363,8 +363,18 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
 
     fn usb_write(&mut self, id: &str, rest: &[&[u8]], data: &[u8]) -> StoreOutcome {
         if id == BOARD {
+            // The board runs beside its debugger, not only when the
+            // container is between slices: a debugger polling a core it has
+            // just let run, a transfer at a time, is otherwise polling a
+            // board that never gets the time to do anything.
+            let now = self.monotonic();
             return match &mut *self.board.borrow_mut() {
-                crate::board::Slot::Present(board) => board.usb_write(rest, data),
+                crate::board::Slot::Present(board) => {
+                    if let Some(now) = now {
+                        board.catch_up(now);
+                    }
+                    board.usb_write(rest, data)
+                }
                 _ => StoreOutcome::Failed,
             };
         }
