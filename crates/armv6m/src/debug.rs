@@ -387,17 +387,24 @@ impl Machine {
 
 /// Register `n` by its DCRSR selector (C1.6.3): r0–r12, sp, lr, the
 /// return address 15, xPSR 16, MSP 17, PSP 18, and 20 packing CONTROL in
-/// 31:24 with PRIMASK in 0.
+/// 31:24 with FAULTMASK in 16, BASEPRI in 15:8 and PRIMASK in 0. With an
+/// FPU, FPSCR is 33 and s0–s31 are 64–95 (C1.6.3 of ARMv7-M).
 pub fn register(m: &Machine, n: u32) -> u32 {
     let cpu = &m.cpu;
+    let fpu = m.core != crate::state::Core::CortexM0Plus;
     match n {
         15 => cpu.pc,
         0..=14 => cpu.reg(n as usize),
         16 => cpu.xpsr(),
         17 => cpu.msp,
         18 => cpu.psp,
-        // FAULTMASK and BASEPRI do not exist on this profile.
-        20 => ((cpu.npriv as u32) | (cpu.spsel as u32) << 1) << 24 | cpu.primask as u32,
+        // FAULTMASK, BASEPRI and FPCA stay zero on ARMv6-M, which has none.
+        20 => {
+            let control = (cpu.npriv as u32) | (cpu.spsel as u32) << 1 | (cpu.fpca as u32) << 2;
+            control << 24 | (cpu.faultmask as u32) << 16 | (cpu.basepri as u32) << 8 | cpu.primask as u32
+        }
+        33 if fpu => cpu.fpscr,
+        64..=95 if fpu => cpu.s[(n - 64) as usize],
         _ => 0,
     }
 }
@@ -405,13 +412,17 @@ pub fn register(m: &Machine, n: u32) -> u32 {
 /// Writes register `n` by its DCRSR selector; false if there is no such
 /// register.
 pub fn set_register(m: &mut Machine, n: u32, value: u32) -> bool {
+    let v7 = m.core != crate::state::Core::CortexM0Plus;
+    let mask = m.bus.scs.nvic.mask;
     let cpu = &mut m.cpu;
     match n {
         0..=12 | 14 => cpu.r[n as usize] = value,
         13 => cpu.set_sp(value),
         15 => cpu.pc = value & !1,
+        16 if v7 => cpu.set_xpsr(value),
         16 => {
             cpu.set_apsr(value);
+            cpu.q = false;
             cpu.t = value & 1 << 24 != 0;
         }
         17 => cpu.msp = value & !3,
@@ -422,8 +433,15 @@ pub fn set_register(m: &mut Machine, n: u32, value: u32) -> bool {
             if cpu.mode == Mode::Thread {
                 cpu.spsel = value >> 25 & 1 != 0;
             }
+            if v7 {
+                cpu.basepri = (value >> 8) as u8 & mask;
+                cpu.faultmask = value >> 16 & 1 != 0;
+                cpu.fpca = value >> 26 & 1 != 0;
+            }
             m.update_priority();
         }
+        33 if v7 => cpu.fpscr = value & 0xF7C0_009F,
+        64..=95 if v7 => cpu.s[(n - 64) as usize] = value,
         _ => return false,
     }
     true

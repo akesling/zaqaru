@@ -30,7 +30,7 @@ use armv6m::{Event, Machine, Outcome};
 pub(crate) const CYCLES_PER_MS: u64 = 16_000;
 
 pub(crate) fn usage() -> ExitCode {
-    eprintln!("usage: zaqaru-m0 <final.bin> [--part stm32g031|stm32g070|…] [--ms N] [--quiet]");
+    eprintln!("usage: zaqaru-m0 <final.bin> [--part stm32g031|stm32g070|…] [--core m0+|m7] [--ms N] [--quiet]");
     eprintln!("       zaqaru-m0 serve <final.bin> [--gdb ADDR] [--listen ADDR] [--archive ZIP] [--board FILE]");
     eprintln!("       zaqaru-m0 door [--listen ADDR] [--probe ADDR] [--archive ZIP] [--humility PATH]");
     ExitCode::from(2)
@@ -48,11 +48,19 @@ fn main() -> ExitCode {
     let mut ms: u64 = 2000;
     let mut quiet = false;
     let mut part = armv6m::part::STM32G031;
+    let mut core = armv6m::state::Core::CortexM0Plus;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--part" => match args.next().and_then(|v| armv6m::part::Part::named(&v)) {
                 Some(named) => part = named,
                 None => return usage(),
+            },
+            // The part's own Cortex-M0+, or a Cortex-M7 in its place: for
+            // running an image built for ARMv7E-M on the G0's peripherals.
+            "--core" => match args.next().as_deref() {
+                Some("m0+" | "m0plus") => core = armv6m::state::Core::CortexM0Plus,
+                Some("m7") => core = armv6m::state::Core::CortexM7,
+                _ => return usage(),
             },
             "--ms" => match args.next().and_then(|v| v.parse().ok()) {
                 Some(v) => ms = v,
@@ -71,7 +79,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut machine = match Machine::stm32g0(part, &bytes) {
+    let mut machine = match Machine::stm32g0(part, &bytes).and_then(|mut m| m.set_core(core).map(|()| m)) {
         Ok(machine) => machine,
         Err(e) => {
             eprintln!("zaqaru-m0: {e}");
