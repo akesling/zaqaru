@@ -139,11 +139,17 @@ pub enum Step {
 pub struct Cpu<'a> {
     pub tcb: &'a mut Tcb,
     pub space: &'a mut Space,
+    /// How many elements a `rep movs`/`rep stos` may do in one call: one,
+    /// unless the caller says it has budget for more. Each element still
+    /// retires as an instruction, so the count — and every preemption point
+    /// — is what one at a time would give; what the run loop saves is going
+    /// round once per element.
+    pub repeat: u64,
 }
 
 impl<'a> Cpu<'a> {
     pub fn new(tcb: &'a mut Tcb, space: &'a mut Space) -> Self {
-        Self { tcb, space }
+        Self { tcb, space, repeat: 1 }
     }
 
     // ---- operands --------------------------------------------------------
@@ -1683,6 +1689,47 @@ impl<'a> Cpu<'a> {
             true => 0u64.wrapping_sub(u64::from(width.bytes())),
             false => u64::from(width.bytes()),
         };
+        // A run of elements of a `rep movs` or `rep stos`, as many as the
+        // caller allows, stopping early where one at a time would have
+        // stopped: at the end of the count, at a store on cached code (whose
+        // drain must come before the next fetch), or at a fault — with every
+        // element before it done and retired, and the faulting one not.
+        if repeated && self.repeat > 1 && matches!(operation, StringOperation::Move | StringOperation::Store) {
+            let mut done = 0u64;
+            loop {
+                let source = self.tcb.registers[number::RSI];
+                let destination = self.tcb.registers[number::RDI];
+                let element = match operation {
+                    StringOperation::Move => self.space.load(source, width).and_then(|value| self.space.store(destination, width, value)),
+                    _ => {
+                        let value = self.tcb.read_register(Slice { number: number::RAX as u8, width, high_byte: false });
+                        self.space.store(destination, width, value)
+                    }
+                };
+                if let Err(fault) = element {
+                    // `step` retired one, which the caller takes back for
+                    // the fault; the ones done before it stay.
+                    self.tcb.retired += done;
+                    return Err(fault.into());
+                }
+                if matches!(operation, StringOperation::Move) {
+                    self.tcb.registers[number::RSI] = source.wrapping_add(step);
+                }
+                self.tcb.registers[number::RDI] = destination.wrapping_add(step);
+                done += 1;
+                let remaining = self.tcb.registers[number::RCX].wrapping_sub(1);
+                self.tcb.registers[number::RCX] = remaining;
+                if remaining == 0 {
+                    self.tcb.retired += done - 1;
+                    return Ok(Step::Retired);
+                }
+                if done == self.repeat || self.space.has_dirty_code() {
+                    self.tcb.retired += done - 1;
+                    self.tcb.rip = instruction.ip();
+                    return Ok(Step::Retired);
+                }
+            }
+        }
         let source = self.tcb.registers[number::RSI];
         let destination = self.tcb.registers[number::RDI];
         match operation {

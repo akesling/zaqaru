@@ -146,8 +146,15 @@ impl Engine {
             *budget -= 1;
             let block = cache.block(index);
             let (instruction, quick) = (&block.instructions[0], &block.quick[0]);
+            let before = tcb.retired;
             let mut cpu = Cpu::new(tcb, space);
-            match cpu.run(quick, instruction) {
+            // A `rep movs`/`rep stos` may do as many elements as there is
+            // budget for in this one call; anything else does one.
+            cpu.repeat = *budget + 1;
+            let ran = cpu.run(quick, instruction);
+            // The elements past the first, which the budget pays for too.
+            *budget = budget.saturating_sub(cpu.tcb.retired.wrapping_sub(before).saturating_sub(1));
+            match ran {
                 Ok(Step::Retired) => {}
                 Ok(Step::Syscall) => return Err(Outcome::Syscall),
                 Err(trap) => {

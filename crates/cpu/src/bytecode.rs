@@ -244,6 +244,11 @@ pub enum Op {
     /// otherwise materialise the target into a scratch first — one of the
     /// commonest op pairs a real workload dispatches. Retires as `ExitTo`.
     ExitImm = 49,
+    /// `Load` and `LoadX` that write the whole destination, zero-extended,
+    /// rather than at the op's width — `movzx` into a 32- or 64-bit register
+    /// from memory, which is otherwise a load into a scratch and a `Widen`.
+    LoadZ = 50,
+    LoadXZ = 51,
 }
 
 impl Op {
@@ -260,7 +265,7 @@ impl Op {
         // The discriminants are contiguous 0..=29, so a range check and a
         // transmute is the whole of it — the dense dispatch the format is
         // for.
-        (byte <= Op::ExitImm as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
+        (byte <= Op::LoadXZ as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
     }
 }
 
@@ -332,6 +337,50 @@ fn width_of(word: Word) -> Width {
         2 => Width::Dword,
         _ => Width::Qword,
     }
+}
+
+/// The condition a fused `cmp` or `test` branches on, decided from its
+/// operands — `left`, `right` and `result` already truncated to `width` —
+/// as x86's flags would decide it. `None` for a producer or condition this
+/// does not shortcut (overflow and parity, and the other producers), which
+/// the flags record answers instead.
+#[inline(always)]
+fn decided(producer: Op, condition: Condition, width: Width, left: u64, right: u64, result: u64) -> Option<bool> {
+    let negative = |value: u64| (value >> (width.bits() - 1)) & 1 != 0;
+    let signed = |value: u64| width.sign_extend(value) as i64;
+    let left = left & width.mask();
+    let right = right & width.mask();
+    Some(match producer {
+        Op::Cmp => match condition {
+            Condition::Equal => left == right,
+            Condition::NotEqual => left != right,
+            Condition::Below => left < right,
+            Condition::AboveOrEqual => left >= right,
+            Condition::BelowOrEqual => left <= right,
+            Condition::Above => left > right,
+            Condition::Less => signed(left) < signed(right),
+            Condition::GreaterOrEqual => signed(left) >= signed(right),
+            Condition::LessOrEqual => signed(left) <= signed(right),
+            Condition::Greater => signed(left) > signed(right),
+            Condition::Sign => negative(result),
+            Condition::NoSign => !negative(result),
+            _ => return None,
+        },
+        // A logical result clears the carry and overflow, so the signed
+        // conditions are the sign alone and the unsigned ones the zero.
+        Op::Test => match condition {
+            Condition::Equal | Condition::BelowOrEqual => result == 0,
+            Condition::NotEqual | Condition::Above => result != 0,
+            Condition::Below => false,
+            Condition::AboveOrEqual => true,
+            Condition::Sign | Condition::Less => negative(result),
+            Condition::NoSign | Condition::GreaterOrEqual => !negative(result),
+            Condition::LessOrEqual => result == 0 || negative(result),
+            Condition::Greater => result != 0 && !negative(result),
+            _ => return None,
+        },
+        _ => return None,
+    })
 }
 
 /// A finished trace: a flat stream of words, and the guest address each word
@@ -682,10 +731,11 @@ pub fn run<'a>(
                     spent += 1;
                 }
             }
-            Op::Load => {
+            Op::Load | Op::LoadZ => {
                 let width = width_of(word);
                 let address = regs[a].wrapping_add(imm as i32 as i64 as u64);
                 match space.load(address, width) {
+                    Ok(value) if matches!(op, Op::LoadZ) => regs[d] = value,
                     Ok(value) => write!(d, width, value),
                     Err(fault) => {
                         tcb.rip = trace.ip[pc - 1];
@@ -942,14 +992,23 @@ pub fn run<'a>(
                     Op::Inc | Op::Dec => 1,
                     _ => right,
                 };
-                let mut evaluated = flags;
-                evaluated.record(rule, width, left, record_right, result);
-                let holds = condition.holds(&evaluated);
+                // A compare or a test whose flags die at the branch: the
+                // condition straight from the operands, without the record —
+                // most of what a `cmp`/`jcc` costs is building flags nobody
+                // else reads.
+                let holds = match (live_after, decided(producer, condition, width, left, right, result)) {
+                    (false, Some(holds)) => holds,
+                    _ => {
+                        let mut evaluated = flags;
+                        evaluated.record(rule, width, left, record_right, result);
+                        if live_after {
+                            flags = evaluated;
+                        }
+                        condition.holds(&evaluated)
+                    }
+                };
                 if writes_back {
                     write!(d, width, result);
-                }
-                if live_after {
-                    flags = evaluated;
                 }
                 // Two guest instructions — the producer and the branch.
                 spent += 2;
@@ -1107,13 +1166,14 @@ pub fn run<'a>(
                 }
                 break_on_dirty!();
             }
-            Op::LoadX => {
+            Op::LoadX | Op::LoadXZ => {
                 let width = width_of(word);
                 let scale = 1u64 << ((word >> field::CONDITION) & 0b11);
                 let address = regs[a]
                     .wrapping_add(regs[b].wrapping_mul(scale))
                     .wrapping_add(imm as i32 as i64 as u64);
                 match space.load(address, width) {
+                    Ok(value) if matches!(op, Op::LoadXZ) => regs[d] = value,
                     Ok(value) => write!(d, width, value),
                     Err(fault) => {
                         tcb.rip = trace.ip[pc - 1];

@@ -146,6 +146,37 @@ fn run_bytecode(guest: &mut Guest) -> Outcome {
     }
 }
 
+/// Asserts a run left exactly the reference's machine.
+fn same(reference: &Snapshot, other: &Snapshot, what: &str) {
+    assert_eq!(
+        reference.outcome, other.outcome,
+        "{what}: the two machines stopped for different reasons"
+    );
+    for register in 0..16 {
+        assert_eq!(
+            reference.registers[register], other.registers[register],
+            "{what}: register {register} differs: interpreter {:#x} vs {:#x}",
+            reference.registers[register], other.registers[register],
+        );
+    }
+    assert_eq!(reference.rip, other.rip, "{what}: rip differs");
+    assert_eq!(
+        reference.status, other.status,
+        "{what}: status flags differ: interpreter {:#x} vs {:#x}",
+        reference.status, other.status,
+    );
+    assert_eq!(reference.fs_base, other.fs_base, "{what}: fs_base differs");
+    assert_eq!(
+        reference.retired, other.retired,
+        "{what}: retired instruction count differs: interpreter {} vs {}",
+        reference.retired, other.retired,
+    );
+    assert!(
+        reference.memory == other.memory,
+        "{what}: memory differs between the two machines"
+    );
+}
+
 /// Runs `build` both ways and asserts the two machines match. The runs are
 /// sequential and share [`BASE`], so absolute addresses are comparable; the
 /// reference is snapshotted and dropped before the bytecode run maps the same
@@ -170,34 +201,18 @@ fn agree(build: impl Fn(&mut CodeAssembler, u64) + Copy) -> Outcome {
         let outcome = run_bytecode(&mut guest);
         guest.snapshot(outcome)
     };
+    // And the engine's own run loop with the accelerator on — what a
+    // container runs: traces entered and left through the block cache, a
+    // defer re-entering its trace after the one instruction, a repeated
+    // string operation run as many elements at a time as the budget allows.
+    let integrated = {
+        let mut guest = Guest::at(base, BlockCache::new(), build);
+        let outcome = Engine::run(&mut guest.tcb, &mut guest.space, &mut guest.cache, QUANTUM);
+        guest.snapshot(outcome)
+    };
+    same(&reference, &integrated, "the integrated run loop");
 
-    assert_eq!(
-        reference.outcome, bytecode.outcome,
-        "the two machines stopped for different reasons"
-    );
-    for register in 0..16 {
-        assert_eq!(
-            reference.registers[register], bytecode.registers[register],
-            "register {register} differs: interpreter {:#x} vs bytecode {:#x}",
-            reference.registers[register], bytecode.registers[register],
-        );
-    }
-    assert_eq!(reference.rip, bytecode.rip, "rip differs");
-    assert_eq!(
-        reference.status, bytecode.status,
-        "status flags differ: interpreter {:#x} vs bytecode {:#x}",
-        reference.status, bytecode.status,
-    );
-    assert_eq!(reference.fs_base, bytecode.fs_base, "fs_base differs");
-    assert_eq!(
-        reference.retired, bytecode.retired,
-        "retired instruction count differs: interpreter {} vs bytecode {}",
-        reference.retired, bytecode.retired,
-    );
-    assert!(
-        reference.memory == bytecode.memory,
-        "memory differs between the two machines"
-    );
+    same(&reference, &bytecode, "the bytecode driver");
     reference.outcome
 }
 
@@ -844,6 +859,115 @@ fn single_op_addressing_and_negative_immediates_agree() {
         a.set_label(&mut data).unwrap();
         a.dq(&[0x0123_4567_89ab_cdef]).unwrap();
         a.set_label(&mut out).unwrap();
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn fused_conditions_decided_from_the_operands_agree() {
+    // Every condition a fused cmp or test decides without its flags record,
+    // at three widths, over values either side of each sign boundary. Each
+    // width-and-producer group shifts its own register left (by `lea`, which
+    // leaves the flags alone) and sets the low bit when the branch is not
+    // taken, so every decision is its own bit and one wrong one shows.
+    let values: [u64; 6] = [0, 1, 0x7f, 0x80, 0x7fff_ffff, 0xffff_ffff_ffff_ffff];
+    for (x, y) in values.iter().flat_map(|x| values.iter().map(move |y| (*x, *y))) {
+        agree(|a, _| {
+            a.mov(rbx, x).unwrap();
+            a.mov(rcx, y).unwrap();
+            macro_rules! case {
+                ($compare:expr, $jump:ident, $acc:expr) => {{
+                    let mut skip = a.create_label();
+                    a.lea($acc, qword_ptr($acc + $acc)).unwrap();
+                    $compare;
+                    a.$jump(skip).unwrap();
+                    a.or($acc, 1i32).unwrap();
+                    a.set_label(&mut skip).unwrap();
+                }};
+            }
+            macro_rules! conditions {
+                ($compare:expr, $acc:expr) => {{
+                    a.xor($acc, $acc).unwrap();
+                    case!($compare, je, $acc);
+                    case!($compare, jne, $acc);
+                    case!($compare, jb, $acc);
+                    case!($compare, jae, $acc);
+                    case!($compare, jbe, $acc);
+                    case!($compare, ja, $acc);
+                    case!($compare, jl, $acc);
+                    case!($compare, jge, $acc);
+                    case!($compare, jle, $acc);
+                    case!($compare, jg, $acc);
+                    case!($compare, js, $acc);
+                    case!($compare, jns, $acc);
+                }};
+            }
+            conditions!(a.cmp(rbx, rcx).unwrap(), rax);
+            conditions!(a.cmp(ebx, ecx).unwrap(), rdx);
+            conditions!(a.cmp(bl, cl).unwrap(), rsi);
+            conditions!(a.test(rbx, rcx).unwrap(), rdi);
+            conditions!(a.test(ebx, ecx).unwrap(), r8);
+            conditions!(a.test(bl, cl).unwrap(), r9);
+            a.syscall().unwrap();
+        });
+    }
+}
+
+#[test]
+fn movzx_from_memory_agrees() {
+    // movzx into 32- and 64-bit registers is one zero-extending load; into a
+    // 16-bit one it keeps the upper bits, and stays two ops.
+    agree(|a, entry| {
+        let buf = entry + 0x1000;
+        a.mov(rbx, buf).unwrap();
+        a.mov(rcx, 3u64).unwrap();
+        a.mov(rdx, 0xfedc_ba98_7654_3210u64).unwrap();
+        a.mov(qword_ptr(rbx), rdx).unwrap();
+        a.mov(qword_ptr(rbx + 24), rdx).unwrap();
+        a.mov(rax, 0xffff_ffff_ffff_ffffu64).unwrap();
+        a.mov(rsi, rax).unwrap();
+        a.mov(rdi, rax).unwrap();
+        a.mov(r8, rax).unwrap();
+        a.mov(r9, rax).unwrap();
+        a.movzx(eax, byte_ptr(rbx + 7)).unwrap();
+        a.movzx(rsi, word_ptr(rbx + 2)).unwrap();
+        a.movzx(edi, byte_ptr(rbx + rcx * 8)).unwrap();
+        a.movzx(r8, word_ptr(rbx + rcx * 8 + 2)).unwrap();
+        a.movzx(r9w, byte_ptr(rbx + 1)).unwrap();
+        a.movsx(r10, byte_ptr(rbx + 7)).unwrap();
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn repeated_string_operations_agree() {
+    // `rep stos` and `rep movs` long enough to be run many elements at a
+    // time, inside a trace that defers them, at two widths; a backwards
+    // `rep movs` (direction flag set); and a zero count. Every element still
+    // retires, so the counts must match the interpreter's exactly.
+    agree(|a, entry| {
+        let buf = entry + 0x2000;
+        a.mov(rdi, buf).unwrap();
+        a.mov(rcx, 3000u64).unwrap();
+        a.mov(rax, 0x0102_0304_0506_0708u64).unwrap();
+        a.rep().stosq().unwrap();
+        a.mov(rdi, buf + 0x6000).unwrap();
+        a.mov(rcx, 777u64).unwrap();
+        a.mov(al, 0x5au32).unwrap();
+        a.rep().stosb().unwrap();
+        a.mov(rsi, buf).unwrap();
+        a.mov(rdi, buf + 0x8000).unwrap();
+        a.mov(rcx, 1500u64).unwrap();
+        a.rep().movsq().unwrap();
+        a.std().unwrap();
+        a.mov(rsi, buf + 0x100).unwrap();
+        a.mov(rdi, buf + 0x7000).unwrap();
+        a.mov(rcx, 40u64).unwrap();
+        a.rep().movsb().unwrap();
+        a.cld().unwrap();
+        a.xor(rcx, rcx).unwrap();
+        a.rep().stosq().unwrap();
+        a.add(rdx, rdi).unwrap();
         a.syscall().unwrap();
     });
 }

@@ -1043,6 +1043,18 @@ impl Emitter {
                 self.push(encode(op, dst.number, slice.number, 0, quick.width, false, false, true, source_class, 0));
                 Some(())
             }
+            // `movzx` into a 32- or 64-bit register: the load itself, at the
+            // source width, writing the whole destination zero-extended —
+            // which is what both widths of destination mean by it.
+            Source::Memory if op == Op::Widen && matches!(quick.width, Width::Dword | Width::Qword) => {
+                if let Some((base, index, scale, disp)) = indexed_address(quick) {
+                    self.push(encode(Op::LoadXZ, dst.number, base, index, quick.source_width, false, false, true, scale, disp as u32));
+                } else {
+                    let (base, disp) = self.address(quick)?;
+                    self.push(encode(Op::LoadZ, dst.number, base, 0, quick.source_width, false, false, true, 0, disp as u32));
+                }
+                Some(())
+            }
             Source::Memory => {
                 let scratch = self.emit_scratch_load(quick, quick.source_width)?;
                 self.push(encode(op, dst.number, scratch, 0, quick.width, false, false, true, source_class, 0));
