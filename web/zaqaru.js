@@ -577,6 +577,8 @@ export class MountTable {
         if (!edge) continue;
         store = edge.load(state);
       } else if (state.kind === "server") continue;
+      // USB devices are the world's, like the edge: a file does not hold them.
+      else if (state.kind === "usb") continue;
       else throw `a saved store of kind ${state.kind}`;
       table.mount(path, store);
     }

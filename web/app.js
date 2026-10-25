@@ -17,6 +17,8 @@
 // and when the first answer arrives it stands the machine on the instant
 // the request came in and shows everything.
 
+import { request as requestUsb } from "./usb.js";
+
 const worker = new Worker("./worker.js", { type: "module" });
 const $ = (id) => document.getElementById(id);
 
@@ -273,6 +275,13 @@ worker.onmessage = (event) => {
       if (!drain()) seek(frontier);
     } else if (following && (message.stopped || finished !== null)) follow();
     else if (following && !busy && performance.now() - lastState >= FOLLOW_MS) follow();
+    return;
+  }
+  // The USB devices the worker holds for the container: the page's grants.
+  if (message.type === "usb") {
+    granted = message.devices;
+    const panel = panels.get("usb");
+    if (panel && values.usb?.value) renderers.usb(values.usb.value, panel);
     return;
   }
   if (message.type === "state") {
@@ -563,7 +572,7 @@ function go(at, focus) {
 // are. Which panels stand in the open, which fold under "the machine" and
 // which under "kernel internals" is the one opinion the page keeps.
 
-const OPEN = ["board", "processes", FILES, DESCRIPTORS, "net"];
+const OPEN = ["board", "usb", "processes", FILES, DESCRIPTORS, "net"];
 const MACHINE = [
   "processes/{pid}/threads/{tid}/registers",
   "processes/{pid}/threads/{tid}/disassembly",
@@ -859,7 +868,100 @@ function processLabel(p) {
   return `<span style="color:${colorOf(p.pid)}">${escape(nameOf(p.pid))}</span> · pid ${p.pid}`;
 }
 
+// ---- USB ---------------------------------------------------------------------
+//
+// The container's USB devices, from its store, and what they carried. A
+// CMSIS-DAP probe's transfers are commands and their answers, so the log is
+// decoded as those: which command, and for a register transfer, which
+// registers it read and wrote.
+
+let granted = []; // the devices the worker holds for the container
+
+const DAP = {
+  0x00: "Info", 0x01: "HostStatus", 0x02: "Connect", 0x03: "Disconnect", 0x04: "TransferConfigure",
+  0x05: "Transfer", 0x06: "TransferBlock", 0x07: "TransferAbort", 0x08: "WriteABORT", 0x09: "Delay",
+  0x0a: "ResetTarget", 0x10: "SWJ_Pins", 0x11: "SWJ_Clock", 0x12: "SWJ_Sequence", 0x13: "SWD_Configure",
+  0x1d: "SWD_Sequence", 0x7e: "QueueCommands", 0x7f: "ExecuteCommands", 0xff: "error",
+};
+const DP = { 0x0: "DPIDR/ABORT", 0x4: "CTRL/STAT", 0x8: "SELECT", 0xc: "RDBUFF" };
+const AP = { 0x0: "CSW", 0x4: "TAR", 0xc: "DRW" };
+const ACK = ["?", "OK", "WAIT", "?", "FAULT"];
+
+function bytesOf(hex) {
+  const out = [];
+  for (let i = 0; i + 1 < hex.length; i += 2) out.push(parseInt(hex.slice(i, i + 2), 16));
+  return out;
+}
+
+/// One transfer as a CMSIS-DAP command or answer: a name, and a summary.
+function decodeDap(transfer) {
+  const b = bytesOf(transfer.head);
+  const name = DAP[b[0]] ?? `0x${(b[0] ?? 0).toString(16)}`;
+  const outward = !transfer.endpoint.startsWith("8");
+  if (!outward) {
+    if (b[0] === 0x05) return { name, summary: `${b[1]} done, ${ACK[b[2] & 7] ?? b[2]}` };
+    if (b[0] === 0x06) return { name, summary: `${b[1] | (b[2] << 8)} done, ${ACK[b[3] & 7] ?? b[3]}` };
+    return { name, summary: `${transfer.length} byte${transfer.length === 1 ? "" : "s"}` };
+  }
+  if (b[0] === 0x05) {
+    const parts = [];
+    let at = 3;
+    for (let n = 0; n < b[2] && at < b.length; n++) {
+      const request = b[at++];
+      const reads = request & 2;
+      const label = (request & 1 ? AP : DP)[request & 0x0c] ?? `0x${(request & 0x0c).toString(16)}`;
+      parts.push(`${request & 1 ? "AP" : "DP"} ${reads ? "read" : "write"} ${label}`);
+      if (!reads || request & 0x10) at += 4;
+    }
+    return { name, summary: parts.join(", ") + (b[2] > parts.length ? ` … (${b[2]})` : "") };
+  }
+  if (b[0] === 0x06) {
+    const request = b[4] ?? 0;
+    return { name, summary: `${b[2] | (b[3] << 8)} × ${request & 1 ? "AP" : "DP"} ${request & 2 ? "read" : "write"} ${(request & 1 ? AP : DP)[request & 0x0c] ?? ""}` };
+  }
+  if (b[0] === 0x00) return { name, summary: { 1: "vendor", 2: "product", 3: "serial", 4: "version", 0xf0: "capabilities", 0xfe: "packet count", 0xff: "packet size" }[b[1]] ?? `id 0x${(b[1] ?? 0).toString(16)}` };
+  return { name, summary: `${transfer.length} byte${transfer.length === 1 ? "" : "s"}` };
+}
+
+async function connectUsb() {
+  try {
+    await requestUsb();
+    worker.postMessage({ type: "usb" });
+  } catch (why) {
+    // Cancelling the chooser is an answer, not an error.
+    if (!/No device selected/i.test(String(why))) status(`USB: ${why}`);
+  }
+}
+
 const renderers = {
+  // The USB devices the container's programs can open, and their traffic.
+  usb(value, panel) {
+    const enumerated = new Set(value.devices.map((d) => d.id));
+    const can = !!navigator.usb;
+    let html = `<div class="usb"><div class="usbbar"><button class="connect" ${can ? "" : "disabled"} title="${can ? "grant the container a USB device from this computer — a debug probe, say; programs started from now on find it" : "this browser has no WebUSB"}">connect a USB device…</button>`;
+    const waiting = granted.filter((g) => !enumerated.has(g.id));
+    if (waiting.length) html += ` <span class="dim">${waiting.map((g) => escape(g.name || g.id)).join(", ")}: granted — the next program to start finds it</span>`;
+    html += `</div>`;
+    if (!value.devices.length) html += `<div class="dim">no USB devices${can ? "" : " — and this browser cannot grant one"}</div>`;
+    for (const d of value.devices) {
+      const kind = d.provider === "board" ? "the board's probe" : "from this computer";
+      const rows = d.recent
+        .slice(-14)
+        .reverse()
+        .map((t) => {
+          const { name, summary } = decodeDap(t);
+          const outward = !t.endpoint.startsWith("8");
+          return `<tr class="${outward ? "out" : "in"}"><td class="at">${t.at.toLocaleString()}</td><td>${outward ? "→" : "←"} ${escape(t.endpoint)}</td><td><b>${escape(name)}</b></td><td>${escape(summary)}</td>${t.status ? `<td class="refusal">${t.status}</td>` : ""}</tr>`;
+        })
+        .join("");
+      html += `<div class="device"><div><b>${escape(d.name ?? d.id)}</b> · ${escape(d.vendor ?? "")}:${escape(d.product ?? "")} · ${kind} · bus ${d.bus} device ${d.address}${d.open ? ` · open ×${d.open}` : ""}</div>
+        <div class="dim">${escape(d.interface ?? "")} · ${escape(d.speed)} Mbit/s · out ${d.out.transfers.toLocaleString()} transfers, ${(d.out.bytes / 1024).toFixed(1)} KiB · in ${d.in.transfers.toLocaleString()}, ${(d.in.bytes / 1024).toFixed(1)} KiB</div>
+        ${rows ? `<table class="transfers">${rows}</table>` : `<div class="dim">nothing carried yet</div>`}</div>`;
+    }
+    panel.body.innerHTML = html + `</div>`;
+    panel.body.querySelector(".connect").onclick = connectUsb;
+  },
+
   // A board on the container's bench: its LED drawn, and the core's state.
   board(value, panel) {
     const on = value.led === "on";
@@ -872,7 +974,7 @@ const renderers = {
     panel.body.innerHTML = `<div class="board">
       <div class="led${on ? " on" : ""}" title="the user LED, PC6, active low"></div>
       <div><b>${escape(value.chip)}</b> · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated</div>
-      <div>LED ${escape(value.led ?? "never driven")} · ${value.faults} faults · probe ${escape(value.probe)}${value.debugger ? " · debugger attached" : ""}</div>
+      <div>LED ${escape(value.led ?? "never driven")} · ${value.faults} faults · probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
       <div class="dim">${escape(value.image)} · ${value.instructions.toLocaleString()} instructions · ${escape(value.mode)} mode, ${value.privileged ? "privileged" : "unprivileged"}</div>
       <div class="dim">${exceptions}</div>
       <div class="registers">${registers}</div>

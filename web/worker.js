@@ -44,8 +44,10 @@
 import { Container, Edge, KIND, MountTable, parseTape, standardMounts, text } from "./zaqaru.js";
 import { Checkpoints } from "./checkpoints.js";
 import { decode, inflate, refill } from "./snapshot.js";
+import { WebUsb } from "./usb.js";
 
 let module = null;
+let usb = null; // the WebUSB store, when the browser has WebUSB
 let tape = null;
 let live = null; // the frontier container, in live mode
 let edge = null;
@@ -177,11 +179,15 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
   // Live: the world is JavaScript's, and recorded.
   tape = null;
   edge = new Edge(publish ?? []);
+  // And USB devices the page has been granted, if the browser has WebUSB.
+  usb = globalThis.navigator?.usb ? new WebUsb({ onArrival: wake, onChange: (devices) => postMessage({ type: "usb", devices }) }) : null;
+  await usb?.refresh();
   if (snapshotBytes) {
     const inflating = performance.now();
     const file = decode(await inflate(new Uint8Array(snapshotBytes)));
     inflated = performance.now() - inflating;
     const mounts = MountTable.load(file.mounts, { edge });
+    if (usb) mounts.mount(["services", "usb"], usb);
     mounts.record();
     observed = mounts.observe();
     live = await Container.continueFrom(module, file, mounts);
@@ -191,6 +197,7 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
     // here: whatever the file kept of the console is the boot's output.
   } else {
     const mounts = standardMounts({ seed: null, config: { trace: 1 }, edge });
+    if (usb) mounts.mount(["services", "usb"], usb);
     mounts.record();
     observed = mounts.observe();
     live = await Container.instantiate(module, mounts);
@@ -508,6 +515,9 @@ onmessage = async (event) => {
     else if (message.type === "request") request(message.id, message.port, message.request);
     else if (message.type === "open") openStream(message.id, message.port);
     else if (message.type === "write") streams.get(message.id)?.send(new TextEncoder().encode(message.data));
+    // The page has been granted a USB device: attach it, and the next
+    // program to start finds it.
+    else if (message.type === "usb") await usb?.refresh();
   } catch (why) {
     postMessage({ type: "error", message: String(why?.stack ?? why) });
   }

@@ -57,6 +57,31 @@ otherwise in a container from `builder.Dockerfile`. Then it builds the
 bench image from `Dockerfile`, bakes it, and checks the module under Node
 (`check.mjs`).
 
+## USB, and a probe of your own
+
+The page's **usb** panel lists the USB devices the container's programs can
+open, and what each has carried: totals, and the latest transfers decoded
+as CMSIS-DAP commands — `Transfer: AP write TAR, AP read DRW`, a
+`TransferBlock` of memory, an `Info` query. It is read from the container's
+store like every other panel, so the slider shows the traffic as it was at
+any instant.
+
+**connect a USB device…** grants the container a device from your computer
+through WebUSB (Chrome or Edge). The page asks; the worker the container
+runs in attaches what was granted and serves it at `services/usb` — the
+same store contract the board's probe is served through
+(`web/usb.js`, `crates/kernel/src/usb.rs`) — so the next program to start
+finds it in sysfs beside the board's. With two probes on the desk, name the
+one you mean, as on a real one: the door runs `humility` against the
+board's probe by its IDs (`1209:0001`), and `humility -p VID:PID …` reaches
+yours.
+
+This has been checked against a mock CMSIS-DAP device standing in for
+WebUSB, with stock Humility enumerating it, reading its descriptors and
+exchanging commands with it; not yet against a real probe. A Nucleo's own
+ST-LINK speaks ST-LINK rather than CMSIS-DAP, which probe-rs also drives,
+but whether a browser lets it be claimed is untested.
+
 ## Things to type
 
 | line | what it does |
@@ -70,6 +95,7 @@ bench image from `Dockerfile`, bakes it, and checks the module under Node
 | `humility hiffy -c UserLeds.led_toggle -a index=0` | an IPC call made on the board, through the hiffy task: the LED changes |
 | `humility flash -F` | flashes the archive's image onto the board through probe-rs's own flash algorithm, then resets it |
 | `humility flash --verify` | reads the flash back and compares it with the archive |
+| `humility -p VID:PID tasks` | the same, through a probe connected from the page |
 | `board` | the board itself: running or halted, simulated time, LED, faults, exceptions taken |
 | `exit` | end the session |
 

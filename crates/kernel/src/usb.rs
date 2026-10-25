@@ -184,11 +184,51 @@ pub(crate) struct Handle {
     references: u32,
 }
 
-/// Every device and open device file in the container.
+/// One transfer, as the log keeps it: when, which way, on which endpoint,
+/// how it ended, and the first bytes of it — enough to say what a probe was
+/// asked, which a CMSIS-DAP command says in its first few.
+#[derive(Clone, Debug)]
+pub struct Transfer {
+    /// The container's instant, in retired instructions.
+    pub at: u64,
+    pub endpoint: u8,
+    pub length: u32,
+    pub status: i32,
+    pub head: Vec<u8>,
+}
+
+/// What a device has carried: totals, and the latest transfers.
+#[derive(Clone, Debug, Default)]
+pub struct Log {
+    pub out: (u64, u64),
+    pub inward: (u64, u64),
+    pub recent: VecDeque<Transfer>,
+}
+
+/// How many transfers a device's log keeps, and how much of each.
+pub const RECENT: usize = 48;
+pub const HEAD: usize = 24;
+
+impl Log {
+    fn note(&mut self, transfer: Transfer) {
+        let totals = if transfer.endpoint & 0x80 != 0 { &mut self.inward } else { &mut self.out };
+        totals.0 += 1;
+        totals.1 += u64::from(transfer.length);
+        if self.recent.len() == RECENT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(transfer);
+    }
+}
+
+/// Every device and open device file in the container, and what each
+/// device has carried — kept by id across enumerations, which happen at
+/// every `exec`, so the log is the device's and not one program's.
 #[derive(Clone, Debug, Default)]
 pub struct Usb {
     pub devices: Vec<Device>,
     pub(crate) handles: Vec<Option<Handle>>,
+    pub logs: std::collections::BTreeMap<String, Log>,
 }
 
 /// See [`crate::ring::Shared`].
@@ -258,14 +298,76 @@ impl Usb {
     }
 
     /// Completes the oldest pending URB on `endpoint` with `data`.
-    fn complete(&mut self, id: u32, endpoint: u8, status: i32, data: Vec<u8>) {
+    fn complete(&mut self, id: u32, endpoint: u8, status: i32, data: Vec<u8>, at: u64) {
         let Some(handle) = self.handle_mut(id) else { return };
-        let Some(at) = handle.pending.iter().position(|u| u.endpoint == endpoint) else { return };
-        let mut urb = handle.pending.remove(at);
+        let Some(index) = handle.pending.iter().position(|u| u.endpoint == endpoint) else { return };
+        let mut urb = handle.pending.remove(index);
         urb.status = status;
         urb.actual = data.len().min(urb.length as usize) as u32;
+        let transfer = Transfer { at, endpoint, length: urb.actual, status, head: data[..data.len().min(HEAD)].to_vec() };
         urb.data = data;
         handle.completed.push_back(urb);
+        let device = handle.device;
+        self.note(device, transfer);
+    }
+
+    /// Logs a transfer against device `device`.
+    fn note(&mut self, device: usize, transfer: Transfer) {
+        if let Some(id) = self.devices.get(device).map(|d| d.id.clone()) {
+            self.logs.entry(id).or_default().note(transfer);
+        }
+    }
+
+    /// The table as the store's `usb` lens serves it.
+    pub fn json(&self) -> String {
+        use crate::system::server::quoted;
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let devices: Vec<String> = self
+            .devices
+            .iter()
+            .enumerate()
+            .map(|(n, d)| {
+                let log = self.logs.get(&d.id).cloned().unwrap_or_default();
+                let recent: Vec<String> = log
+                    .recent
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            r#"{{"at":{},"endpoint":"{:02x}","length":{},"status":{},"head":"{}"}}"#,
+                            t.at,
+                            t.endpoint,
+                            t.length,
+                            t.status,
+                            hex(&t.head)
+                        )
+                    })
+                    .collect();
+                let attribute = |name| self.attribute(n, None, name).map_or("null".to_string(), |v| quoted(&v));
+                let interface = self.attribute(n, Some(0), "interface").map_or("null".to_string(), |v| quoted(&v));
+                let open = self.handles.iter().flatten().filter(|h| h.device == n).count();
+                format!(
+                    r#"{{"id":{},"provider":{},"bus":{},"address":{},"vendor":{},"product":{},"manufacturer":{},"name":{},"serial":{},"interface":{},"speed":{},"open":{},"out":{{"transfers":{},"bytes":{}}},"in":{{"transfers":{},"bytes":{}}},"recent":[{}]}}"#,
+                    quoted(&d.id),
+                    quoted(if d.id == BOARD { "board" } else { "host" }),
+                    BUS,
+                    d.address,
+                    attribute("idVendor"),
+                    attribute("idProduct"),
+                    attribute("manufacturer"),
+                    attribute("product"),
+                    attribute("serial"),
+                    interface,
+                    quoted(&d.speed),
+                    open,
+                    log.out.0,
+                    log.out.1,
+                    log.inward.0,
+                    log.inward.1,
+                    recent.join(",")
+                )
+            })
+            .collect();
+        format!(r#"{{"devices":[{}]}}"#, devices.join(","))
     }
 
     /// A sysfs attribute of device `device`, or of its interface
@@ -347,6 +449,12 @@ fn endpoint_name(endpoint: u8) -> Vec<u8> {
 }
 
 impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_, S, M> {
+    /// The container's instant, as the running thread counts it: see
+    /// `cpu::state::Tcb::clock`.
+    fn instant(&mut self) -> u64 {
+        self.machine.tcb().map_or(0, |thread| thread.retired.wrapping_add(thread.clock))
+    }
+
     /// Reads `rest` of device `id` from whoever provides it.
     fn usb_read(&mut self, id: &str, rest: &[&[u8]], into: &mut Vec<u8>) -> StoreOutcome {
         if id == BOARD {
@@ -622,8 +730,13 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                     StoreOutcome::Failed => urb.status = Errno::Pipe.as_result() as i32,
                     _ => urb.actual = length,
                 }
+                let at = self.instant();
                 let mut usb = self.usb.borrow_mut();
-                usb.handle_mut(id).ok_or(Errno::BadFile)?.completed.push_back(urb);
+                let handle = usb.handle_mut(id).ok_or(Errno::BadFile)?;
+                let transfer = Transfer { at, endpoint, length: urb.actual, status: urb.status, head: bytes[..bytes.len().min(HEAD)].to_vec() };
+                handle.completed.push_back(urb);
+                let index = handle.device;
+                usb.note(index, transfer);
             }
             TYPE_BULK | TYPE_INTERRUPT => {
                 self.usb.borrow_mut().handle_mut(id).ok_or(Errno::BadFile)?.pending.push(urb(buffer));
@@ -662,17 +775,21 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// may now have an answer.
     pub(crate) fn service_usb(&mut self) -> bool {
         let waiting = self.usb.borrow().waiting();
+        if waiting.is_empty() {
+            return false;
+        }
+        let at = self.instant();
         let mut moved = false;
         for (handle, device, endpoint, length) in waiting {
             let mut data = Vec::new();
             let max = length.to_string();
             match self.usb_read(&device, &[b"endpoints", &endpoint_name(endpoint), b"pending", max.as_bytes()], &mut data) {
                 StoreOutcome::Present => {
-                    self.usb.borrow_mut().complete(handle, endpoint, 0, data);
+                    self.usb.borrow_mut().complete(handle, endpoint, 0, data, at);
                     moved = true;
                 }
                 StoreOutcome::Failed => {
-                    self.usb.borrow_mut().complete(handle, endpoint, Errno::Pipe.as_result() as i32, Vec::new());
+                    self.usb.borrow_mut().complete(handle, endpoint, Errno::Pipe.as_result() as i32, Vec::new(), at);
                     moved = true;
                 }
                 StoreOutcome::Absent => {}
@@ -701,7 +818,7 @@ mod tests {
 
     #[test]
     fn sysfs_says_what_nusb_reads_to_find_a_cmsis_dap_probe() {
-        let usb = Usb { devices: vec![probe()], handles: Vec::new() };
+        let usb = Usb { devices: vec![probe()], ..Usb::default() };
         let a = |name| usb.attribute(0, None, name).unwrap();
         assert_eq!(a("idVendor"), "1209");
         assert_eq!(a("idProduct"), "0001");

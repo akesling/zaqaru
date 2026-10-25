@@ -5,8 +5,10 @@
 //! ```
 //!
 //! `--probe` is the board's USB probe (`usb`), which Humility finds as
-//! probe-rs finds any probe plugged in, or a GDB server's address, which a
-//! Humility built with the GDB probe reaches as `gdb:ADDRESS`.
+//! probe-rs finds any probe plugged in — named by its USB IDs, so that a
+//! probe the page has connected beside it does not make the choice
+//! ambiguous — or a GDB server's address, which a Humility built with the
+//! GDB probe reaches as `gdb:ADDRESS`.
 //!
 //! Each connection is a session: a banner, a `$ ` prompt, and a line at a
 //! time. `humility …` runs Humility against the probe, its output streamed
@@ -97,6 +99,9 @@ const HELP: &str = "\
     humility manifest       what the archive says was built
     humility flash -F       flash the archive's image onto the board, and
                             run it
+    humility -p VID:PID …   the same against a probe connected from the
+                            page — its USB panel, 'connect a USB
+                            device…' — on real hardware
     board                   the board itself: state, time, LED, faults
     exit                    end the session
 ";
@@ -158,7 +163,7 @@ impl FrontDoor {
         command
             .args(args)
             .env("HUMILITY_PROBE", match self.probe.as_str() {
-                "usb" => "usb".to_string(),
+                "usb" => format!("{:04x}:{:04x}", armv6m::cmsis_dap::VENDOR_ID, armv6m::cmsis_dap::PRODUCT_ID),
                 address => format!("gdb:{address}"),
             })
             .stdin(Stdio::null())
