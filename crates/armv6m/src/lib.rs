@@ -30,6 +30,7 @@
 //! to the next event, which is also what makes an idle system cheap to run.
 
 pub mod bus;
+pub mod cmsis_dap;
 pub mod dap;
 pub mod debug;
 pub mod exception;
