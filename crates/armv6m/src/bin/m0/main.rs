@@ -221,9 +221,12 @@ fn peer_target(peer: &armv6m::net::Peer) -> String {
 
 pub(crate) fn heard_line(heard: &armv6m::net::Heard) -> String {
     match heard {
-        armv6m::net::Heard::Udp { from, source, port, payload } => {
-            format!("{:?} from [{}]:{source} on port {port}", String::from_utf8_lossy(payload), armv6m::net::show(from))
-        }
+        armv6m::net::Heard::Udp { from, source, port, payload, multicast } => format!(
+            "{:?} from [{}]:{source} on port {port}{}",
+            String::from_utf8_lossy(payload),
+            armv6m::net::show(from),
+            if *multicast { ", to all nodes" } else { "" }
+        ),
         armv6m::net::Heard::Pong { from, sequence } => format!("an echo reply from [{}], sequence {sequence}", armv6m::net::show(from)),
     }
 }

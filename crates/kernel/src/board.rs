@@ -115,6 +115,11 @@ pub struct Board {
     pub heard: VecDeque<(u64, String)>,
     heard_count: u64,
     pings: u16,
+    /// Datagrams the board sent to a group rather than to the host —
+    /// udpbroadcast's, every second — counted, and the latest, apart from
+    /// what was sent to the host.
+    multicast: u64,
+    last_multicast: Option<String>,
 }
 
 /// How many of what the host heard the board keeps.
@@ -245,7 +250,7 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
 fn heard_line(heard: &armv6m::net::Heard) -> String {
     use armv6m::net::{Heard, show};
     match heard {
-        Heard::Udp { from, source, port, payload } => {
+        Heard::Udp { from, source, port, payload, .. } => {
             let text = String::from_utf8_lossy(payload);
             let printable = text.chars().all(|c| !c.is_control() || c == '\n');
             let body = if printable { format!("{:?}", text.trim_end_matches('\n')) } else { format!("{} bytes", payload.len()) };
@@ -310,6 +315,8 @@ impl Board {
                 self.leds = Led::of(part.name).into_iter().map(|led| (led, None)).collect();
                 self.host = armv6m::net::Peer::default();
                 self.heard.clear();
+                self.multicast = 0;
+                self.last_multicast = None;
                 self.serial.clear();
                 self.faults = 0;
                 self.usb_probe = Probe::default();
@@ -471,6 +478,11 @@ impl Board {
                         self.machine.deliver(reply);
                     }
                     for heard in heard {
+                        if let armv6m::net::Heard::Udp { multicast: true, .. } = heard {
+                            self.multicast += 1;
+                            self.last_multicast = Some(heard_line(&heard));
+                            continue;
+                        }
                         self.heard_count += 1;
                         let line = heard_line(&heard);
                         self.console.push(format!("[board {:>10.3} ms] the host heard {line}", self.ms(cycle)));
@@ -700,6 +712,9 @@ impl Board {
         if matches!(m.bus.soc, armv6m::bus::Soc::H7(_)) {
             let board = self.host.board.map_or("not heard from yet".into(), |(_, ip)| armv6m::net::show(&ip));
             network = format!("network     the host is {}, the board {board}\n", armv6m::net::show(&self.host.ip));
+            if let Some(line) = &self.last_multicast {
+                network += &format!("multicast   {} datagrams to all nodes, the latest {line}\n", self.multicast);
+            }
             for (n, line) in &self.heard {
                 network += &format!("heard #{n:<4} {line}\n");
             }
@@ -859,6 +874,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             heard: VecDeque::new(),
             heard_count: 0,
             pings: 0,
+            multicast: 0,
+            last_multicast: None,
         }))
     }
 

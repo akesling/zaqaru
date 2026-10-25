@@ -53,7 +53,9 @@ pub fn show(ip: &[u8; 16]) -> String {
 /// Something the host heard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Heard {
-    Udp { from: [u8; 16], source: u16, port: u16, payload: Vec<u8> },
+    /// A datagram; `multicast` if it was sent to a group (all nodes, say)
+    /// rather than to this host.
+    Udp { from: [u8; 16], source: u16, port: u16, payload: Vec<u8>, multicast: bool },
     Pong { from: [u8; 16], sequence: u16 },
 }
 
@@ -141,6 +143,7 @@ impl Peer {
                     source: u16::from_be_bytes([body[0], body[1]]),
                     port: u16::from_be_bytes([body[2], body[3]]),
                     payload: body[8..length].to_vec(),
+                    multicast: packet.destination[0] == 0xFF,
                 });
             }
             _ => {}
@@ -259,6 +262,6 @@ mod tests {
         let mut board = Peer { mac: [0x0E, 1, 2, 3, 4, 5], ip: link_local([0x0E, 1, 2, 3, 4, 5]), board: None };
         board.board = Some((host.mac, host.ip));
         let (_, heard) = host.receive(&board.udp(7, b"hello"));
-        assert_eq!(heard, [Heard::Udp { from: board.ip, source: PORT, port: 7, payload: b"hello".to_vec() }]);
+        assert_eq!(heard, [Heard::Udp { from: board.ip, source: PORT, port: 7, payload: b"hello".to_vec(), multicast: false }]);
     }
 }
