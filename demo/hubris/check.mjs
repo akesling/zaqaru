@@ -39,8 +39,8 @@ const session = edge.open(PORT, {
 });
 
 let retired = 0;
-// Runs the container until `done()` or `limit` ms pass; it sleeps when the
-// container is idle, as the page does.
+// Runs the container until `done()` or `limit` ms pass; when it is idle, it
+// waits as long as the container said it could be left, as the page does.
 async function runUntil(done, limit) {
   const from = performance.now();
   while (!done() && performance.now() - from < limit) {
@@ -51,7 +51,7 @@ async function runUntil(done, limit) {
       console.error(console_.join(""));
       process.exit(1);
     }
-    if (turn.kind === KIND.IDLE) await sleep(5);
+    if (turn.kind === KIND.IDLE) await (turn.wait >= 1 ? sleep(Math.min(turn.wait, 50)) : new Promise(setImmediate));
   }
   return done();
 }

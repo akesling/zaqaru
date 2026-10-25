@@ -737,9 +737,18 @@ export class Container {
     };
   }
 
+  /// A turn's answer. An idle one says how long the container can be left
+  /// before anything in it waits on time — `wait`, in milliseconds, or
+  /// `Infinity` when nothing does — so a host can sleep for that rather than
+  /// guess.
   decode(word) {
     const kind = word & 0xff;
-    return { kind, status: kind === KIND.FINISHED ? (word >> 8) & 0xff : null };
+    const wait = kind === KIND.IDLE ? (word >>> 8) & 0xffffff : null;
+    return {
+      kind,
+      status: kind === KIND.FINISHED ? (word >> 8) & 0xff : null,
+      wait: wait === null ? null : wait === 0xffffff ? Infinity : wait / 1000,
+    };
   }
 
   /// Runs until the container has retired `until` instructions in total,

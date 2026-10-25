@@ -38,6 +38,19 @@ pub const KIND_IDLE: i32 = 1;
 pub const KIND_FINISHED: i32 = 2;
 pub const KIND_STOPPED: i32 = 3;
 
+/// An idle turn's answer: `KIND_IDLE`, and above it how long the host may
+/// leave the container before it has anything to do, in microseconds — at
+/// most [`IDLE_FOREVER`] less one, and [`IDLE_FOREVER`] itself when nothing
+/// is waiting for time at all. A host that waits that long, or until it has
+/// something to deliver, wastes neither a core spinning nor a deadline
+/// sleeping past it.
+pub const IDLE_FOREVER: i64 = 0xFF_FFFF;
+
+fn idle(wait: Option<u64>) -> i32 {
+    let micros = wait.map_or(IDLE_FOREVER, |ns| ((ns / 1000) as i64).min(IDLE_FOREVER - 1));
+    KIND_IDLE | (micros as i32) << 8
+}
+
 /// Runs the container, and answers what happened.
 ///
 /// The first call boots: it reads the command line and environment the
@@ -90,7 +103,7 @@ pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
             Turn::Idle if until < 0 => {}
             Turn::Idle => {
                 system.serve();
-                return KIND_IDLE;
+                return idle(system.idle_wait());
             }
             Turn::Finished(outcome) => {
                 system.serve();

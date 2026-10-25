@@ -243,9 +243,11 @@ function checkpoint() {
 
 /// Live: one slice of the frontier, at most `by` instructions; answers the
 /// turn's kind.
+let idleFor = 0; // ms the last idle slice said the container can be left
 function slice(by) {
   const began = performance.now();
   const turn = live.step(frontier + by);
+  idleFor = turn.wait ?? 0;
   const retired = live.value("statistics").retired;
   const took = performance.now() - began;
   ran += took;
@@ -301,7 +303,7 @@ async function advance(by) {
   while (finished === null && frontier < target) {
     if (slice(target - frontier) !== KIND.IDLE) break;
     if (++idles > 20) break;
-    await sleep(5);
+    await idle();
   }
   progress({ idle: idles > 20, reply: true });
 }
@@ -312,6 +314,28 @@ const channel = new MessageChannel();
 const yielded = [];
 channel.port1.onmessage = () => yielded.shift()?.();
 const yieldNow = () => new Promise((resolve) => (yielded.push(resolve), channel.port2.postMessage(null)));
+
+const IDLE_MAX_MS = 50; // the longest an idle container is left, whatever it says
+
+/// Waits as long as an idle container said it could be left — until its
+/// next deadline — or until something arrives for it: a message from the
+/// page, or a USB transfer completing, either of which calls `wake`. A
+/// timer in a busy worker is clamped to about 4 ms, which is longer than
+/// most of the deadlines here (a millisecond is common: a USB read timing
+/// out), so a shorter wait yields the event loop until the deadline rather
+/// than sleep past it.
+let waking = null;
+function wake() {
+  waking?.();
+}
+async function idle() {
+  const until = performance.now() + Math.min(idleFor, IDLE_MAX_MS);
+  let woken = false;
+  const woke = new Promise((resolve) => (waking = () => ((woken = true), resolve())));
+  if (until - performance.now() >= 4) await Promise.race([sleep(until - performance.now() - 1), woke]);
+  while (!woken && performance.now() < until) await yieldNow();
+  waking = null;
+}
 
 const SLICE_MS = 8; // how long one slice should run, between messages
 const REPORT_MS = 50; // how often the page hears of the frontier
@@ -335,7 +359,7 @@ async function run() {
       const took = performance.now() - began;
       if (kind === KIND.IDLE) {
         if (performance.now() - reported >= REPORT_MS) (progress({ idle: true }), (reported = performance.now()));
-        await sleep(5);
+        await idle();
         continue;
       }
       // A slice that ended early, idle or not, says nothing about the rate.
@@ -468,6 +492,8 @@ function openStream(id, port) {
 
 onmessage = async (event) => {
   const message = event.data;
+  // Anything the page sends may be what a parked container waits for.
+  wake();
   try {
     if (message.type === "load") await load(message);
     else if (message.type === "advance") await advance(message.by);

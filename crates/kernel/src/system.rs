@@ -122,6 +122,10 @@ pub struct System<'a, S: Store> {
     /// The container's timebase, which every process's vDSO page holds a
     /// copy of. See `Kernel::adopt_timebase`.
     clock: crate::vdso::Timebase,
+    /// How long the last idle pass found the container could be left
+    /// alone: until its earliest deadline, or `None` when nothing waits for
+    /// time. See [`System::idle_wait`].
+    wait: Option<u64>,
 }
 
 impl<'a, S: Store + Clone> System<'a, S> {
@@ -143,6 +147,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             clock_rate: 0,
             clock_sample: None,
             clock: crate::vdso::Timebase::default(),
+            wait: None,
             departed_accelerated: 0,
             departed_blocks: 0,
         }
@@ -713,7 +718,18 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// the earliest deadline is known, so "wait for a host event or that
     /// long" is the one call that turns this spin into a sleep. Until then
     /// it spins, which costs a core and is correct.
+    /// How long the container can be left alone after the idle turn just
+    /// returned: until the earliest deadline anything is waiting for, in
+    /// nanoseconds, or `None` when nothing waits for time. What a host that
+    /// can sleep should sleep for, or until it has something to deliver.
+    pub fn idle_wait(&self) -> Option<u64> {
+        self.wait
+    }
+
     fn idle(&mut self) -> bool {
+        // Until this pass finds a deadline, nothing says to wait at all: an
+        // early return means something is runnable again.
+        self.wait = Some(0);
         // Nothing can run, so this is the other moment the container is
         // already crossing the boundary — and the clock a sleeping container
         // wakes to must be the time it woke, not the time it went to sleep.
@@ -754,6 +770,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
         let listening = self.containers.iter().any(|container| {
             container.status.is_none() && container.process.kernel.has_edge()
         });
+        self.wait = None;
         let Some(deadline) = deadline else {
             if listening {
                 // Wait for the host rather than spin: nothing here is runnable
@@ -774,6 +791,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             // deadlock is right and the stall report names the threads.
             return false;
         };
+        self.wait = Some(deadline.saturating_sub(now));
         let mut woken = false;
         for index in 0..self.containers.len() {
             if self.containers[index].status.is_some() {
