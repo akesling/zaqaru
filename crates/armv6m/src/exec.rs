@@ -1,10 +1,13 @@
-//! Execution: what each ARMv6-M instruction means.
+//! Execution: what each 16-bit Thumb instruction means, and the IT block
+//! around it.
 //!
 //! ARMv6-M is the whole 16-bit Thumb set less a few, plus six 32-bit
-//! encodings — `bl`, `msr`, `mrs`, and the three barriers. Decoding follows
-//! the manual's own tables (A5.2), one arm per group, and every encoding
-//! the architecture leaves undefined is a [`Fault::Undefined`] naming its
-//! bits: a HardFault to the guest, never a silent guess.
+//! encodings — `bl`, `msr`, `mrs`, and the three barriers. ARMv7E-M has the
+//! same 16-bit set plus CBZ, CBNZ and IT, and the rest of Thumb-2 in
+//! [`crate::thumb2`]. Decoding follows the manual's own tables (A5.2), one
+//! arm per group, and every encoding the architecture leaves undefined is a
+//! [`Fault::Undefined`] naming its bits: a fault to the guest, never a
+//! silent guess.
 //!
 //! Two rules hold throughout:
 //!
@@ -16,7 +19,7 @@
 //!   [`Machine::store`]**, which is where alignment and the MPU are checked.
 
 use crate::scs::exception::SVCALL;
-use crate::state::Mode;
+use crate::state::{Core, Mode};
 use crate::{Access, Fault, Machine, Outcome};
 
 pub(crate) enum Flow {
@@ -34,16 +37,18 @@ pub fn add_with_carry(x: u32, y: u32, carry: bool) -> (u32, bool, bool) {
 }
 
 #[derive(Clone, Copy)]
-enum Shift {
+pub enum Shift {
     Lsl,
     Lsr,
     Asr,
     Ror,
+    /// Rotate right by one through the carry; the amount is ignored.
+    Rrx,
 }
 
 /// `Shift_C` (A2.2.2), for an amount of any size: an amount of zero leaves
 /// both the value and the carry alone.
-fn shift_c(kind: Shift, x: u32, amount: u32, carry: bool) -> (u32, bool) {
+pub fn shift_c(kind: Shift, x: u32, amount: u32, carry: bool) -> (u32, bool) {
     if amount == 0 {
         return (x, carry);
     }
@@ -67,6 +72,7 @@ fn shift_c(kind: Shift, x: u32, amount: u32, carry: bool) -> (u32, bool) {
             let result = x.rotate_right(amount % 32);
             (result, result >> 31 != 0)
         }
+        Shift::Rrx => ((carry as u32) << 31 | x >> 1, x & 1 != 0),
     }
 }
 
@@ -75,11 +81,11 @@ fn low(i: u32, shift: u32) -> u32 {
 }
 
 impl Machine {
-    fn r(&self, n: u32) -> u32 {
+    pub(crate) fn r(&self, n: u32) -> u32 {
         self.cpu.reg(n as usize)
     }
 
-    fn w(&mut self, n: u32, value: u32) {
+    pub(crate) fn w(&mut self, n: u32, value: u32) {
         self.cpu.set_reg(n as usize, value);
     }
 
@@ -96,7 +102,7 @@ impl Machine {
         result
     }
 
-    fn condition(&self, cond: u32) -> bool {
+    pub(crate) fn condition(&self, cond: u32) -> bool {
         let c = &self.cpu;
         match cond {
             0x0 => c.z,
@@ -117,7 +123,7 @@ impl Machine {
         }
     }
 
-    fn check(&mut self, addr: u32, access: Access) -> Result<(), Fault> {
+    pub(crate) fn check(&mut self, addr: u32, access: Access) -> Result<(), Fault> {
         if self.permits(addr, access, self.cpu.privileged()) {
             Ok(())
         } else {
@@ -168,7 +174,7 @@ impl Machine {
 
     /// `BXWritePC`: an interworking branch, which in Handler mode is how an
     /// exception returns.
-    fn bx(&mut self, target: u32) -> Result<(), Fault> {
+    pub(crate) fn bx(&mut self, target: u32) -> Result<(), Fault> {
         if self.cpu.mode == Mode::Handler && target >> 28 == 0xF {
             return self.exception_return(target);
         }
@@ -178,21 +184,101 @@ impl Machine {
     }
 
     /// Executes the instruction at `cpu.pc`.
+    ///
+    /// Inside an IT block the instruction's condition is the block's
+    /// (A7.3.3): one that fails is skipped, as a NOP would be, and either
+    /// way the block advances. It advances *before* the instruction runs,
+    /// so that an exception return inside it — which restores a stacked IT
+    /// state — is not then advanced again; a fault puts it back, so the
+    /// frame records the IT state of the instruction that faulted.
     pub(crate) fn execute(&mut self) -> Result<Flow, Fault> {
         let pc = self.cpu.pc;
         let first = self.fetch(pc)?;
-        if first >> 11 >= 0b11101 {
-            let second = self.fetch(pc.wrapping_add(2))?;
-            self.execute32(first, second)
-        } else {
-            self.execute16(first)
+        let wide = first >> 11 >= 0b11101;
+        let second = if wide { self.fetch(pc.wrapping_add(2))? } else { 0 };
+        if self.core == Core::CortexM0Plus {
+            return if wide { self.execute32(first, second) } else { self.execute16(first) };
         }
+        let it = self.cpu.itstate;
+        if it & 0xF != 0 {
+            self.cpu.itstate = if it & 7 == 0 { 0 } else { it & 0xE0 | (it << 1) & 0x1F };
+            // BKPT runs whatever the condition says.
+            if !self.condition(u32::from(it >> 4)) && first & 0xFF00 != 0xBE00 {
+                self.cpu.pc = pc.wrapping_add(if wide { 4 } else { 2 });
+                return Ok(Flow::Next);
+            }
+        }
+        self.it_active = it & 0xF != 0;
+        let result = if wide { self.execute_thumb2(first, second) } else { self.execute16(first) };
+        self.it_active = false;
+        if result.is_err() {
+            self.cpu.itstate = it;
+        }
+        result
+    }
+
+    /// Whether a 16-bit instruction that can set the flags does: outside an
+    /// IT block always, inside one never (A6.1). ARMv6-M has no IT blocks.
+    fn setflags(&self) -> bool {
+        !self.it_active
+    }
+
+    /// A load of one register, which on ARMv7-M may be unaligned unless
+    /// CCR.UNALIGN_TRP says otherwise. An unaligned access is made a byte
+    /// at a time, each checked as the access it is part of.
+    pub(crate) fn load_unaligned(&mut self, addr: u32, size: u32) -> Result<u32, Fault> {
+        if addr & (size - 1) == 0 || !self.allows_unaligned() {
+            return self.load(addr, size);
+        }
+        let mut value = 0;
+        for i in 0..size {
+            value |= self.load(addr.wrapping_add(i), 1)? << (8 * i);
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn store_unaligned(&mut self, addr: u32, size: u32, value: u32) -> Result<(), Fault> {
+        if addr & (size - 1) == 0 || !self.allows_unaligned() {
+            return self.store(addr, size, value);
+        }
+        // Checked whole before any byte lands, so a store the MPU refuses
+        // half of changes nothing.
+        self.check(addr, Access::Write)?;
+        self.check(addr.wrapping_add(size - 1), Access::Write)?;
+        for i in 0..size {
+            self.store(addr.wrapping_add(i), 1, value >> (8 * i))?;
+        }
+        Ok(())
+    }
+
+    fn allows_unaligned(&self) -> bool {
+        self.core != Core::CortexM0Plus && self.bus.scs.ccr & crate::scs::CCR_UNALIGN_TRP == 0
+    }
+
+    /// LDRT and friends: the access is checked as unprivileged code's.
+    pub(crate) fn load_unprivileged(&mut self, addr: u32, size: u32) -> Result<u32, Fault> {
+        let mode = (self.cpu.mode, self.cpu.npriv);
+        self.cpu.mode = Mode::Thread;
+        self.cpu.npriv = true;
+        let result = self.load_unaligned(addr, size);
+        (self.cpu.mode, self.cpu.npriv) = mode;
+        result
+    }
+
+    pub(crate) fn store_unprivileged(&mut self, addr: u32, size: u32, value: u32) -> Result<(), Fault> {
+        let mode = (self.cpu.mode, self.cpu.npriv);
+        self.cpu.mode = Mode::Thread;
+        self.cpu.npriv = true;
+        let result = self.store_unaligned(addr, size, value);
+        (self.cpu.mode, self.cpu.npriv) = mode;
+        result
     }
 
     fn execute16(&mut self, i: u32) -> Result<Flow, Fault> {
         let pc = self.cpu.pc;
         let mut next = pc.wrapping_add(2);
         let undefined = Fault::Undefined { instr: i };
+        let sf = self.setflags();
 
         match i >> 10 {
             // Shift (immediate), add, subtract, move, compare.
@@ -208,14 +294,16 @@ impl Machine {
                         _ => (Shift::Asr, if imm5 == 0 { 32 } else { imm5 }),
                     };
                     let (result, c) = shift_c(kind, m, amount, self.cpu.c);
-                    self.cpu.c = c;
-                    self.nz(result);
+                    if sf {
+                        self.cpu.c = c;
+                        self.nz(result);
+                    }
                     self.w(low(i, 0), result);
                 }
                 0b011 => {
                     let n = self.r(low(i, 3));
                     let y = if i & 1 << 10 != 0 { low(i, 6) } else { self.r(low(i, 6)) };
-                    let result = if i & 1 << 9 != 0 { self.add_flags(n, !y, true) } else { self.add_flags(n, y, false) };
+                    let result = if i & 1 << 9 != 0 { self.arith(n, !y, true, sf) } else { self.arith(n, y, false, sf) };
                     self.w(low(i, 0), result);
                 }
                 op => {
@@ -223,18 +311,20 @@ impl Machine {
                     let imm = i & 0xFF;
                     match op & 3 {
                         0 => {
-                            self.nz(imm);
+                            if sf {
+                                self.nz(imm);
+                            }
                             self.w(d, imm);
                         }
                         1 => {
                             self.add_flags(self.r(d), !imm, true);
                         }
                         2 => {
-                            let result = self.add_flags(self.r(d), imm, false);
+                            let result = self.arith(self.r(d), imm, false, sf);
                             self.w(d, result);
                         }
                         _ => {
-                            let result = self.add_flags(self.r(d), !imm, true);
+                            let result = self.arith(self.r(d), !imm, true, sf);
                             self.w(d, result);
                         }
                     }
@@ -249,29 +339,37 @@ impl Machine {
                 let c = self.cpu.c;
                 let shifted = |machine: &mut Machine, kind| {
                     let (result, c) = shift_c(kind, x, y & 0xFF, c);
-                    machine.cpu.c = c;
-                    machine.nz(result);
+                    if sf {
+                        machine.cpu.c = c;
+                        machine.nz(result);
+                    }
+                    machine.w(dn, result);
+                };
+                let logical = |machine: &mut Machine, result: u32| {
+                    if sf {
+                        machine.nz(result);
+                    }
                     machine.w(dn, result);
                 };
                 match i >> 6 & 0xF {
-                    0x0 => self.logical(dn, x & y),
-                    0x1 => self.logical(dn, x ^ y),
+                    0x0 => logical(self, x & y),
+                    0x1 => logical(self, x ^ y),
                     0x2 => shifted(self, Shift::Lsl),
                     0x3 => shifted(self, Shift::Lsr),
                     0x4 => shifted(self, Shift::Asr),
                     0x5 => {
-                        let result = self.add_flags(x, y, c);
+                        let result = self.arith(x, y, c, sf);
                         self.w(dn, result);
                     }
                     0x6 => {
-                        let result = self.add_flags(x, !y, c);
+                        let result = self.arith(x, !y, c, sf);
                         self.w(dn, result);
                     }
                     0x7 => shifted(self, Shift::Ror),
                     0x8 => self.nz(x & y),
                     // RSBS rd, rn, #0: rn is the register in bits 5:3.
                     0x9 => {
-                        let result = self.add_flags(!y, 0, true);
+                        let result = self.arith(!y, 0, true, sf);
                         self.w(dn, result);
                     }
                     0xA => {
@@ -280,10 +378,10 @@ impl Machine {
                     0xB => {
                         self.add_flags(x, y, false);
                     }
-                    0xC => self.logical(dn, x | y),
-                    0xD => self.logical(dn, x.wrapping_mul(y)),
-                    0xE => self.logical(dn, x & !y),
-                    _ => self.logical(dn, !y),
+                    0xC => logical(self, x | y),
+                    0xD => logical(self, x.wrapping_mul(y)),
+                    0xE => logical(self, x & !y),
+                    _ => logical(self, !y),
                 }
             }
 
@@ -335,16 +433,16 @@ impl Machine {
                 let addr = self.r(low(i, 3)).wrapping_add(self.r(low(i, 6)));
                 let t = low(i, 0);
                 match i >> 9 & 7 {
-                    0 => self.store(addr, 4, self.r(t))?,
-                    1 => self.store(addr, 2, self.r(t))?,
+                    0 => self.store_unaligned(addr, 4, self.r(t))?,
+                    1 => self.store_unaligned(addr, 2, self.r(t))?,
                     2 => self.store(addr, 1, self.r(t))?,
                     op => {
                         let value = match op {
                             3 => self.load(addr, 1)? as u8 as i8 as u32,
-                            4 => self.load(addr, 4)?,
-                            5 => self.load(addr, 2)?,
+                            4 => self.load_unaligned(addr, 4)?,
+                            5 => self.load_unaligned(addr, 2)?,
                             6 => self.load(addr, 1)?,
-                            _ => self.load(addr, 2)? as u16 as i16 as u32,
+                            _ => self.load_unaligned(addr, 2)? as u16 as i16 as u32,
                         };
                         self.w(t, value);
                     }
@@ -415,6 +513,7 @@ impl Machine {
                     }
                     return Err(Fault::SvcEscalation);
                 }
+                _ if self.it_active => return Err(undefined),
                 cond => {
                     if self.condition(cond) {
                         next = pc.wrapping_add(4).wrapping_add(((i & 0xFF) as u8 as i8 as i32 * 2) as u32);
@@ -434,17 +533,12 @@ impl Machine {
         Ok(Flow::Next)
     }
 
-    fn logical(&mut self, d: u32, result: u32) {
-        self.nz(result);
-        self.w(d, result);
-    }
-
     fn transfer(&mut self, loading: bool, addr: u32, size: u32, t: u32) -> Result<(), Fault> {
         if loading {
-            let value = self.load(addr, size)?;
+            let value = self.load_unaligned(addr, size)?;
             self.w(t, value);
         } else {
-            self.store(addr, size, self.r(t))?;
+            self.store_unaligned(addr, size, self.r(t))?;
         }
         Ok(())
     }
@@ -492,13 +586,35 @@ impl Machine {
                 self.cpu.set_sp(base);
             }
             0b0110 => {
-                // CPSIE i / CPSID i; unprivileged, a no-op.
-                if i & 0xFFEF != 0xB662 {
+                // CPSIE and CPSID: i on both profiles, f on ARMv7-M.
+                // Unprivileged, a no-op.
+                let v7 = self.core != Core::CortexM0Plus;
+                if i & 0xFFEC != 0xB660 || i & 3 == 0 || !v7 && i & 3 != 2 {
                     return undefined;
                 }
                 if self.cpu.privileged() {
-                    self.cpu.primask = i & 1 << 4 != 0;
+                    let disable = i & 1 << 4 != 0;
+                    if i & 2 != 0 {
+                        self.cpu.primask = disable;
+                    }
+                    // FAULTMASK cannot be set from a handler already at
+                    // HardFault's priority or above.
+                    if i & 1 != 0 && (!disable || self.priority > -1) {
+                        self.cpu.faultmask = disable;
+                    }
                     self.update_priority();
+                }
+            }
+            0b0001 | 0b0011 | 0b1001 | 0b1011 if self.core != Core::CortexM0Plus => {
+                // CBZ and CBNZ, which may not be in an IT block.
+                if self.it_active {
+                    return undefined;
+                }
+                let n = self.cpu.r[(i & 7) as usize];
+                let offset = (i >> 9 & 1) << 6 | (i >> 3 & 0x1F) << 1;
+                if (n == 0) != (i & 1 << 11 != 0) {
+                    self.cpu.pc = pc.wrapping_add(4).wrapping_add(offset);
+                    return Ok(Flow::Next);
                 }
             }
             0b1010 => {
@@ -535,10 +651,15 @@ impl Machine {
                 self.cpu.set_sp(addr);
             }
             0b1110 => return Ok(Flow::Halt(Outcome::Breakpoint { pc, imm: i as u8 })),
-            0b1111 => {
-                if i & 0xF != 0 {
+            0b1111 if i & 0xF != 0 => {
+                // IT: firstcond and mask, which together are ITSTATE.
+                let firstcond = i >> 4 & 0xF;
+                if self.core == Core::CortexM0Plus || self.it_active || firstcond == 0xF || firstcond == 0xE && (i & 0xF).count_ones() != 1 {
                     return undefined;
                 }
+                self.cpu.itstate = (i & 0xFF) as u8;
+            }
+            0b1111 => {
                 // NOP, YIELD, WFE, WFI, SEV. Only WFI does anything: with no
                 // other processor to signal it, WFE is a hint the model is
                 // free to treat as a NOP, and does.
@@ -586,7 +707,7 @@ impl Machine {
     }
 
     /// MSR (B4.2.3). Unprivileged code may write only the flags.
-    fn msr(&mut self, n: u32, sysm: u32) {
+    pub(crate) fn msr(&mut self, n: u32, sysm: u32) {
         let value = self.r(n);
         let privileged = self.cpu.privileged();
         match sysm {
@@ -610,7 +731,7 @@ impl Machine {
     }
 
     /// MRS (B4.2.2). EPSR always reads as zero.
-    fn mrs(&self, sysm: u32) -> u32 {
+    pub(crate) fn mrs(&self, sysm: u32) -> u32 {
         let privileged = self.cpu.privileged();
         match sysm {
             0..=7 => {

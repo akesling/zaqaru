@@ -17,6 +17,7 @@
 //! section it comes from where that is not obvious.
 
 use crate::Access;
+use crate::state::Core;
 
 /// The lowest execution priority there is: Thread mode with nothing
 /// active. ARMv6-M priorities are the top two bits of a byte, so every
@@ -308,9 +309,22 @@ pub struct Scs {
     pub vectactive: u32,
     /// Set by a write of SYSRESETREQ to AIRCR; the run loop answers it.
     pub reset_requested: bool,
+    /// Which processor these registers belong to.
+    pub core: Core,
+    /// CCR, as ARMv7-M lets software set it. ARMv6-M's is fixed.
+    pub ccr: u32,
 }
 
+/// CCR.UNALIGN_TRP: fault every unaligned access, as ARMv6-M always does.
+pub const CCR_UNALIGN_TRP: u32 = 1 << 3;
+/// CCR.DIV_0_TRP: fault a divide by zero rather than answer zero.
+pub const CCR_DIV_0_TRP: u32 = 1 << 4;
+/// CCR.STKALIGN: exception frames are eight-byte aligned.
+pub const CCR_STKALIGN: u32 = 1 << 9;
+
 const CPUID_CORTEX_M0PLUS: u32 = 0x410C_C601;
+/// Cortex-M7 r1p2, which is what an STM32H7 has.
+const CPUID_CORTEX_M7: u32 = 0x411F_C272;
 const AIRCR_VECTKEY: u32 = 0x05FA;
 
 impl Scs {
@@ -318,8 +332,14 @@ impl Scs {
         // The epoch survives: a verdict cached before the reset was made
         // under a configuration the reset just threw away.
         let epoch = self.mpu.epoch.wrapping_add(1);
+        let core = self.core;
         *self = Scs::default();
         self.mpu.epoch = epoch;
+        self.core = core;
+        self.ccr = match core {
+            Core::CortexM0Plus => CCR_STKALIGN | CCR_UNALIGN_TRP,
+            Core::CortexM7 => CCR_STKALIGN,
+        };
     }
 
     /// Runs the clock for `n` cycles.
@@ -356,7 +376,10 @@ impl Scs {
                 let i = (addr - 0xE000_E400) as usize;
                 u32::from_le_bytes([nvic.ipr[i], nvic.ipr[i + 1], nvic.ipr[i + 2], nvic.ipr[i + 3]])
             }
-            0xE000_ED00 => CPUID_CORTEX_M0PLUS,
+            0xE000_ED00 => match self.core {
+                Core::CortexM0Plus => CPUID_CORTEX_M0PLUS,
+                Core::CortexM7 => CPUID_CORTEX_M7,
+            },
             0xE000_ED04 => {
                 let vectpending = nvic.highest_pending().map_or(0, |(n, _)| n);
                 (nvic.is_pending(NMI) as u32) << 31
@@ -369,8 +392,7 @@ impl Scs {
             0xE000_ED08 => self.vtor,
             0xE000_ED0C => 0xFA05_0000,
             0xE000_ED10 => self.scr,
-            // CCR: STKALIGN and UNALIGN_TRP, both fixed on this profile.
-            0xE000_ED14 => 1 << 9 | 1 << 3,
+            0xE000_ED14 => self.ccr,
             0xE000_ED1C => nvic.shpr2,
             0xE000_ED20 => nvic.shpr3,
             // SHCSR exists, but on a Cortex-M0+ it reads as zero from the
@@ -437,6 +459,10 @@ impl Scs {
                 }
             }
             0xE000_ED10 => self.scr = value & 0b10110,
+            // ARMv6-M's CCR is fixed. ARMv7-M's takes the traps, STKALIGN,
+            // BFHFNMIGN, USERSETMPEND and NONBASETHRDENA; the M7's cache
+            // and branch-predictor enables read back.
+            0xE000_ED14 if self.core != Core::CortexM0Plus => self.ccr = value & 0x0007_031B,
             0xE000_ED1C => nvic.shpr2 = value & 0xC000_0000,
             0xE000_ED20 => nvic.shpr3 = value & 0xC0C0_0000,
             0xE000_ED94..=0xE000_EDA0 => {

@@ -36,11 +36,13 @@ pub mod debug;
 pub mod exception;
 pub mod exec;
 pub mod flash;
+pub mod fpu;
 pub mod part;
 pub mod gdb;
 pub mod scs;
 pub mod state;
 pub mod stm32g0;
+pub mod thumb2;
 pub mod usart;
 
 use std::collections::BTreeSet;
@@ -48,7 +50,7 @@ use std::collections::BTreeSet;
 use bus::{Bus, Unmapped};
 use exec::Flow;
 use scs::exception::HARD_FAULT;
-use state::{Cpu, Mode};
+use state::{Core, Cpu, Mode};
 
 /// The kind of access a permission check is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +86,10 @@ pub enum Fault {
     /// Pushing an exception frame faulted; the exception that wanted it is
     /// still pending.
     Stacking { exception: u32 },
+    /// SDIV or UDIV by zero with CCR.DIV_0_TRP set. ARMv7-M only.
+    DivideByZero,
+    /// A coprocessor instruction with the coprocessor absent or disabled.
+    NoCoprocessor { instr: u32 },
 }
 
 /// Why [`Machine::run`] returned.
@@ -128,6 +134,16 @@ pub enum Event {
 pub struct Machine {
     /// Which G0 this is.
     pub part: part::Part,
+    /// Which processor: the part's own Cortex-M0+, or a Cortex-M7.
+    pub core: Core,
+    /// Whether the instruction executing is inside an IT block.
+    pub(crate) it_active: bool,
+    /// The local exclusive monitor: the address an LDREX marked, until a
+    /// STREX, a CLREX or an exception clears it.
+    pub(crate) exclusive: Option<u32>,
+    /// A 32-bit instruction's write to the pc, taken as a branch when it
+    /// completes.
+    pub(crate) branch_to: Option<u32>,
     pub cpu: Cpu,
     pub bus: Bus,
     /// Cycles elapsed since power-on: retired instructions, plus whatever
@@ -192,6 +208,10 @@ impl Machine {
     pub fn stm32g0(part: part::Part, image: &[u8]) -> Result<Machine, String> {
         let mut machine = Machine {
             part,
+            core: Core::CortexM0Plus,
+            it_active: false,
+            exclusive: None,
+            branch_to: None,
             cpu: Cpu::default(),
             bus: Bus::new(part, image)?,
             cycles: 0,
@@ -211,10 +231,18 @@ impl Machine {
         Ok(machine)
     }
 
+    /// The same machine with a different processor in it, out of reset.
+    pub fn set_core(&mut self, core: Core) -> Result<(), String> {
+        self.core = core;
+        self.reset()
+    }
+
     /// A system reset: the processor and peripherals back to their reset
     /// state, memory left as it was, and the boot vector taken (B1.5.5).
     pub fn reset(&mut self) -> Result<(), String> {
         self.cpu = Cpu::default();
+        self.exclusive = None;
+        self.bus.scs.core = self.core;
         self.bus.scs.reset();
         self.bus.soc.reset();
         self.bus.flash_interface.reset();

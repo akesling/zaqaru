@@ -94,6 +94,8 @@ impl Machine {
             EXC_RETURN_THREAD_MSP
         };
         self.cpu.mode = Mode::Handler;
+        self.cpu.itstate = 0;
+        self.exclusive = None;
         self.cpu.ipsr = n;
         self.cpu.spsel = false;
         self.bus.scs.nvic.active |= 1 << n;
@@ -162,8 +164,14 @@ impl Machine {
         self.cpu.r[12] = r12;
         self.cpu.r[14] = lr;
         self.cpu.pc = pc & !1;
-        self.cpu.set_apsr(xpsr);
-        self.cpu.t = xpsr & 1 << 24 != 0;
+        self.cpu.set_xpsr(xpsr);
+        if self.core == crate::state::Core::CortexM0Plus {
+            // Reserved on ARMv6-M, whatever the frame held.
+            self.cpu.q = false;
+            self.cpu.ge = 0;
+            self.cpu.itstate = 0;
+        }
+        self.exclusive = None;
         self.cpu.mode = mode;
         self.cpu.spsel = on_psp;
         self.cpu.ipsr = if mode == Mode::Handler { xpsr & 0x3F } else { 0 };
