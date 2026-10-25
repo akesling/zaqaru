@@ -423,3 +423,61 @@ fn a_context_that_used_the_fpu_is_stacked_with_it() {
     assert_eq!(m.cpu.r[6] & 4, 4, "and set again on return");
     assert_eq!(m.cpu.msp, STACK_TOP);
 }
+
+#[test]
+fn the_fpu_is_absent_until_cpacr_enables_it() {
+    let mut m = machine(&program(
+        "
+        .equ CPACR, 0xE000ED88
+        reset:
+            ldr r0, =SHCSR
+            ldr r1, =(1 << 18)
+            str r1, [r0]
+            vadd.f32 s0, s1, s2
+            bkpt #0
+        usage_fault:
+            ldr r0, =CFSR
+            ldr r5, [r0]
+            str r5, [r0]
+            @ Enable CP10 and CP11 and go back to the instruction.
+            ldr r0, =CPACR
+            ldr r1, =(0xF << 20)
+            str r1, [r0]
+            dsb
+            isb
+            bx lr
+        ",
+    ));
+    m.cpu.s[1] = 1.5f32.to_bits();
+    m.cpu.s[2] = 2.25f32.to_bits();
+    ended(&mut m, 0);
+    assert_eq!(m.cpu.r[5], cfsr::NOCP);
+    assert_eq!(f32::from_bits(m.cpu.s[0]), 3.75);
+}
+
+#[test]
+fn an_fp_instruction_marks_the_context_and_the_frame_carries_it() {
+    let mut m = machine(&program(
+        "
+        .equ CPACR, 0xE000ED88
+        reset:
+            ldr r0, =CPACR
+            ldr r1, =(0xF << 20)
+            str r1, [r0]
+            isb
+            vmov.f32 s0, #1.0
+            mrs r6, CONTROL         @ FPCA, from ASPEN
+            svc #0
+            vmov r7, s0             @ restored by the return
+            bkpt #0
+        svc:
+            mov r4, lr
+            vmov.f32 s0, #2.0       @ the handler's own use
+            bx lr
+        ",
+    ));
+    ended(&mut m, 0);
+    assert_eq!(m.cpu.r[6] & 4, 4);
+    assert_eq!(m.cpu.r[4], 0xFFFF_FFE9);
+    assert_eq!(f32::from_bits(m.cpu.r[7]), 1.0);
+}

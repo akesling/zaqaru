@@ -16,6 +16,9 @@ path = "src/bin/m0/main.rs"
 # For the door's reading of a Hubris archive: one file out of a zip.
 bzip2-rs = "0.1.2"
 miniz_oxide = "0.8.9"
+# IEEE 754 in software, for the FPU: every rounding mode and exception
+# flag, and NaNs whose bits do not depend on the host.
+rustc_apfloat = "0.2.3"
 
 [dev-dependencies]
 # The ISA tests assemble their programs with clang and read the labels back

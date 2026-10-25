@@ -170,3 +170,128 @@ fn every_instruction_agrees_with_qemu() {
         failures.iter().take(400).cloned().collect::<Vec<_>>().join("\n")
     );
 }
+
+/// One FP case: the core state as above, then FPSCR and s0–s31.
+struct FpCase {
+    line: usize,
+    instr: String,
+    before: Vec<u32>,
+    expected: Option<(Vec<u32>, Vec<(u32, u8)>)>,
+}
+
+fn parse_fp(text: &str) -> Vec<FpCase> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|(n, l)| {
+            let (input, output) = l.split_once(" => ").unwrap();
+            let mut fields = input.split(' ');
+            let instr = fields.next().unwrap().to_string();
+            let before = fields.map(hex).collect();
+            let expected = (output.trim() != "fault").then(|| {
+                let mut fields = output.split(' ');
+                let mut regs: Vec<u32> = fields.by_ref().take(50).map(hex).collect();
+                regs[13] &= !3;
+                let writes = fields
+                    .map(|w| {
+                        let (a, b) = w.split_once(':').unwrap();
+                        (hex(a), hex(b) as u8)
+                    })
+                    .collect();
+                (regs, writes)
+            });
+            FpCase { line: n + 1, instr, before, expected }
+        })
+        .collect()
+}
+
+fn run_fp(m: &mut Machine, base: &[u8], case: &FpCase) -> Option<(Vec<u32>, Vec<(u32, u8)>)> {
+    let (hw1, hw2) = (hex(&case.instr[..4]) as u16, hex(&case.instr[4..]) as u16);
+    let code = [hw1.to_le_bytes(), hw2.to_le_bytes()].concat();
+    m.reset().unwrap();
+    m.bus.sram.copy_from_slice(base);
+    let at = (CODE - SRAM_BASE) as usize;
+    m.bus.sram[at..at + 4].copy_from_slice(&code);
+    let b = &case.before;
+    m.cpu.r[..13].copy_from_slice(&b[..13]);
+    m.cpu.msp = b[13];
+    m.cpu.r[14] = b[14];
+    m.cpu.set_apsr(b[15]);
+    m.cpu.fpscr = b[16];
+    m.cpu.s.copy_from_slice(&b[17..49]);
+    // The FPU on, and the context already using it, so that FPDSCR's
+    // defaults do not replace the case's FPSCR.
+    m.bus.scs.cpacr = 0xF << 20;
+    m.cpu.fpca = true;
+    m.cpu.pc = CODE;
+    m.cpu.t = true;
+    m.events.clear();
+    m.run(1);
+    if m.events.iter().any(|e| matches!(e, armv6m::Event::Fault { .. })) {
+        return None;
+    }
+    let mut regs = m.cpu.r[..13].to_vec();
+    // AHP is the oracle's to keep or drop; the corpus leaves it out.
+    regs.extend([m.cpu.msp & !3, m.cpu.r[14], m.cpu.pc, m.cpu.apsr() & 0xF000_0000, m.cpu.fpscr & 0xF3C0_009F]);
+    regs.extend(m.cpu.s);
+    // Against SRAM as it started, the instruction included: a store may
+    // land on it.
+    let mut initial = base.to_vec();
+    initial[at..at + 4].copy_from_slice(&code);
+    let writes = (0..SRAM_SIZE)
+        .filter(|&i| m.bus.sram[i] != initial[i])
+        .map(|i| (SRAM_BASE + i as u32, m.bus.sram[i]))
+        .collect();
+    Some((regs, writes))
+}
+
+#[test]
+fn every_fp_instruction_agrees_with_qemu() {
+    let path = std::env::var("FPU_CORPUS").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fpu.corpus").into());
+    let cases = parse_fp(&std::fs::read_to_string(&path).unwrap());
+    assert!(!cases.is_empty());
+    let base = pattern();
+    let mut m = machine();
+    let mut names: Vec<String> =
+        ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "sp", "lr", "pc", "apsr", "fpscr"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    names.extend((0..32).map(|i| format!("s{i}")));
+    let mut failures = Vec::new();
+    let mut unaligned = 0;
+    for case in &cases {
+        let got = run_fp(&mut m, &base, case);
+        if got == case.expected {
+            continue;
+        }
+        if got.is_none() && m.events.iter().any(|e| matches!(e, armv6m::Event::Fault { fault: armv6m::Fault::Unaligned { .. }, .. })) {
+            unaligned += 1;
+            continue;
+        }
+        let why = match (&got, &case.expected) {
+            (None, Some(_)) => format!("faulted here, ran there: {:?}", m.events.last()),
+            (Some(_), None) => "ran here, faulted there".to_string(),
+            (Some((regs, writes)), Some((want, want_writes))) => {
+                let mut diffs: Vec<String> = (0..50)
+                    .filter(|&i| regs[i] != want[i])
+                    .map(|i| format!("{} {:x} want {:x}", names[i], regs[i], want[i]))
+                    .collect();
+                if writes != want_writes {
+                    diffs.push(format!("writes {writes:x?} want {want_writes:x?}"));
+                }
+                diffs.join(", ")
+            }
+            (None, None) => unreachable!(),
+        };
+        failures.push(format!("line {}: {}: {why}", case.line, case.instr));
+    }
+    eprintln!("{} cases, {} faulted unaligned where QEMU does not check", cases.len(), unaligned);
+    assert!(
+        failures.is_empty(),
+        "{} of {} cases disagree:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.iter().take(400).cloned().collect::<Vec<_>>().join("\n")
+    );
+}

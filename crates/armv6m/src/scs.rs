@@ -473,6 +473,10 @@ pub struct Scs {
     /// How many external interrupts the part has, rounded up to a multiple
     /// of 32 as ICTR reports them.
     pub irq_lines: u32,
+    /// FPCCR, FPCAR and FPDSCR: the FPU's context control.
+    pub fpccr: u32,
+    pub fpcar: u32,
+    pub fpdscr: u32,
 }
 
 /// CCR.UNALIGN_TRP: fault every unaligned access, as ARMv6-M always does.
@@ -521,6 +525,7 @@ impl Scs {
                 self.ccr = CCR_STKALIGN;
                 self.nvic.mask = 0xF0;
                 self.mpu.count = 16;
+                self.fpccr = crate::fpu::FPCCR_ASPEN | crate::fpu::FPCCR_LSPEN;
             }
         }
     }
@@ -631,6 +636,14 @@ impl Scs {
             0xE000_ED34 if v7 => self.faults.mmfar,
             0xE000_ED38 if v7 => self.faults.bfar,
             0xE000_ED88 if v7 => self.cpacr,
+            0xE000_EF34 if v7 => self.fpccr,
+            0xE000_EF38 if v7 => self.fpcar,
+            0xE000_EF3C if v7 => self.fpdscr,
+            // MVFR0–2: an FPv5 FPU with single and double precision, as an
+            // STM32H7's Cortex-M7 has.
+            0xE000_EF40 if v7 => 0x1011_0221,
+            0xE000_EF44 if v7 => 0x1200_0011,
+            0xE000_EF48 if v7 => 0x0000_0040,
             // MPU_TYPE: DREGION, separate instruction and data maps not.
             0xE000_ED90 => (self.mpu.count as u32) << 8,
             0xE000_ED94 => self.mpu.ctrl,
@@ -753,6 +766,11 @@ impl Scs {
             0xE000_ED34 if v7 => self.faults.mmfar = value,
             0xE000_ED38 if v7 => self.faults.bfar = value,
             0xE000_ED88 if v7 => self.cpacr = value & 0x00F0_0000,
+            // ASPEN, LSPEN and the context bits; LSPACT stays clear, since
+            // stacking is never lazy here.
+            0xE000_EF34 if v7 => self.fpccr = value & 0xC000_013A,
+            0xE000_EF38 if v7 => self.fpcar = value & !7,
+            0xE000_EF3C if v7 => self.fpdscr = value & 0x07C0_0000,
             0xE000_ED94..=0xE000_EDBB => {
                 self.mpu.epoch = self.mpu.epoch.wrapping_add(1);
                 self.write_mpu(addr, value);
