@@ -10,6 +10,12 @@
 //! What it finds where is told by the ROM table at `0xE00FF000` and the
 //! CoreSight identification registers at the top of each component.
 //!
+//! A Cortex-M7 differs in the parts a debugger finds: a second-generation
+//! breakpoint unit (the FPB, eight comparators matching anywhere), a DWT
+//! with four comparators and a cycle counter, an ITM, and its ROM tables —
+//! the chip's at `0xE00FE000`, ST's, naming the part, and the core's PPB
+//! table under it.
+//!
 //! Two things are simplified:
 //!
 //! - **The debug registers answer the debugger, not the processor.**
@@ -23,7 +29,7 @@
 //! debug port see the same halted core, and a run of a halted core does
 //! nothing (it returns [`Outcome::Halted`]).
 
-use crate::state::Mode;
+use crate::state::{Core, Mode};
 use crate::{Machine, Outcome};
 
 pub const DFSR: u32 = 0xE000_ED30;
@@ -34,7 +40,10 @@ pub const DEMCR: u32 = 0xE000_EDFC;
 pub const DWT: u32 = 0xE000_1000;
 pub const BPU: u32 = 0xE000_2000;
 pub const SCS: u32 = 0xE000_E000;
+pub const ITM: u32 = 0xE000_0000;
 pub const ROM_TABLE: u32 = 0xE00F_F000;
+/// An H7's ROM table: the chip's, above the M7's own at [`ROM_TABLE`].
+pub const CHIP_ROM_TABLE: u32 = 0xE00F_E000;
 
 const DBGKEY: u32 = 0xA05F;
 
@@ -60,9 +69,21 @@ pub const DWTENA: u32 = 1 << 24;
 
 const DCRSR_REGWNR: u32 = 1 << 16;
 
-/// Comparators in the BPU and the DWT, as a Cortex-M0+ has them.
-const BPU_COMPARATORS: usize = 4;
-const DWT_COMPARATORS: usize = 2;
+/// Comparators in the BPU and the DWT: as many as a Cortex-M7 has, of
+/// which a Cortex-M0+ has the first four and two.
+const BPU_COMPARATORS: usize = 8;
+const DWT_COMPARATORS: usize = 4;
+
+/// How many of each comparator a core has.
+fn comparators(core: Core) -> (usize, usize) {
+    match core {
+        Core::CortexM0Plus => (4, 2),
+        Core::CortexM7 => (8, 4),
+    }
+}
+
+/// DWT_CTRL.CYCCNTENA.
+const CYCCNTENA: u32 = 1 << 0;
 
 #[derive(Clone, Debug, Default)]
 pub struct Debug {
@@ -92,6 +113,15 @@ pub struct Debug {
     /// Whether any BPU comparator is in force, so a run checks only when
     /// one is.
     pub(crate) breaking: bool,
+    /// The FPB's architecture version: 1 on a Cortex-M0+, whose BPU
+    /// matches halfwords of the code region, 2 on a Cortex-M7, whose FPB
+    /// matches an address anywhere.
+    pub(crate) fpb_v2: bool,
+    /// DWT_CTRL as written, and CYCCNT: what it read when it was last
+    /// written or stopped, and the cycle that was at if it is counting.
+    dwt_ctrl: u32,
+    cyccnt: u32,
+    cyccnt_since: Option<u64>,
 }
 
 impl Debug {
@@ -106,6 +136,9 @@ impl Debug {
     /// COMP holds bits 28:2 of a word address, and BP_MATCH says which of
     /// its two halfwords break.
     pub fn breaks_at(&self, pc: u32) -> bool {
+        if self.fpb_v2 {
+            return self.bpu.iter().any(|&comp| comp & 1 != 0 && comp & !1 == pc);
+        }
         self.bpu.iter().any(|&comp| {
             let halfword = match comp >> 30 {
                 0b01 => pc & 2 == 0,
@@ -118,65 +151,95 @@ impl Debug {
     }
 
     fn rearm(&mut self) {
-        self.breaking = self.enabled && self.bpu_enabled && self.bpu.iter().any(|&c| c & 1 != 0 && c >> 30 != 0);
+        let armed = |c: u32| c & 1 != 0 && (self.fpb_v2 || c >> 30 != 0);
+        self.breaking = self.enabled && self.bpu_enabled && self.bpu.iter().any(|&c| armed(c));
     }
 
     /// Lets go of the core as a debugger leaving does: running, nothing
     /// caught, no breakpoint set.
     pub fn release(&mut self) {
-        *self = Debug { retired_at_read: self.retired_at_read, ..Debug::default() };
+        *self = Debug { retired_at_read: self.retired_at_read, fpb_v2: self.fpb_v2, ..Debug::default() };
+    }
+
+    fn cyccnt(&self, cycles: u64) -> u32 {
+        match self.cyccnt_since {
+            Some(since) => self.cyccnt.wrapping_add((cycles - since) as u32),
+            None => self.cyccnt,
+        }
     }
 }
 
 /// Whether `addr` is one of the registers this module answers rather than
-/// the bus.
-pub fn answers(addr: u32) -> bool {
+/// the bus, on a given core.
+pub fn answers(core: Core, addr: u32) -> bool {
     matches!(addr & !3, DFSR | DHCSR | DCRSR | DCRDR | DEMCR)
         || (DWT..DWT + 0x1000).contains(&addr)
         || (BPU..BPU + 0x1000).contains(&addr)
         || (ROM_TABLE..ROM_TABLE + 0x1000).contains(&addr)
         || (SCS + 0xFD0..SCS + 0x1000).contains(&addr)
+        || core == Core::CortexM7
+            && ((CHIP_ROM_TABLE..CHIP_ROM_TABLE + 0x1000).contains(&addr) || (ITM + 0xFD0..ITM + 0x1000).contains(&addr))
 }
 
+/// JEP106 designer codes, as continuation count and identity.
+const ARM: (u32, u32) = (4, 0x3B);
+const ST: (u32, u32) = (0, 0x20);
+
 /// The CoreSight identification registers at the top of each component's
-/// 4 KiB: peripheral IDs 4 and 0–3, then component IDs 0–3. A Cortex-M0+'s
-/// own — ARM's JEP106 code, its part numbers, and the component class (1
-/// for a ROM table, 0xE for the rest).
-fn identification(addr: u32) -> Option<u32> {
+/// 4 KiB: peripheral IDs 4 and 0–3, then component IDs 0–3. The core's
+/// own — ARM's code, its part numbers, and the component class (1 for a
+/// ROM table, 0xE for the rest) — and on an H7 ST's ROM table, whose part
+/// number is the part's DEV_ID.
+fn identification(core: Core, dev_id: u16, addr: u32) -> Option<u32> {
     if addr & 0xFFF < 0xFD0 {
         return None;
     }
-    let (part, class) = match addr & !0xFFF {
-        ROM_TABLE => (0x4C0, 0x1),
-        SCS => (0x008, 0xE),
-        DWT => (0x00A, 0xE),
-        BPU => (0x00B, 0xE),
+    let ((continuation, code), part, class) = match (core, addr & !0xFFF) {
+        (Core::CortexM0Plus, ROM_TABLE) => (ARM, 0x4C0, 0x1),
+        (Core::CortexM0Plus, SCS) => (ARM, 0x008, 0xE),
+        (Core::CortexM0Plus, DWT) => (ARM, 0x00A, 0xE),
+        (Core::CortexM0Plus, BPU) => (ARM, 0x00B, 0xE),
+        (Core::CortexM7, CHIP_ROM_TABLE) => (ST, u32::from(dev_id), 0x1),
+        (Core::CortexM7, ROM_TABLE) => (ARM, 0x4C7, 0x1),
+        (Core::CortexM7, SCS) => (ARM, 0x00C, 0xE),
+        (Core::CortexM7, DWT) => (ARM, 0x002, 0xE),
+        (Core::CortexM7, BPU) => (ARM, 0x00E, 0xE),
+        (Core::CortexM7, ITM) => (ARM, 0x001, 0xE),
         _ => return None,
     };
-    Some(match addr & 0xFFF {
-        0xFD0 => 0x04,
+    Some(coresight_id(addr & 0xFFF, continuation, code, part, class))
+}
+
+/// One identification register, at `offset` in a component's 4 KiB.
+pub fn coresight_id(offset: u32, continuation: u32, code: u32, part: u32, class: u32) -> u32 {
+    match offset {
+        0xFD0 => continuation,
         0xFE0 => part & 0xFF,
-        0xFE4 => part >> 8 | 0xB << 4,
-        0xFE8 => 0x0B,
+        0xFE4 => part >> 8 | (code & 0xF) << 4,
+        0xFE8 => 1 << 3 | code >> 4,
         0xFF0 => 0x0D,
         0xFF4 => class << 4,
         0xFF8 => 0x05,
         0xFFC => 0xB1,
         _ => 0,
-    })
+    }
 }
 
-/// The ROM table's entries: the SCS, the DWT and the BPU, as offsets from
-/// the table, each present and in the 32-bit format.
-fn rom_entry(offset: u32) -> u32 {
-    let entry = |component: u32| component.wrapping_sub(ROM_TABLE) | 3;
+/// A ROM table's entries, as offsets from the table, each present and in
+/// the 32-bit format: a Cortex-M0+'s SCS, DWT and BPU; an M7's SCS, DWT,
+/// FPB and ITM, under the chip's table.
+fn rom_entry(core: Core, table: u32, offset: u32) -> u32 {
+    let entry = |component: u32| component.wrapping_sub(table) | 3;
+    let entries: &[u32] = match (core, table) {
+        (Core::CortexM0Plus, ROM_TABLE) => &[SCS, DWT, BPU],
+        (Core::CortexM7, ROM_TABLE) => &[SCS, DWT, BPU, ITM],
+        (Core::CortexM7, CHIP_ROM_TABLE) => &[ROM_TABLE],
+        _ => &[],
+    };
     match offset {
-        0x000 => entry(SCS),
-        0x004 => entry(DWT),
-        0x008 => entry(BPU),
         // MEMTYPE: the system memory map is on this bus.
         0xFCC => 1,
-        _ => 0,
+        _ => entries.get((offset / 4) as usize).map_or(0, |&c| entry(c)),
     }
 }
 
@@ -208,6 +271,12 @@ impl Machine {
     /// clears its two sticky status bits, as the architecture says; `peek`
     /// says not to.
     pub(crate) fn debug_register(&mut self, addr: u32, peek: bool) -> Option<u32> {
+        let core = self.core;
+        if !answers(core, addr) {
+            return None;
+        }
+        let v7 = core == Core::CortexM7;
+        let (bpus, dwts) = comparators(core);
         let d = &mut self.debug;
         let word = addr & !3;
         Some(match word {
@@ -232,21 +301,23 @@ impl Machine {
             DCRDR => d.dcrdr,
             DEMCR => d.demcr,
             DFSR => d.dfsr,
-            // FP_CTRL: four code comparators, KEY reads as one.
-            BPU => (BPU_COMPARATORS as u32) << 4 | 1 << 1 | d.bpu_enabled as u32,
-            a if (BPU + 8..BPU + 8 + 4 * BPU_COMPARATORS as u32).contains(&a) => d.bpu[((a - BPU - 8) / 4) as usize],
-            // DWT_CTRL: two comparators.
-            DWT => (DWT_COMPARATORS as u32) << 28,
+            // FP_CTRL: the code comparators, KEY reading as one, and on an
+            // FPB the architecture's revision.
+            BPU => (bpus as u32) << 4 | (d.fpb_v2 as u32) << 28 | 1 << 1 | d.bpu_enabled as u32,
+            a if (BPU + 8..BPU + 8 + 4 * bpus as u32).contains(&a) => d.bpu[((a - BPU - 8) / 4) as usize],
+            // DWT_CTRL: the comparators, and on an M7 the cycle counter.
+            DWT => (dwts as u32) << 28 | d.dwt_ctrl,
+            a if a == DWT + 4 && v7 => d.cyccnt(self.cycles),
             // DWT_PCSR: the pc, sampled.
             a if a == DWT + 0x1C => self.cpu.pc,
-            a if (DWT + 0x20..DWT + 0x20 + 0x10 * DWT_COMPARATORS as u32).contains(&a) => {
+            a if (DWT + 0x20..DWT + 0x20 + 0x10 * dwts as u32).contains(&a) => {
                 let (n, r) = (((a - DWT - 0x20) / 0x10) as usize, ((a - DWT) & 0xF) / 4);
                 if r < 3 { d.dwt[n][r as usize] } else { 0 }
             }
-            a if (ROM_TABLE..ROM_TABLE + 0xFD0).contains(&a) => rom_entry(a - ROM_TABLE),
-            a => match identification(a) {
+            a if a & 0xFFF < 0xFD0 && matches!(a & !0xFFF, ROM_TABLE | CHIP_ROM_TABLE) => rom_entry(core, a & !0xFFF, a & 0xFFF),
+            a => match identification(core, self.part.dev_id, a) {
                 Some(value) => value,
-                None if answers(a) => 0,
+                None if answers(core, a) => 0,
                 None => return None,
             },
         })
@@ -254,6 +325,9 @@ impl Machine {
 
     /// A debug register write; false if `addr` is not one.
     pub(crate) fn set_debug_register(&mut self, addr: u32, value: u32) -> bool {
+        let core = self.core;
+        let (bpus, dwts) = comparators(core);
+        let cycles = self.cycles;
         let d = &mut self.debug;
         match addr & !3 {
             DHCSR => {
@@ -301,17 +375,27 @@ impl Machine {
                     d.rearm();
                 }
             }
-            a if (BPU + 8..BPU + 8 + 4 * BPU_COMPARATORS as u32).contains(&a) => {
-                d.bpu[((a - BPU - 8) / 4) as usize] = value & 0xDFFF_FFFD;
+            a if (BPU + 8..BPU + 8 + 4 * bpus as u32).contains(&a) => {
+                d.bpu[((a - BPU - 8) / 4) as usize] = if d.fpb_v2 { value } else { value & 0xDFFF_FFFD };
                 d.rearm();
             }
-            a if (DWT + 0x20..DWT + 0x20 + 0x10 * DWT_COMPARATORS as u32).contains(&a) => {
+            DWT if core == Core::CortexM7 => {
+                let counting = value & CYCCNTENA != 0;
+                d.cyccnt = d.cyccnt(cycles);
+                d.cyccnt_since = counting.then_some(cycles);
+                d.dwt_ctrl = value & CYCCNTENA;
+            }
+            a if a == DWT + 4 && core == Core::CortexM7 => {
+                d.cyccnt = value;
+                d.cyccnt_since = d.cyccnt_since.map(|_| cycles);
+            }
+            a if (DWT + 0x20..DWT + 0x20 + 0x10 * dwts as u32).contains(&a) => {
                 let (n, r) = (((a - DWT - 0x20) / 0x10) as usize, ((a - DWT) & 0xF) / 4);
                 if r < 3 {
                     d.dwt[n][r as usize] = value;
                 }
             }
-            a => return answers(a),
+            a => return answers(core, a),
         }
         self.wake_for_debug();
         true
@@ -334,7 +418,7 @@ impl Machine {
 
     /// A store as the AHB-AP makes it. False is a bus error.
     pub fn debug_store(&mut self, addr: u32, size: u32, value: u32) -> bool {
-        if answers(addr) {
+        if answers(self.core, addr) {
             let shift = 8 * (addr & 3);
             let mask = if size == 4 { u32::MAX } else { ((1 << (8 * size)) - 1) << shift };
             let word = self.debug_register(addr, true).unwrap_or(0) & !mask | value << shift & mask;
@@ -370,6 +454,7 @@ impl Machine {
     /// The reset half of vector catch, and S_RESET_ST. Debug state itself
     /// is on the debug reset domain and survives a system reset.
     pub(crate) fn debug_reset(&mut self) {
+        self.debug.fpb_v2 = self.core == Core::CortexM7;
         self.debug.reset_seen = true;
         self.debug.lockup = false;
         self.debug.halted = false;

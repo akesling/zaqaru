@@ -435,7 +435,7 @@ impl Machine {
             let ok = if a & 3 == 0 && bytes.len() - at >= 4 {
                 let word = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
                 at += 4;
-                if debug::answers(a) { self.set_debug_register(a, word) } else { self.bus.write(a, 4, word).is_ok() }
+                if debug::answers(self.core, a) { self.set_debug_register(a, word) } else { self.bus.write(a, 4, word).is_ok() }
             } else {
                 at += 1;
                 self.bus.write(a, 1, bytes[at - 1] as u32).is_ok()

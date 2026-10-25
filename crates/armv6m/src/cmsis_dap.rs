@@ -197,7 +197,7 @@ impl Probe {
     fn access(&mut self, m: &mut Machine, request: u8, value: u32) -> Result<u32, Ack> {
         let a = request & 0xC;
         match (request & 1 != 0, request & 2 != 0) {
-            (false, true) => self.port.dp_read(a),
+            (false, true) => self.port.dp_read(m, a),
             (false, false) => self.port.dp_write(a, value).map(|()| 0),
             (true, true) => self.port.ap_read(m, a),
             (true, false) => self.port.ap_write(m, a, value).map(|()| 0),

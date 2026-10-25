@@ -1,5 +1,8 @@
 //! The debug port: an ADIv5 SW-DP with one AHB-AP behind it, as an
-//! STM32G031's Cortex-M0+ has.
+//! STM32G031's Cortex-M0+ has; or, on an H7, a DPv2 SW-DP with three:
+//! the Cortex-M7's AHB-AP (AP0), the D3 domain's (AP1), and the debug APB
+//! (AP2), where ST's DBGMCU is — which is where probe-rs enables the
+//! debug clocks.
 //!
 //! This is what a probe talks to. A CMSIS-DAP probe's transfers are reads
 //! and writes of these registers — DP registers by address, AP registers by
@@ -27,6 +30,50 @@ pub const DPIDR: u32 = 0x0BC1_1477;
 pub const AP_IDR: u32 = 0x0477_0031;
 /// BASE: the ROM table, present and in the ADIv5 format.
 pub const AP_BASE: u32 = crate::debug::ROM_TABLE | 3;
+
+/// An H7's DPIDR: an ARM SW-DP, DPv2, part 0xBA02 (RM0433 60.3).
+pub const H7_DPIDR: u32 = 0x6BA0_2477;
+/// TARGETID: ST's part 0x450. DLPIDR: SWD protocol version 1.
+const H7_TARGETID: u32 = 0x0450_0041;
+const H7_DLPIDR: u32 = 0x0000_0001;
+/// The H7's three APs: two AHB-APs, of the M7's generation, and an APB-AP.
+const H7_AHB_AP_IDR: u32 = 0x8477_0001;
+const H7_APB_AP_IDR: u32 = 0x5477_0002;
+/// The debug APB's ROM table, and what it lists: DBGMCU.
+const APBD_ROM_TABLE: u32 = 0xE00E_0000;
+const APBD_END: u32 = 0xE010_0000;
+
+/// What one access port reaches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The system, through the core's own bus.
+    System,
+    /// The debug APB.
+    DebugApb,
+}
+
+/// An access port: its IDR, its BASE, and what it reaches.
+struct Ap {
+    idr: u32,
+    base: u32,
+    reach: Reach,
+}
+
+const G0_APS: &[Ap] = &[Ap { idr: AP_IDR, base: AP_BASE, reach: Reach::System }];
+const H7_APS: &[Ap] = &[
+    Ap { idr: H7_AHB_AP_IDR, base: crate::debug::CHIP_ROM_TABLE | 3, reach: Reach::System },
+    // D3's AHB-AP reaches D3's memories and peripherals; here, the same
+    // system, with no ROM table of its own.
+    Ap { idr: H7_AHB_AP_IDR, base: 2, reach: Reach::System },
+    Ap { idr: H7_APB_AP_IDR, base: APBD_ROM_TABLE | 3, reach: Reach::DebugApb },
+];
+
+fn aps(m: &Machine) -> &'static [Ap] {
+    match m.part.family {
+        crate::part::Family::G0 => G0_APS,
+        crate::part::Family::H7 => H7_APS,
+    }
+}
 
 /// A transfer's acknowledgement, as the wire gives it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,10 +147,19 @@ impl Port {
         self.control & CDBGPWRUPREQ != 0
     }
 
-    /// Reads DP register `a` (0x0, 0x4, 0x8 or 0xC).
-    pub fn dp_read(&mut self, a: u8) -> Result<u32, Ack> {
+    /// Reads DP register `a` (0x0, 0x4, 0x8 or 0xC) of `m`'s debug port.
+    /// On a DPv2, 0x4 is banked by SELECT's DPBANKSEL: CTRL/STAT, DLCR,
+    /// TARGETID, DLPIDR, EVENTSTAT.
+    pub fn dp_read(&mut self, m: &Machine, a: u8) -> Result<u32, Ack> {
+        let v2 = m.part.family == crate::part::Family::H7;
         match a & 0xC {
-            0x0 => Ok(DPIDR),
+            0x0 => Ok(if v2 { H7_DPIDR } else { DPIDR }),
+            0x4 if v2 && self.select & 0xF != 0 => Ok(match self.select & 0xF {
+                1 => 0x40,
+                2 => H7_TARGETID,
+                3 => H7_DLPIDR,
+                _ => 0,
+            }),
             0x4 => {
                 let requests = self.control & (CSYSPWRUPREQ | CDBGPWRUPREQ | CDBGRSTREQ);
                 Ok(self.control | requests << 1 | self.sticky)
@@ -152,29 +208,28 @@ impl Port {
             return Err(Ack::Fault);
         }
         let (ap, register) = self.ap_register(a);
-        // Only AP 0 exists; the rest read as zero, which is how a debugger
+        // The APs past the last read as zero, which is how a debugger
         // scanning for APs knows it has found them all.
-        let value = if ap != 0 {
-            0
-        } else {
-            match register {
+        let value = match aps(m).get(ap as usize) {
+            None => 0,
+            Some(port) => match register {
                 CSW => self.csw & CSW_WRITABLE | CSW_DEVICEEN,
                 TAR => self.tar,
                 DRW => {
                     let size = self.size();
                     let addr = self.tar & !(size - 1);
-                    let loaded = m.debug_load(addr, size).ok_or_else(|| self.error())?;
+                    let loaded = load(m, port.reach, addr, size).ok_or_else(|| self.error())?;
                     self.increment();
                     loaded << (8 * (addr & 3))
                 }
                 r if (BD0..BD0 + 0x10).contains(&r) => {
-                    m.debug_load(self.tar & !0xF | (r - BD0) as u32, 4).ok_or_else(|| self.error())?
+                    load(m, port.reach, self.tar & !0xF | (r - BD0) as u32, 4).ok_or_else(|| self.error())?
                 }
                 CFG => 0,
-                BASE => AP_BASE,
-                IDR => AP_IDR,
+                BASE => port.base,
+                IDR => port.idr,
                 _ => 0,
-            }
+            },
         };
         self.rdbuff = value;
         Ok(value)
@@ -186,22 +241,22 @@ impl Port {
             return Err(Ack::Fault);
         }
         let (ap, register) = self.ap_register(a);
-        if ap != 0 {
+        let Some(port) = aps(m).get(ap as usize) else {
             return Ok(());
-        }
+        };
         match register {
             CSW => self.csw = value & CSW_WRITABLE,
             TAR => self.tar = value,
             DRW => {
                 let size = self.size();
                 let addr = self.tar & !(size - 1);
-                if !m.debug_store(addr, size, value >> (8 * (addr & 3))) {
+                if !store(m, port.reach, addr, size, value >> (8 * (addr & 3))) {
                     return Err(self.error());
                 }
                 self.increment();
             }
             r if (BD0..BD0 + 0x10).contains(&r) => {
-                if !m.debug_store(self.tar & !0xF | (r - BD0) as u32, 4, value) {
+                if !store(m, port.reach, self.tar & !0xF | (r - BD0) as u32, 4, value) {
                     return Err(self.error());
                 }
             }
@@ -235,6 +290,40 @@ impl Port {
     }
 }
 
+/// A load through an AP. The debug APB has its ROM table, listing
+/// DBGMCU, and DBGMCU; the rest of it reads as zero, as unclaimed APB space
+/// does, and anything outside it is a bus error.
+fn load(m: &mut Machine, reach: Reach, addr: u32, size: u32) -> Option<u32> {
+    if reach == Reach::System {
+        return m.debug_load(addr, size);
+    }
+    if !(APBD_ROM_TABLE..APBD_END).contains(&addr) {
+        return None;
+    }
+    let dbgmcu = crate::stm32h7::DBGMCU_DEBUG;
+    let word = match addr & !3 {
+        a if a & !0xFFF == APBD_ROM_TABLE && a & 0xFFF >= 0xFD0 => {
+            crate::debug::coresight_id(a & 0xFFF, 0, 0x20, u32::from(m.part.dev_id), 0x1)
+        }
+        a if a == APBD_ROM_TABLE => dbgmcu.wrapping_sub(APBD_ROM_TABLE) | 3,
+        a if a == APBD_ROM_TABLE + 0xFCC => 1,
+        a if (dbgmcu..dbgmcu + 0x80).contains(&a) => return m.debug_load(addr, size),
+        _ => 0,
+    };
+    Some(word >> (8 * (addr & 3)) & if size == 4 { u32::MAX } else { (1 << (8 * size)) - 1 })
+}
+
+fn store(m: &mut Machine, reach: Reach, addr: u32, size: u32, value: u32) -> bool {
+    if reach == Reach::System {
+        return m.debug_store(addr, size, value);
+    }
+    let dbgmcu = crate::stm32h7::DBGMCU_DEBUG;
+    match addr {
+        a if (dbgmcu..dbgmcu + 0x80).contains(&a) => m.debug_store(addr, size, value),
+        a => (APBD_ROM_TABLE..APBD_END).contains(&a),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,13 +344,14 @@ mod tests {
     }
 
     /// A port powered up, with CSW set for words, incrementing.
-    fn connected() -> Port {
+    fn connected(m: &Machine) -> Port {
         let mut port = Port::default();
         port.line_reset();
-        assert_eq!(port.dp_read(0x0), Ok(DPIDR));
+        let dpidr = port.dp_read(m, 0x0).unwrap();
+        assert!(dpidr == DPIDR || dpidr == H7_DPIDR);
         port.dp_write(0x0, STKERRCLR | STKCMPCLR | WDERRCLR | ORUNERRCLR).unwrap();
         port.dp_write(0x4, CSYSPWRUPREQ | CDBGPWRUPREQ).unwrap();
-        let status = port.dp_read(0x4).unwrap();
+        let status = port.dp_read(m, 0x4).unwrap();
         assert_eq!(status >> 28, 0xF, "both power-ups acknowledged: {status:08x}");
         port.dp_write(0x8, 0).unwrap();
         port
@@ -282,7 +372,7 @@ mod tests {
     #[test]
     fn a_debugger_finds_one_ahb_ap_and_the_rom_table_behind_it() {
         let mut m = counting();
-        let mut port = connected();
+        let mut port = connected(&m);
         port.dp_write(0x8, 0xF0).unwrap();
         assert_eq!(port.ap_read(&mut m, IDR & 0xC), Ok(AP_IDR));
         assert_eq!(port.ap_read(&mut m, BASE & 0xC), Ok(AP_BASE));
@@ -308,10 +398,78 @@ mod tests {
         assert_eq!(word(&mut port, &mut m, 0xE000_ED00), 0x410C_C601, "CPUID: a Cortex-M0+");
     }
 
+    /// An H753 running the same loop, from its flash's own address.
+    fn h753_counting() -> Machine {
+        let mut image = vec![0u8; 0x110];
+        image[0..4].copy_from_slice(&(SRAM_BASE + 0x2000).to_le_bytes());
+        image[4..8].copy_from_slice(&(FLASH_BASE + 0x100 | 1).to_le_bytes());
+        for (i, halfword) in [0x2000u16, 0x3001, 0xE7FD].iter().enumerate() {
+            image[0x100 + 2 * i..0x102 + 2 * i].copy_from_slice(&halfword.to_le_bytes());
+        }
+        Machine::new(crate::part::STM32H753, &image).unwrap()
+    }
+
+    #[test]
+    fn an_h7_has_three_aps_and_st_s_rom_table_names_the_part() {
+        let mut m = h753_counting();
+        let mut port = connected(&m);
+        assert_eq!(port.dp_read(&m, 0x0), Ok(H7_DPIDR));
+        port.dp_write(0x8, 2).unwrap();
+        assert_eq!(port.dp_read(&m, 0x4), Ok(H7_TARGETID));
+        port.dp_write(0x8, 0).unwrap();
+
+        let idrs: Vec<u32> = (0..4)
+            .map(|ap| {
+                port.dp_write(0x8, ap << 24 | 0xF0).unwrap();
+                port.ap_read(&mut m, IDR & 0xC).unwrap()
+            })
+            .collect();
+        assert_eq!(idrs, [H7_AHB_AP_IDR, H7_AHB_AP_IDR, H7_APB_AP_IDR, 0]);
+        port.dp_write(0x8, 0xF0).unwrap();
+        let base = port.ap_read(&mut m, BASE & 0xC).unwrap() & !0xFFF;
+        port.dp_write(0x8, 0).unwrap();
+
+        // The chip's table: ST's, part 0x450, listing the M7's.
+        let pid = |port: &mut Port, m: &mut Machine, base: u32| {
+            let byte = |port: &mut Port, m: &mut Machine, at: u32| word(port, m, base + at) & 0xFF;
+            (byte(port, m, 0xFE0) | byte(port, m, 0xFE4) << 8 | byte(port, m, 0xFE8) << 16, byte(port, m, 0xFD0))
+        };
+        assert_eq!(base, crate::debug::CHIP_ROM_TABLE);
+        assert_eq!(pid(&mut port, &mut m, base), (0x0A_0450, 0), "JEP106 0x20, ST, and the DEV_ID");
+        let m7 = base.wrapping_add(word(&mut port, &mut m, base) & !0xFFF);
+        assert_eq!(m7, ROM_TABLE);
+        let components: Vec<u32> =
+            (0..5).map(|i| word(&mut port, &mut m, m7 + 4 * i)).take_while(|&e| e != 0).map(|e| m7.wrapping_add(e & !0xFFF)).collect();
+        assert_eq!(components, [SCS, DWT, BPU, ITM]);
+        assert_eq!(pid(&mut port, &mut m, BPU).0 & 0xFFF, 0x00E, "the M7's FPB");
+        assert_eq!(word(&mut port, &mut m, BPU) >> 28, 1, "FP_CTRL.REV: an FPB v2");
+
+        // DBGMCU, through the debug APB, where probe-rs enables the debug
+        // clocks; and the same register from the core's side.
+        port.dp_write(0x8, 2 << 24).unwrap();
+        assert_eq!(word(&mut port, &mut m, 0xE00E_1000) & 0xFFF, 0x450);
+        set_word(&mut port, &mut m, 0xE00E_1004, 0x0070_0007);
+        port.ap_write(&mut m, TAR, 0x2000_0000).unwrap();
+        assert_eq!(port.ap_read(&mut m, DRW), Err(Ack::Fault), "the debug APB reaches no memory");
+        port.dp_write(0x0, STKERRCLR).unwrap();
+        port.dp_write(0x8, 0).unwrap();
+        assert_eq!(word(&mut port, &mut m, 0x5C00_1004), 0x0070_0007);
+    }
+
+    #[test]
+    fn an_fpb_v2_comparator_stops_at_its_address() {
+        let mut m = h753_counting();
+        let mut port = connected(&m);
+        set_word(&mut port, &mut m, DHCSR, 0xA05F << 16 | C_DEBUGEN);
+        set_word(&mut port, &mut m, BPU, 0b11);
+        set_word(&mut port, &mut m, BPU + 8 + 4 * 7, (FLASH_BASE + 0x102) | 1);
+        assert_eq!(m.run(1000), Outcome::Stopped { pc: FLASH_BASE + 0x102 });
+    }
+
     #[test]
     fn halting_reading_registers_and_stepping_go_through_the_debug_registers() {
         let mut m = counting();
-        let mut port = connected();
+        let mut port = connected(&m);
         assert_eq!(m.run(1000), Outcome::Budget);
         set_word(&mut port, &mut m, DHCSR, 0xA05F << 16 | C_DEBUGEN | C_HALT);
         assert_eq!(word(&mut port, &mut m, DHCSR) & S_HALT, S_HALT);
@@ -342,7 +500,7 @@ mod tests {
     #[test]
     fn a_bpu_comparator_stops_the_core_before_the_instruction() {
         let mut m = counting();
-        let mut port = connected();
+        let mut port = connected(&m);
         set_word(&mut port, &mut m, DHCSR, 0xA05F << 16 | C_DEBUGEN);
         set_word(&mut port, &mut m, BPU, 0b11);
         // The `adds` at 0x0800_0102: the upper halfword of its word.
@@ -356,7 +514,7 @@ mod tests {
     #[test]
     fn vector_catch_halts_a_reset_at_the_reset_vector() {
         let mut m = counting();
-        let mut port = connected();
+        let mut port = connected(&m);
         set_word(&mut port, &mut m, DHCSR, 0xA05F << 16 | C_DEBUGEN | C_HALT);
         set_word(&mut port, &mut m, DEMCR, VC_CORERESET);
         word(&mut port, &mut m, DHCSR);
@@ -372,12 +530,12 @@ mod tests {
     #[test]
     fn memory_reads_increment_and_a_bus_error_is_sticky_until_aborted() {
         let mut m = counting();
-        let mut port = connected();
+        let mut port = connected(&m);
         port.ap_write(&mut m, CSW, 0x2300_0012).unwrap();
         port.ap_write(&mut m, TAR, FLASH_BASE + 0x100).unwrap();
         let words: Vec<u32> = (0..2).map(|_| port.ap_read(&mut m, DRW).unwrap()).collect();
         assert_eq!(words, [0x3001_2000, 0x0000_E7FD]);
-        assert_eq!(port.dp_read(0xC), Ok(0x0000_E7FD), "RDBUFF");
+        assert_eq!(port.dp_read(&m, 0xC), Ok(0x0000_E7FD), "RDBUFF");
 
         // Bytes land in their lane.
         port.ap_write(&mut m, CSW, 0x2300_0010).unwrap();
@@ -390,7 +548,7 @@ mod tests {
 
         port.ap_write(&mut m, TAR, 0x3000_0000).unwrap();
         assert_eq!(port.ap_read(&mut m, DRW), Err(Ack::Fault));
-        assert_eq!(port.dp_read(0x4).unwrap() & STICKYERR, STICKYERR);
+        assert_eq!(port.dp_read(&m, 0x4).unwrap() & STICKYERR, STICKYERR);
         assert_eq!(port.ap_read(&mut m, IDR & 0xC), Err(Ack::Fault), "everything faults while sticky");
         port.dp_write(0x0, STKERRCLR).unwrap();
         assert_eq!(word(&mut port, &mut m, FLASH_BASE), 0x2000_2000);

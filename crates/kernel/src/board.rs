@@ -1,11 +1,12 @@
-//! A microcontroller board on the container's bench: an emulated Cortex-M0+
-//! (see the `armv6m` crate) that the kernel runs beside the processes, with
-//! a debug probe the processes can reach.
+//! A microcontroller board on the container's bench: an emulated STM32 (see
+//! the `armv6m` crate) that the kernel runs beside the processes, with a
+//! debug probe the processes can reach.
 //!
 //! An image asks for one by containing `/etc/zaqaru/board`:
 //!
 //! ```text
-//! chip   stm32g031        # or stm32g030, stm32g070, or an ordering code
+//! chip   stm32g031        # or stm32g030, stm32g070, stm32h743, stm32h753,
+//!                         # or an ordering code
 //! led    PC6 low          # optional: the part's Nucleo's, by default
 //! image  /hubris/final.bin
 //! probe  127.0.0.1:3333
@@ -22,8 +23,8 @@
 //!
 //! # Time
 //!
-//! The board runs at 16 MHz of *simulated* time per second of the
-//! container's monotonic clock, advanced at the points the scheduler
+//! The board runs at its part's clock — 16 MHz for a G0, 400 MHz for an
+//! H7 — of *simulated* time per second of the container's monotonic clock, advanced at the points the scheduler
 //! already crosses to the host — a process finishing its slice, and the
 //! container going idle — and so at points that are a pure function of
 //! execution, against clock readings that are store answers and so on the
@@ -54,7 +55,7 @@ use std::rc::Rc;
 use armv6m::cmsis_dap::{self, Probe};
 
 use armv6m::gdb::{self, Debugger, Response};
-use armv6m::stm32g0::Edge;
+use armv6m::gpio::Edge;
 use armv6m::{Event, Machine, Outcome};
 
 use crate::ring::End;
@@ -62,9 +63,6 @@ use crate::socket::{Address, Endpoint, State};
 
 /// Where an image asks for a board.
 pub const CONFIGURATION: &[u8] = b"/etc/zaqaru/board";
-
-/// The board's clock: the G0 demo's 16 MHz HSI, in cycles per microsecond.
-const CYCLES_PER_MICROSECOND: u64 = 16;
 
 /// How far behind the container's clock the board may fall before it gives
 /// the time up.
@@ -101,9 +99,8 @@ pub struct Board {
     origin: Option<u64>,
     /// The last monotonic reading the board was moved on at.
     pub now: u64,
-    pub led: Option<bool>,
-    /// Which pin the LED is on, if the board has one.
-    pub led_pin: Option<Led>,
+    /// The board's LEDs, and whether each is lit, if it has been driven.
+    pub leds: Vec<(Led, Option<bool>)>,
     /// What the USARTs have sent, the latest [`SERIAL_KEPT`] bytes or so.
     pub serial: Vec<u8>,
     pub faults: u64,
@@ -133,10 +130,10 @@ pub struct Configuration {
     pub chip: String,
     pub image: String,
     pub probe: (u32, u16),
-    pub led: Option<Led>,
+    pub leds: Vec<Led>,
 }
 
-/// The board's user LED: which pin, and which level lights it.
+/// A user LED on the board: which pin, and which level lights it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Led {
     /// 0 for port A.
@@ -146,16 +143,19 @@ pub struct Led {
 }
 
 impl Led {
-    /// The LED of the board a part comes on, as Hubris's own LED driver has
-    /// it: the G031 Nucleo's PC6, the G070 Nucleo's PA5 (lit high, as the
-    /// Nucleo-64 wires it), the G030 oxcon2023g0 badge's PB7.
-    pub fn of(part: &str) -> Option<Led> {
-        Some(match part {
-            "stm32g031" => Led { port: 2, pin: 6, active_low: true },
-            "stm32g070" => Led { port: 0, pin: 5, active_low: false },
-            "stm32g030" => Led { port: 1, pin: 7, active_low: true },
-            _ => return None,
-        })
+    /// The LEDs of the board a part comes on, as Hubris's own LED driver
+    /// has them: the G031 Nucleo's PC6, the G070 Nucleo's PA5 (lit high, as
+    /// the Nucleo-64 wires it), the G030 oxcon2023g0 badge's PB7, and the
+    /// Nucleo-144 H7s' green PB0, red PB14 and yellow PE1.
+    pub fn of(part: &str) -> Vec<Led> {
+        let led = |port: u8, pin: u8, active_low: bool| Led { port, pin, active_low };
+        match part {
+            "stm32g031" => vec![led(2, 6, true)],
+            "stm32g070" => vec![led(0, 5, false)],
+            "stm32g030" => vec![led(1, 7, true)],
+            "stm32h743" | "stm32h753" => vec![led(1, 0, false), led(1, 14, false), led(4, 1, false)],
+            _ => Vec::new(),
+        }
     }
 
     /// `PC6 low`, `PA5 high`.
@@ -163,7 +163,7 @@ impl Led {
         let (pin, level) = text.split_once(char::is_whitespace).unwrap_or((text, "high"));
         let bytes = pin.as_bytes();
         let port = match bytes {
-            [b'P', port @ b'A'..=b'F', ..] => port - b'A',
+            [b'P', port @ b'A'..=b'K', ..] => port - b'A',
             _ => return None,
         };
         let pin = pin[2..].parse().ok().filter(|&pin: &u8| pin < 16)?;
@@ -179,6 +179,18 @@ impl Led {
         format!("P{}{}", (b'A' + self.port) as char, self.pin)
     }
 }
+
+/// `PC13`: a port, 0 for A, and a pin.
+fn parse_pin(text: &str) -> Option<(u8, u8)> {
+    let port = match text.as_bytes() {
+        [b'P', port @ b'A'..=b'K', ..] => port - b'A',
+        _ => return None,
+    };
+    let pin = text[2..].parse().ok().filter(|&pin: &u8| pin < 16)?;
+    Some((port, pin))
+}
+
+const MODELLED: &str = "the modelled parts are stm32g030, stm32g031, stm32g070, stm32h743 and stm32h753";
 
 /// How much of what the USARTs sent the board keeps: the tail, for the
 /// page's serial panel.
@@ -206,13 +218,29 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
     }
     let chip = chip.unwrap_or_else(|| "stm32g031".to_string());
     let part = armv6m::part::Part::named(&chip)
-        .ok_or_else(|| format!("chip `{chip}`: the modelled parts are stm32g030, stm32g031 and stm32g070"))?;
+        .ok_or_else(|| format!("chip `{chip}`: {MODELLED}"))?;
     Ok(Configuration {
         chip: part.name.to_string(),
         image: image.ok_or("no `image`")?,
         probe: probe.unwrap_or((crate::socket::INADDR_LOOPBACK, 3333)),
-        led: led.or_else(|| Led::of(part.name)),
+        leds: led.map_or_else(|| Led::of(part.name), |led| vec![led]),
     })
+}
+
+fn lit_json(lit: Option<bool>) -> String {
+    use crate::system::server::quoted;
+    match lit {
+        Some(true) => quoted("on"),
+        Some(false) => quoted("off"),
+        None => "null".into(),
+    }
+}
+
+fn core_name(core: armv6m::state::Core) -> &'static str {
+    match core {
+        armv6m::state::Core::CortexM0Plus => "Cortex-M0+",
+        armv6m::state::Core::CortexM7 => "Cortex-M7",
+    }
 }
 
 fn parse_address(text: &str) -> Option<(u32, u16)> {
@@ -230,24 +258,25 @@ fn parse_address(text: &str) -> Option<(u32, u16)> {
 impl Board {
     /// A command written to `/dev/board`, a line at a time:
     ///
-    /// - `part NAME` puts a different G0 on the bench — `stm32g070`, or an
-    ///   ordering code such as a Hubris archive names (`STM32G070RBTx`) —
-    ///   erased, and held halted as a probe holds a blank part, for
-    ///   `humility flash` to program;
-    /// - `image TEXT` says what is in its flash now, for the panel.
+    /// - `part NAME` puts a different part on the bench — `stm32g070`,
+    ///   `stm32h753`, or an ordering code such as a Hubris archive names
+    ///   (`STM32G070RBTx`) — erased, and held halted as a probe holds a
+    ///   blank part, for `humility flash` to program;
+    /// - `image TEXT` says what is in its flash now, for the panel;
+    /// - `pin PC13 high`, `low` or `float` drives a pin from outside the
+    ///   chip, or lets it go: a button pressed and released.
     pub fn command(&mut self, line: &str) -> Result<(), String> {
         let (verb, rest) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
         match verb {
             "part" => {
                 let part = armv6m::part::Part::named(rest.trim())
-                    .ok_or_else(|| format!("part `{}`: the modelled parts are stm32g030, stm32g031 and stm32g070", rest.trim()))?;
-                let mut machine = Machine::stm32g0(part, &[])?;
+                    .ok_or_else(|| format!("part `{}`: {MODELLED}", rest.trim()))?;
+                let mut machine = Machine::new(part, &[])?;
                 machine.halt();
                 self.machine = machine;
                 self.chip = part.name.to_string();
                 self.image = "(erased)".to_string();
-                self.led = None;
-                self.led_pin = Led::of(part.name);
+                self.leds = Led::of(part.name).into_iter().map(|led| (led, None)).collect();
                 self.serial.clear();
                 self.faults = 0;
                 self.usb_probe = Probe::default();
@@ -264,8 +293,20 @@ impl Board {
                 self.image = rest.trim().to_string();
                 Ok(())
             }
+            "pin" => {
+                let (pin, level) = rest.trim().split_once(char::is_whitespace).unwrap_or((rest.trim(), ""));
+                let (port, pin) = parse_pin(pin).ok_or_else(|| format!("pin `{pin}`: expected a pin, `PC13`"))?;
+                let level = match level.trim() {
+                    "high" => Some(true),
+                    "low" => Some(false),
+                    "float" => None,
+                    other => return Err(format!("`{other}`: a pin is driven `high`, `low` or `float`")),
+                };
+                self.machine.drive(port as usize, pin, level);
+                Ok(())
+            }
             "" => Ok(()),
-            other => Err(format!("`{other}`: the board takes `part NAME` and `image TEXT`")),
+            other => Err(format!("`{other}`: the board takes `part NAME`, `image TEXT` and `pin PIN LEVEL`")),
         }
     }
 
@@ -286,9 +327,10 @@ impl Board {
             self.rebase(now);
             return;
         }
-        let due = now.saturating_sub(origin) / 1000 * CYCLES_PER_MICROSECOND;
+        let mhz = self.mhz();
+        let due = now.saturating_sub(origin) / 1000 * mhz;
         let behind = due.saturating_sub(self.machine.cycles);
-        let budget = behind.min(MAX_BEHIND_NS / 1000 * CYCLES_PER_MICROSECOND);
+        let budget = behind.min(MAX_BEHIND_NS / 1000 * mhz);
         let outcome = self.machine.run(budget);
         if behind > budget {
             self.rebase(now);
@@ -323,12 +365,22 @@ impl Board {
     /// Restarts the clock from where the board is: simulated time now
     /// corresponds to `now`.
     fn rebase(&mut self, now: u64) {
-        let ran = self.machine.cycles / CYCLES_PER_MICROSECOND * 1000;
+        let ran = self.machine.cycles / self.mhz() * 1000;
         self.origin = Some(now.saturating_sub(ran));
     }
 
+    /// The board's clock, in cycles per microsecond: its part's.
+    fn mhz(&self) -> u64 {
+        self.machine.part.mhz()
+    }
+
+    /// Simulated milliseconds at `cycle`.
+    fn ms(&self, cycle: u64) -> f64 {
+        cycle as f64 / (self.mhz() * 1000) as f64
+    }
+
     fn stamp(&self) -> String {
-        format!("[board {:>10.3} ms]", self.machine.cycles as f64 / (CYCLES_PER_MICROSECOND * 1000) as f64)
+        format!("[board {:>10.3} ms]", self.ms(self.machine.cycles))
     }
 
     /// Turns the machine's events into console lines and board state.
@@ -336,18 +388,24 @@ impl Board {
         let events: Vec<Event> = self.machine.events.drain(..).collect();
         for event in events {
             match event {
+                // Only an LED's edges reach the console: an H7 Hubris toggles
+                // its profiling pins at every system call.
                 Event::Pin { cycle, edge: Edge { port, before, after } } => {
-                    let at = cycle as f64 / (CYCLES_PER_MICROSECOND * 1000) as f64;
-                    let mut line = format!("[board {at:>10.3} ms] GPIO{} 0x{before:04x} -> 0x{after:04x}", (b'A' + port) as char);
-                    if let Some(led) = self.led_pin
-                        && port == led.port
-                        && (before ^ after) & 1 << led.pin != 0
-                    {
+                    let at = self.ms(cycle);
+                    let several = self.leds.len() > 1;
+                    for (led, lit) in &mut self.leds {
+                        if port != led.port || (before ^ after) & 1 << led.pin == 0 {
+                            continue;
+                        }
                         let on = (after >> led.pin & 1 != 0) != led.active_low;
-                        self.led = Some(on);
-                        line += if on { "  LED on" } else { "  LED off" };
+                        *lit = Some(on);
+                        let which = if several { format!(" {}", led.name()) } else { String::new() };
+                        self.console.push(format!(
+                            "[board {at:>10.3} ms] GPIO{} 0x{before:04x} -> 0x{after:04x}  LED{which} {}",
+                            (b'A' + port) as char,
+                            if on { "on" } else { "off" }
+                        ));
                     }
-                    self.console.push(line);
                 }
                 // Kept for the serial panel rather than put on the console:
                 // a demo that prints a line a millisecond would drown it.
@@ -359,9 +417,9 @@ impl Board {
                 }
                 Event::Fault { cycle, pc, fault, mode, privileged } => {
                     self.faults += 1;
-                    let at = cycle as f64 / (CYCLES_PER_MICROSECOND * 1000) as f64;
+                    let at = self.ms(cycle);
                     self.console.push(format!(
-                        "[board {at:>10.3} ms] HardFault at pc=0x{pc:08x} ({mode:?}, {}): {fault:?}",
+                        "[board {at:>10.3} ms] fault at pc=0x{pc:08x} ({mode:?}, {}): {fault:?}",
                         if privileged { "privileged" } else { "unprivileged" }
                     ));
                 }
@@ -522,20 +580,22 @@ impl Board {
             _ => String::new(),
         };
         format!(
-            r#"{{"chip":{},"image":{},"state":{},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"faults":{},"probe":{},"debugger":{},"serial":{},"exceptions":{{{}}},"registers":{{{}}}}}"#,
+            r#"{{"chip":{},"core":{},"image":{},"state":{},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"exceptions":{{{}}},"registers":{{{}}}}}"#,
             quoted(&self.chip),
+            quoted(core_name(m.core)),
             quoted(&self.image),
             quoted(if self.machine.halted() { "halted" } else { "running" }),
             quoted(&format!("{:?}", cpu.mode)),
             cpu.privileged(),
-            m.cycles as f64 / (CYCLES_PER_MICROSECOND * 1000) as f64,
+            self.ms(m.cycles),
             m.retired,
-            match self.led {
-                Some(true) => quoted("on"),
-                Some(false) => quoted("off"),
-                None => "null".into(),
-            },
-            self.led_pin.map_or("null".into(), |led| quoted(&led.name())),
+            lit_json(self.leds.first().and_then(|&(_, lit)| lit)),
+            self.leds.first().map_or("null".into(), |(led, _)| quoted(&led.name())),
+            self.leds
+                .iter()
+                .map(|(led, lit)| format!(r#"{{"pin":{},"state":{}}}"#, quoted(&led.name()), lit_json(*lit)))
+                .collect::<Vec<_>>()
+                .join(","),
             self.faults,
             quoted(&probe),
             self.client.is_some(),
@@ -555,11 +615,19 @@ impl Board {
             true => format!("halted at pc=0x{:08x}", m.cpu.pc),
             false => "running".to_string(),
         };
-        let led = match self.led {
-            Some(true) => "on",
-            Some(false) => "off",
-            None => "never driven",
-        };
+        let leds: Vec<String> = self
+            .leds
+            .iter()
+            .map(|(led, lit)| {
+                let state = match lit {
+                    Some(true) => "on",
+                    Some(false) => "off",
+                    None => "never driven",
+                };
+                format!("LED {:<6}{state}", led.name())
+            })
+            .collect();
+        let leds = if leds.is_empty() { "LED         none".to_string() } else { leds.join("\n") };
         let taken: Vec<String> = m
             .taken
             .iter()
@@ -568,12 +636,12 @@ impl Board {
             .map(|(n, count)| format!("{} {count}", armv6m::scs::exception::name(n as u32)))
             .collect();
         format!(
-            "board       {} (emulated Cortex-M0+), in the kernel\nimage       {}\nstate       {state}\ntime        {:.3} s simulated, {} instructions\nLED ({})   {led}\nfaults      {}\nexceptions  {}\n",
+            "board       {} (emulated {}), in the kernel\nimage       {}\nstate       {state}\ntime        {:.3} s simulated, {} instructions\n{leds}\nfaults      {}\nexceptions  {}\n",
             self.chip,
+            core_name(m.core),
             self.image,
-            m.cycles as f64 / (CYCLES_PER_MICROSECOND * 1_000_000) as f64,
+            self.ms(m.cycles) / 1000.0,
             m.retired,
-            self.led_pin.map_or("none".into(), |led| led.name()),
             self.faults,
             taken.join(", "),
         )
@@ -665,7 +733,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             }
         };
         let part = armv6m::part::Part::named(&configuration.chip).expect("parse checked the part");
-        let machine = match Machine::stm32g0(part, &firmware) {
+        let machine = match Machine::new(part, &firmware) {
             Ok(machine) => machine,
             Err(why) => {
                 self.board_says(&format!("board: {}: {why}", configuration.image));
@@ -705,8 +773,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             client: None,
             origin: None,
             now: 0,
-            led: None,
-            led_pin: configuration.led,
+            leds: configuration.leds.into_iter().map(|led| (led, None)).collect(),
             serial: Vec::new(),
             faults: 0,
             console: Vec::new(),
@@ -804,7 +871,7 @@ mod tests {
                 chip: "stm32g031".into(),
                 image: "/hubris/final.bin".into(),
                 probe: (0x7F00_0001, 3333),
-                led: Some(Led { port: 2, pin: 6, active_low: true }),
+                leds: vec![Led { port: 2, pin: 6, active_low: true }],
             }
         );
     }
@@ -812,17 +879,19 @@ mod tests {
     #[test]
     fn a_part_brings_its_board_s_led_unless_told_otherwise() {
         let g070 = parse("chip STM32G070RBTx\nimage /f.bin").unwrap();
-        assert_eq!((g070.chip.as_str(), g070.led), ("stm32g070", Some(Led { port: 0, pin: 5, active_low: false })));
+        assert_eq!((g070.chip.as_str(), g070.leds), ("stm32g070", vec![Led { port: 0, pin: 5, active_low: false }]));
         let told = parse("chip stm32g031\nimage /f.bin\nled PA12 low").unwrap();
-        assert_eq!(told.led, Some(Led { port: 0, pin: 12, active_low: true }));
+        assert_eq!(told.leds, vec![Led { port: 0, pin: 12, active_low: true }]);
         assert!(parse("image /f.bin\nled PZ9 low").is_err());
+        let h753 = parse("chip STM32H753ZITx\nimage /f.bin").unwrap();
+        assert_eq!((h753.chip.as_str(), h753.leds.len()), ("stm32h753", 3));
     }
 
     #[test]
     fn the_probe_and_chip_have_defaults_and_the_image_does_not() {
         assert_eq!(parse("image /f.bin").unwrap().probe, (crate::socket::INADDR_LOOPBACK, 3333));
         assert!(parse("chip stm32g031").is_err());
-        assert!(parse("image /f.bin\nchip stm32h753").is_err());
+        assert!(parse("image /f.bin\nchip stm32f407").is_err());
         assert!(parse("image /f.bin\nflavour vanilla").is_err());
     }
 }

@@ -84,7 +84,7 @@ impl FrontDoor {
 }
 
 const BANNER: &str = "\
-An STM32G031 Nucleo running Hubris, emulated in zaqaru's kernel, with a
+An STM32 Nucleo running Hubris, emulated in zaqaru's kernel, with a
 debug probe on it and Humility attached through it.
 Try `humility tasks`, or `help` for more.
 ";
@@ -103,8 +103,10 @@ const HELP: &str = "\
                             run it
     archives                the Hubris builds there are to flash
     flash NAME              make the board the part NAME was built for and
-                            flash it — g031, g070, or one you uploaded
-                            (drop an archive on the terminal to upload it)
+                            flash it — g031, g070, h753, or one you
+                            uploaded (drop an archive on the terminal)
+    button                  press and release the Nucleo's user button,
+                            PC13 on an H7's
     humility -p VID:PID …   the same against a probe connected from the
                             page — its USB panel, 'connect a USB
                             device…' — on real hardware
@@ -116,7 +118,7 @@ const PROMPT: &[u8] = b"$ ";
 
 /// What the session is, as a terminal's title: OSC 0, the escape a program
 /// sets its window's title with, which a terminal shows and does not print.
-const TITLE: &[u8] = b"\x1b]0;humility \xe2\x80\x94 Hubris on an STM32G031 Nucleo\x07";
+const TITLE: &[u8] = b"\x1b]0;humility \xe2\x80\x94 Hubris on an STM32 Nucleo\x07";
 
 pub(crate) fn accept_requests(listener: TcpListener, door: Arc<FrontDoor>) {
     for stream in listener.incoming() {
@@ -162,11 +164,16 @@ fn session(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
                 }
                 _ => out.write_all(format!("upload NAME SIZE, then SIZE bytes; at most {} MiB\n", UPLOAD_LIMIT >> 20).as_bytes())?,
             },
+            Some("button") => {
+                // B1 on a Nucleo-144: PC13, pulled down, high while held.
+                let pressed = ["pin PC13 high\n", "pin PC13 low\n"].iter().all(|line| std::fs::write("/dev/board", line).is_ok());
+                out.write_all(if pressed { b"pressed and released B1\n" } else { b"the board has no button to press\n" })?
+            }
             Some("flash") => match words.get(1) {
                 Some(name) => door.flash(name, &out)?,
                 None => out.write_all(b"flash NAME: an archive `archives` lists, or one uploaded\n")?,
             },
-            Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, help and exit\n").as_bytes())?,
+            Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, button, flash, help and exit\n").as_bytes())?,
         }
         out.write_all(PROMPT)?;
     }
