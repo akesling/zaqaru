@@ -224,7 +224,7 @@ impl Machine {
 
     /// Runs for `budget` cycles, or until something stops it. A halted core
     /// runs nothing, though a reset asked for still answers; a core told to
-    /// step runs one instruction and halts again.
+    /// step runs one instruction, even on a budget of none, and halts again.
     pub fn run(&mut self, budget: u64) -> Outcome {
         if self.bus.scs.reset_requested {
             return Outcome::SystemReset;
@@ -232,9 +232,11 @@ impl Machine {
         if self.debug.halted {
             return Outcome::Halted;
         }
+        // A step is one instruction whatever the budget: a debugger that
+        // asked for one is owed it, even by a caller with no time to give.
         if self.debug.stepping {
             self.debug.stepping = false;
-            let outcome = self.execute_for(budget.min(1));
+            let outcome = self.execute_for(1);
             if self.debug.halted {
                 return self.settle(outcome);
             }

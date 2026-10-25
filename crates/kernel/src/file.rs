@@ -1027,6 +1027,22 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             Ok(file) => file.offset,
             Err(errno) => return Outcome::Done(errno.as_result()),
         };
+        // A USB device file is the one character device with a position:
+        // its reads are its descriptors from an offset, and Linux's usbfs
+        // seeks it from the start or the current position — nusb rewinds it
+        // before it reads them.
+        if let Ok(Backing::Usb(_)) = self.files.description(fd).map(|file| file.backing) {
+            let to = match whence {
+                seek::SET => requested,
+                seek::CURRENT => current as i64 + requested,
+                _ => return Outcome::Done(Errno::Invalid.as_result()),
+            };
+            if to < 0 {
+                return Outcome::Done(Errno::Invalid.as_result());
+            }
+            self.files.description_mut(fd).expect("the description was here a moment ago").offset = to as u64;
+            return Outcome::Done(to);
+        }
         // A console stream has no position to seek: `ESPIPE` is what Linux
         // answers for a pipe or a character device, and what every libc's
         // `ftell` translates into "this stream is not seekable".

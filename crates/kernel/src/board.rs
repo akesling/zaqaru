@@ -200,18 +200,21 @@ impl Board {
         self.collect();
         match outcome {
             Outcome::Budget | Outcome::Asleep | Outcome::Halted => {}
-            Outcome::SystemReset => {
-                self.console.push(format!("{} system reset", self.stamp()));
-                if let Err(e) = self.machine.reset() {
-                    self.console.push(format!("board: reset failed: {e}"));
-                }
-            }
+            Outcome::SystemReset => self.take_reset(),
             outcome => {
                 self.console.push(format!("{} halted: {outcome:?}", self.stamp()));
                 if let Some(stop) = self.debugger.stopped(outcome) {
                     self.reply(&gdb::frame(&stop));
                 }
             }
+        }
+    }
+
+    /// A system reset, as SYSRESETREQ asks for one.
+    fn take_reset(&mut self) {
+        self.console.push(format!("{} system reset", self.stamp()));
+        if let Err(e) = self.machine.reset() {
+            self.console.push(format!("board: reset failed: {e}"));
         }
     }
 
@@ -353,10 +356,23 @@ impl Board {
         if !response.is_empty() {
             self.usb_responses.push_back(response);
         }
+        // A reset asked for through AIRCR happens now, as it does on the
+        // part, rather than when the board is next moved on: a debugger
+        // that resets and then asks whether the core is halted at the
+        // vector expects the answer to be yes.
+        if self.machine.bus.scs.reset_requested {
+            self.take_reset();
+        }
+        // And a step, which a core takes in a cycle: a debugger polls for
+        // the halt after it for a hundred milliseconds, not for however long
+        // until the board is next moved on.
+        if self.machine.debug.stepping {
+            self.machine.run(1);
+        }
         if was_halted && !self.machine.halted() {
             self.rebase(self.now);
         }
-        // A debugger's write can change a pin, or reset the part.
+        // A debugger's write can change a pin.
         self.collect();
         crate::abi::StoreOutcome::Present
     }

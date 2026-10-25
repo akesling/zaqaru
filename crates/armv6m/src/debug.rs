@@ -187,6 +187,17 @@ impl Machine {
         if !self.debug.halted {
             self.debug.halt(DFSR_HALTED);
         }
+        self.wake_for_debug();
+    }
+
+    /// A halt wakes a core out of `wfi`, as on the part: the `wfi` is done,
+    /// and the core resumes after it. Without this a debugger halting an
+    /// idle Hubris — whose idle task is a `wfi` loop — would find it both
+    /// halted and asleep, which no core is.
+    fn wake_for_debug(&mut self) {
+        if self.debug.halted {
+            self.sleeping = false;
+        }
     }
 
     pub fn halted(&self) -> bool {
@@ -207,7 +218,7 @@ impl Machine {
                     | (d.maskints as u32) * C_MASKINTS
                     | S_REGRDY
                     | (d.halted as u32) * S_HALT
-                    | (self.sleeping as u32) * S_SLEEP
+                    | ((self.sleeping && !d.halted) as u32) * S_SLEEP
                     | (d.lockup as u32) * S_LOCKUP
                     | ((self.retired != d.retired_at_read) as u32) * S_RETIRE_ST
                     | (d.reset_seen as u32) * S_RESET_ST;
@@ -302,6 +313,7 @@ impl Machine {
             }
             a => return answers(a),
         }
+        self.wake_for_debug();
         true
     }
 

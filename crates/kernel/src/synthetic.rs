@@ -165,7 +165,8 @@ pub fn tree(entries: Vec<(Vec<u8>, Node)>) -> Vec<u8> {
 
 /// `/sys`: as much of Linux's as finds USB devices — `bus/usb/devices`,
 /// a directory per device with its attributes, and inside it a directory
-/// per interface with theirs, which is where libusb and nusb look.
+/// per interface with theirs, which is where libusb and nusb look — and
+/// the device classes probe-rs walks besides.
 pub fn sys(usb: &crate::usb::Usb) -> Vec<u8> {
     use crate::usb::{DEVICE_ATTRIBUTES, INTERFACE_ATTRIBUTES};
     let mut devices = Vec::new();
@@ -189,7 +190,18 @@ pub fn sys(usb: &crate::usb::Usb) -> Vec<u8> {
         devices.push((name.into_bytes(), Node::Directory(entries)));
     }
     let usb = Node::Directory(vec![(b"devices".to_vec(), Node::Directory(devices))]);
-    tree(vec![(b"bus".to_vec(), Node::Directory(vec![(b"usb".to_vec(), usb)]))])
+    // And the classes a device search walks on its way, present and empty:
+    // there are no terminals or HID devices here, and a directory that is
+    // missing rather than empty is a system with no sysfs at all — which
+    // serialport, inside probe-rs, panics on.
+    let class = Node::Directory(vec![
+        (b"hidraw".to_vec(), Node::Directory(Vec::new())),
+        (b"tty".to_vec(), Node::Directory(Vec::new())),
+    ]);
+    tree(vec![
+        (b"bus".to_vec(), Node::Directory(vec![(b"usb".to_vec(), usb)])),
+        (b"class".to_vec(), class),
+    ])
 }
 
 /// `/dev`, with the character devices a libc actually opens.

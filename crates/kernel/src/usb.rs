@@ -177,7 +177,7 @@ struct Urb {
 
 /// An open device file: which device, and its URBs.
 #[derive(Clone, Debug, Default)]
-struct Handle {
+pub(crate) struct Handle {
     device: usize,
     pending: Vec<Urb>,
     completed: VecDeque<Urb>,
