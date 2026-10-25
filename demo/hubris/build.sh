@@ -1,5 +1,5 @@
 #!/bin/sh
-# Makes the Hubris bench: Hubris's STM32G031 demo built, a container that
+# Makes the Hubris bench: Hubris's STM32H753 demo built, a container that
 # holds it with Humility and a front door, and that container baked into a
 # module whose kernel runs the board. Then checks the module under Node.
 # Wants docker, node, a Hubris checkout, and some minutes the first time
@@ -56,19 +56,23 @@ else
   }
 fi
 
-# The board boots the G031 demo; the G070 demo — ping over USART1 — is
-# there to flash onto it (`flash g070` at the bench's prompt), and so is
-# anything else a user uploads.
+# The board boots the H753 demo; the G031 and G070 demos — the G070's
+# pings over USART1 — are there to flash onto it (`flash g070` at the
+# bench's prompt), and so is anything else a user uploads.
 mkdir -p "$work/bench/archives"
-for app in g031 g070; do
+for app in g031 g070 h753; do
+  case $app in
+    h7*) dir=demo-stm32h7-nucleo ;;
+    *) dir=demo-stm32g0-nucleo ;;
+  esac
   echo "build: Hubris, app-$app.toml"
-  (cd "$hubris" && cargo xtask dist "app/demo-stm32g0-nucleo/app-$app.toml")
+  (cd "$hubris" && cargo xtask dist "app/$dir/app-$app.toml")
   cp "$hubris/target/demo-stm32${app}-nucleo/dist/default/build-demo-stm32${app}-nucleo-image-default.zip" \
     "$work/bench/archives/$app.zip"
 done
-dist="$hubris/target/demo-stm32g031-nucleo/dist/default"
+dist="$hubris/target/demo-stm32h753-nucleo/dist/default"
 cp "$dist/final.bin" "$work/bench/final.bin"
-cp "$work/bench/archives/g031.zip" "$work/bench/hubris.zip"
+cp "$work/bench/archives/h753.zip" "$work/bench/hubris.zip"
 
 echo "build: Humility $humility_commit"
 if [ ! -d "$work/humility" ]; then

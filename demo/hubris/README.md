@@ -1,18 +1,21 @@
 # The Hubris bench
 
 [Hubris](https://github.com/oxidecomputer/hubris), Oxide's microcontroller
-operating system, running on an emulated STM32G031 Nucleo, with
+operating system, running on an emulated STM32H753 Nucleo-144 — the
+`demo-stm32h753-nucleo` app, all 24 tasks, unmodified — with
 [Humility](https://github.com/oxidecomputer/humility), its debugger,
-attached to it, all inside one zaqaru container, in a browser.
+attached to it, all inside one zaqaru container, in a browser. The G0
+Nucleos are there too, to flash onto the bench.
 
 ```
 browser: a terminal and a board panel
  └─ zaqaru module (wasm)
      ├─ kernel
-     │   ├─ board: Cortex-M0+ + STM32G031, running Hubris's G031 demo image
-     │   │   └─ debug port: SW-DP and AHB-AP
-     │   │       ├─ CMSIS-DAP v2 probe, served as a USB device (services/usb)
-     │   │       └─ GDB remote server on 127.0.0.1:3333
+     │   ├─ board: Cortex-M7 + STM32H753, running Hubris's H753 demo image
+     │   │   ├─ debug port: SW-DP v2; AP0 the M7's AHB-AP, AP1 D3's, AP2 the debug APB
+     │   │   │   ├─ CMSIS-DAP v2 probe, served as a USB device (services/usb)
+     │   │   │   └─ GDB remote server on 127.0.0.1:3333
+     │   │   └─ Ethernet, cabled to a host: IPv6, UDP, ping
      │   └─ usbfs and sysfs: /dev/bus/usb/001/002, /sys/bus/usb/devices/1-1
      └─ processes (x86-64, interpreted)
          ├─ zaqaru-m0 door   port 80: a session, a line at a time
@@ -45,13 +48,15 @@ python3 -m http.server -d . 8000
 ```
 
 The page opens on a terminal, in session with the container, and the
-board beside it: its LED drawn as PC6 drives it, its state, time and
-registers, read from the container's store. "show the machine" opens the
+board beside it: its LEDs drawn as their pins drive them (green PB0, red
+PB14, yellow PE1), its state, time and registers, and what the host on its
+Ethernet cable last heard, read from the container's store. "show the machine" opens the
 rest of the debugger — processes, files, the timeline — and the slider
 seeks the whole bench, board included, to any instant of the run.
 
-`build.sh` builds Hubris's `app/demo-stm32g0-nucleo/app-g031.toml` on this
-host. It builds Humility (pinned, as released, with its default features),
+`build.sh` builds Hubris's `app/demo-stm32h7-nucleo/app-h753.toml`, and
+the G031 and G070 demos to flash in its place, on this host. It builds
+Humility (pinned, as released, with its default features),
 `zaqaru-m0` and zaqaru as Linux x86-64 programs, natively on such a host and
 otherwise in a container from `builder.Dockerfile`. Then it builds the
 bench image from `Dockerfile`, bakes it, and checks the module under Node
@@ -88,15 +93,23 @@ but whether a browser lets it be claimed is untested.
 | --- | --- |
 | `help` | this list |
 | `humility tasks` | Hubris's tasks, their state, and what each waits on |
-| `humility tasks -s pong` | a task's stack, unwound through its frames |
+| `humility tasks -s udpecho` | a task's stack, unwound through its frames |
 | `humility map` | the memory regions each task can reach, from the archive |
 | `humility readvar TICKS` | a kernel variable, read live |
 | `humility ringbuf` | the ring buffers |
-| `humility hiffy -c UserLeds.led_toggle -a index=0` | an IPC call made on the board, through the hiffy task: the LED changes |
+| `humility hiffy -c UserLeds.led_toggle -a index=2` | an IPC call made on the board, through the hiffy task: the yellow LED changes |
+| `humility i2c -c 2 -p F --scan` | a scan of I2C2, through hiffy and the I2C driver: nothing on a bare Nucleo |
+| `humility hiffy -c Update.prep_image_update` | the update server erases flash bank 2 |
 | `humility flash -F` | flashes the archive's image onto the board through probe-rs's own flash algorithm, then resets it |
 | `humility flash --verify` | reads the flash back and compares it with the archive |
-| `humility -p VID:PID tasks` | the same, through a probe connected from the page |
-| `board` | the board itself: running or halted, simulated time, LED, faults, exceptions taken |
+| `udp hello` | a datagram to udpecho's port 7, from the host on the board's Ethernet cable, and its echo |
+| `udp 998 TEXT` | the same to any port |
+| `ping` | an ICMPv6 echo request to the board, and its reply |
+| `button` | presses and releases B1, PC13: the user_button task toggles the red LED |
+| `archives` | the Hubris builds there are to flash |
+| `flash g031` | makes the board the part the archive was built for, erased, and flashes it — `g031`, `g070`, `h753`, or one uploaded |
+| `humility -p VID:PID …` | the same, through a probe connected from the page |
+| `board` | the board itself: running or halted, simulated time, LEDs, faults, exceptions taken, the network |
 | `exit` | end the session |
 
 There is no shell behind the prompt: Humility, the board and nothing else.
@@ -105,18 +118,37 @@ Outside the page, `zaqaru run web/demo/hubris.wasm -p 8080:80` and
 
 ## What is and is not modelled
 
-- The whole ARMv6-M instruction set and system model: exceptions,
-  priorities, both stacks, privilege, SysTick, the NVIC, the MPU. Tasks
-  run unprivileged under it, as on the part.
-- Of the STM32G031: RCC with its oscillators settled, GPIO, and the flash
-  interface — unlocking, page and mass erase, double-word programming, the
-  status and error flags — with FLASHSIZE in system memory. Every other
+- The ARMv7E-M instruction set of a Cortex-M7, Thumb-2 and DSP, and its
+  FPv5 double-precision FPU, checked against QEMU's; and the whole ARMv6-M
+  instruction set for the G0s. The system model of each: exceptions,
+  priorities and their grouping, BASEPRI and FAULTMASK, the configurable
+  faults and their status registers, both stacks, privilege, SysTick, the
+  NVIC, the MPU. Tasks run unprivileged under it, as on the part.
+- Of the STM32H753: its memories (ITCM, DTCM, AXI SRAM, SRAM1–4, backup
+  SRAM, two flash banks); PWR, RCC and flash wait states with everything
+  startup waits on settled at once; GPIO A–K, EXTI and SYSCFG; the USARTs;
+  I2C1–4 with an empty bus; SPI1–6 with nothing on MISO; the
+  general-purpose timers as time bases; the RNG, deterministic; DBGMCU; the
+  dual-bank flash interface — flash-word programming, sector and bank
+  erase, the option bytes' bank swap; and Ethernet — the MAC, its DMA and
+  descriptor rings, MDIO to a LAN8742A with its link up. Every other
   peripheral register reads back what was written.
-- The debug architecture: an ADIv5 SW-DP and AHB-AP, the ROM table and
-  CoreSight IDs, DHCSR halting and stepping, DCRSR register transfer,
-  DEMCR vector catch, DFSR, the four BPU comparators. The DWT's registers
-  read back, and its comparators never match.
-- Time: one instruction is one cycle of the 16 MHz clock Hubris configures,
-  and the board runs at that rate against the container's clock. Exception
-  entry costs no cycles.
-- No UART, no interrupt-raising peripherals, no option-byte programming.
+- Of the STM32G0s: RCC, GPIO, the USARTs and the flash interface.
+- The debug architecture: each part's debug port and APs, the ROM tables
+  and CoreSight IDs, DHCSR halting and stepping, DCRSR register transfer,
+  DEMCR vector catch, DFSR, the breakpoint unit (an M7's FPB, an M0+'s
+  BPU), the DWT's registers and an M7's cycle counter. Watchpoints never
+  match.
+- The network: the board's Ethernet is cabled to one host, which speaks
+  IPv6 on its link-local address — neighbour discovery, echo, UDP — and is
+  driven by the door's `udp` and `ping`. The container's own programs have
+  no IPv6 sockets to reach it with.
+- Time: one instruction is one cycle of the clock Hubris configures — 400
+  MHz on the H7, 16 MHz on a G0 — and the board runs at that rate against
+  the container's clock, which an H7 in a browser cannot keep up with: its
+  simulated time runs slower than the wall's, and the kernel gives the
+  difference up rather than racing. Exception entry, a bus access and a
+  byte on a wire cost no cycles.
+- Not modelled: caches (they are registers that read back), the H7's
+  other DMA engines, QSPI, the hash and crypto blocks, USB, and anything
+  analog.
