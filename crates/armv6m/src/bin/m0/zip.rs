@@ -1,8 +1,10 @@
 //! One file out of a zip archive: enough to read what a Hubris build
 //! archive says about itself — `img/flash.ron`, the part it is for —
-//! without running a program to ask.
+//! without running a program to ask. Hubris writes its archives with
+//! bzip2, so that is read too, beside the stored and deflated entries
+//! every other zip has.
 
-/// The bytes of the entry named `name`, stored or deflated; `None` if the
+/// The bytes of the entry named `name`, stored, deflated or bzip2; `None` if the
 /// archive has no such entry or is not one this reads.
 pub fn entry(archive: &[u8], name: &str) -> Option<Vec<u8>> {
     let u16_at = |at: usize| Some(u16::from_le_bytes(archive.get(at..at + 2)?.try_into().ok()?) as usize);
@@ -33,6 +35,11 @@ pub fn entry(archive: &[u8], name: &str) -> Option<Vec<u8>> {
             return match method {
                 0 => Some(bytes.to_vec()),
                 8 => miniz_oxide::inflate::decompress_to_vec(bytes).ok(),
+                12 => {
+                    let mut out = Vec::new();
+                    std::io::Read::read_to_end(&mut bzip2_rs::DecoderReader::new(bytes), &mut out).ok()?;
+                    Some(out)
+                }
                 _ => None,
             };
         }
@@ -97,5 +104,17 @@ mod tests {
         assert_eq!(entry(&zip, "app.toml").as_deref(), Some(&b"name = \"x\""[..]));
         assert_eq!(entry(&zip, "missing"), None);
         assert_eq!(entry(b"not a zip", "img/flash.ron"), None);
+    }
+
+    /// What a Hubris archive holds: entries compressed with bzip2.
+    #[test]
+    fn a_bzip2_entry_reads_back() {
+        // `bz2.compress` of the flash.ron below.
+        let compressed = vec![66, 90, 104, 57, 49, 65, 89, 38, 83, 89, 29, 197, 126, 206, 0, 0, 5, 223, 128, 64, 16, 80, 100, 88, 144, 16, 138, 12, 0, 10, 98, 192, 64, 32, 0, 49, 64, 0, 1, 147, 32, 198, 104, 212, 109, 19, 210, 99, 212, 39, 168, 248, 68, 203, 152, 205, 140, 131, 165, 221, 85, 108, 173, 123, 16, 79, 64, 31, 107, 108, 108, 159, 139, 185, 34, 156, 40, 72, 14, 226, 191, 103, 0];
+        let zip = archive(&[("img/flash.ron", 12, compressed)]);
+        assert_eq!(
+            entry(&zip, "img/flash.ron").as_deref(),
+            Some(&b"(\n    chip: Some(\"STM32G070KBTx\"),\n)\n"[..])
+        );
     }
 }
