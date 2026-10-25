@@ -26,7 +26,8 @@ out=$(cd "$out" && pwd)
 work="$out/hubris-build"
 mkdir -p "$work/bench"
 
-# Humility at a known commit, with the GDB probe the bench needs on top.
+# Humility at a known commit, as Oxide ships it: nothing patched, default
+# features, so probe-rs finds the board's USB probe by itself.
 humility_commit=28c8454dee325a3f6a799feeecd9329c9fa8d657
 
 # A registry lookup that times out is worth a second try, and a third.
@@ -61,17 +62,15 @@ dist="$hubris/target/demo-stm32g031-nucleo/dist/default"
 cp "$dist/final.bin" "$work/bench/final.bin"
 cp "$dist/build-demo-stm32g031-nucleo-image-default.zip" "$work/bench/hubris.zip"
 
-echo "build: Humility $humility_commit, with the GDB probe"
+echo "build: Humility $humility_commit"
 if [ ! -d "$work/humility" ]; then
   git clone -q https://github.com/oxidecomputer/humility.git "$work/humility"
 fi
 # The work directory is this script's: put the checkout back to the pinned
-# commit and the patch on it, whatever a previous run left.
+# commit, whatever a previous run left — untracked files too, but not
+# ignored ones, which are the build cache.
 git -C "$work/humility" checkout -q --force --detach "$humility_commit"
-# Untracked files too — the patch adds one — but not ignored ones, which
-# are the build cache.
 git -C "$work/humility" clean -q -fd
-git -C "$work/humility" apply "$here/humility-gdb-probe.patch"
 [ "$native" = 1 ] && rustup toolchain install 1.98.1 --profile minimal >/dev/null
 # Built as tight as Cargo's profile allows, from the environment so that
 # Humility's own manifest is untouched: every command is one interpreted run
@@ -79,7 +78,7 @@ git -C "$work/humility" apply "$here/humility-gdb-probe.patch"
 # release profile, measured; it catches no panics, so abort loses nothing.)
 linux 'cd "$W/humility" && CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
   CARGO_PROFILE_RELEASE_PANIC=abort CARGO_PROFILE_RELEASE_DEBUG=false \
-  cargo +1.98.1 build --release --no-default-features -p humility-bin \
+  cargo +1.98.1 build --release -p humility-bin \
   && strip -o "$W/bench/humility" target/release/humility'
 
 echo "build: zaqaru and zaqaru-m0"
