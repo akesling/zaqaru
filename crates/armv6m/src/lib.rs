@@ -36,12 +36,15 @@ pub mod debug;
 pub mod exception;
 pub mod exec;
 pub mod flash;
+pub mod flash_h7;
 pub mod fpu;
-pub mod part;
 pub mod gdb;
+pub mod gpio;
+pub mod part;
 pub mod scs;
 pub mod state;
 pub mod stm32g0;
+pub mod stm32h7;
 pub mod thumb2;
 pub mod usart;
 
@@ -128,7 +131,7 @@ pub enum Outcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// A GPIO port's output changed.
-    Pin { cycle: u64, edge: stm32g0::Edge },
+    Pin { cycle: u64, edge: gpio::Edge },
     /// A USART transmitted a byte.
     Serial { cycle: u64, byte: usart::Byte },
     /// A HardFault was taken. `pc` is the instruction it was taken at;
@@ -137,7 +140,7 @@ pub enum Event {
 }
 
 pub struct Machine {
-    /// Which G0 this is.
+    /// Which STM32 this is.
     pub part: part::Part,
     /// Which processor: the part's own Cortex-M0+, or a Cortex-M7.
     pub core: Core,
@@ -211,9 +214,15 @@ impl Machine {
 
     /// A G0 of the given part with `image` in flash, out of reset.
     pub fn stm32g0(part: part::Part, image: &[u8]) -> Result<Machine, String> {
+        Machine::new(part, image)
+    }
+
+    /// The given part, with its own processor and `image` in flash, out of
+    /// a power-on reset.
+    pub fn new(part: part::Part, image: &[u8]) -> Result<Machine, String> {
         let mut machine = Machine {
             part,
-            core: Core::CortexM0Plus,
+            core: part.core(),
             it_active: false,
             exclusive: None,
             branch_to: None,
@@ -232,7 +241,13 @@ impl Machine {
             tick_due: u64::MAX,
             granted: Box::new([[Grant::NONE; GRANTS]; 3]),
         };
-        machine.reset()?;
+        machine.bus.scs.boot = part.boot();
+        machine.bus.scs.irq_lines = match part.family {
+            part::Family::G0 => 32,
+            // 150 lines, as ICTR counts them.
+            part::Family::H7 => 160,
+        };
+        machine.reset_core()?;
         Ok(machine)
     }
 
@@ -245,18 +260,24 @@ impl Machine {
     /// A system reset: the processor and peripherals back to their reset
     /// state, memory left as it was, and the boot vector taken (B1.5.5).
     pub fn reset(&mut self) -> Result<(), String> {
+        self.bus.reset_soc();
+        self.reset_core()
+    }
+
+    /// The processor's half of a reset.
+    fn reset_core(&mut self) -> Result<(), String> {
         self.cpu = Cpu::default();
         self.exclusive = None;
         self.bus.scs.core = self.core;
         self.bus.scs.reset();
-        self.bus.soc.reset();
-        self.bus.flash_interface.reset();
         self.sleeping = false;
         *self.granted = [[Grant::NONE; GRANTS]; 3];
         self.ticked_at = self.cycles;
         self.tick_due = u64::MAX;
+        let boot = self.part.boot();
         let vector = |bus: &mut Bus, n: u32| {
-            bus.read(4 * n, 4).map_err(|Unmapped| format!("no vector table at 0x{:08x}", 4 * n))
+            let at = boot + 4 * n;
+            bus.read(at, 4).map_err(|Unmapped| format!("no vector table at 0x{at:08x}"))
         };
         self.cpu.msp = vector(&mut self.bus, 0)? & !3;
         let entry = vector(&mut self.bus, 1)?;
@@ -510,8 +531,9 @@ impl Machine {
     /// event log.
     pub(crate) fn drain_edges(&mut self) {
         let cycle = self.cycles;
-        self.events.extend(self.bus.soc.edges.drain(..).map(|edge| Event::Pin { cycle, edge }));
-        self.events.extend(self.bus.soc.serial.drain(..).map(|byte| Event::Serial { cycle, byte }));
+        let (edges, serial) = self.bus.soc.outputs();
+        self.events.extend(edges.drain(..).map(|edge| Event::Pin { cycle, edge }));
+        self.events.extend(serial.drain(..).map(|byte| Event::Serial { cycle, byte }));
     }
 
     /// Pends every external interrupt whose line a peripheral asserts. A
@@ -520,10 +542,18 @@ impl Machine {
     /// still asserted when its handler returns, or when it is unmasked, is
     /// pending again, as the NVIC makes a level-triggered line.
     pub(crate) fn sample_interrupts(&mut self) {
-        let lines = self.bus.soc.interrupts();
-        if lines != 0 {
-            self.bus.scs.nvic.pending.set_irq_word(0, lines, true);
+        for (word, lines) in self.bus.soc.interrupts().into_iter().enumerate() {
+            if lines != 0 {
+                self.bus.scs.nvic.pending.set_irq_word(32 * word as u32, lines, true);
+            }
         }
+    }
+
+    /// Something outside the chip drives a pin to a level — a button
+    /// pressed, say — or lets go of it (`None`). Port 0 is A.
+    pub fn drive(&mut self, port: usize, pin: u8, level: Option<bool>) {
+        self.bus.soc.drive(port, pin, level);
+        self.sample_interrupts();
     }
 
     /// A byte arriving on USART `port`'s line (0 for USART1): taken if the

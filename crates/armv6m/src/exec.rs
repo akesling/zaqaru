@@ -156,7 +156,7 @@ impl Machine {
             // The write may have started, stopped or reloaded it.
             self.sync_systick();
         }
-        if !self.bus.soc.edges.is_empty() || !self.bus.soc.serial.is_empty() {
+        if self.bus.soc.has_outputs() {
             self.drain_edges();
         }
         // A store to a peripheral or to the NVIC can raise or unmask an

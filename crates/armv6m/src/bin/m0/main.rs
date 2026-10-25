@@ -20,6 +20,7 @@ mod zip;
 mod serve;
 
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use armv6m::scs::exception;
@@ -27,11 +28,20 @@ use armv6m::stm32g0::Edge;
 use armv6m::{Event, Machine, Outcome};
 
 /// Hubris's G0 demo runs SysTick off the 16 MHz HSI.
-pub(crate) const CYCLES_PER_MS: u64 = 16_000;
+/// The board's clock, in cycles per millisecond: its part's.
+static CYCLES_PER_MS: AtomicU64 = AtomicU64::new(16_000);
+
+pub(crate) fn cycles_per_ms() -> u64 {
+    CYCLES_PER_MS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_part_clock(part: &armv6m::part::Part) {
+    CYCLES_PER_MS.store(part.mhz() * 1000, Ordering::Relaxed);
+}
 
 pub(crate) fn usage() -> ExitCode {
-    eprintln!("usage: zaqaru-m0 <final.bin> [--part stm32g031|stm32g070|…] [--core m0+|m7] [--ms N] [--quiet]");
-    eprintln!("       zaqaru-m0 serve <final.bin> [--gdb ADDR] [--listen ADDR] [--archive ZIP] [--board FILE]");
+    eprintln!("usage: zaqaru-m0 <final.bin> [--part stm32g031|stm32g070|stm32h753|…] [--core m0+|m7] [--ms N] [--quiet]");
+    eprintln!("       zaqaru-m0 serve <final.bin> [--part NAME] [--gdb ADDR] [--listen ADDR] [--archive ZIP] [--board FILE]");
     eprintln!("       zaqaru-m0 door [--listen ADDR] [--probe ADDR] [--archive ZIP] [--humility PATH]");
     ExitCode::from(2)
 }
@@ -48,7 +58,7 @@ fn main() -> ExitCode {
     let mut ms: u64 = 2000;
     let mut quiet = false;
     let mut part = armv6m::part::STM32G031;
-    let mut core = armv6m::state::Core::CortexM0Plus;
+    let mut core = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--part" => match args.next().and_then(|v| armv6m::part::Part::named(&v)) {
@@ -58,8 +68,8 @@ fn main() -> ExitCode {
             // The part's own Cortex-M0+, or a Cortex-M7 in its place: for
             // running an image built for ARMv7E-M on the G0's peripherals.
             "--core" => match args.next().as_deref() {
-                Some("m0+" | "m0plus") => core = armv6m::state::Core::CortexM0Plus,
-                Some("m7") => core = armv6m::state::Core::CortexM7,
+                Some("m0+" | "m0plus") => core = Some(armv6m::state::Core::CortexM0Plus),
+                Some("m7") => core = Some(armv6m::state::Core::CortexM7),
                 _ => return usage(),
             },
             "--ms" => match args.next().and_then(|v| v.parse().ok()) {
@@ -79,7 +89,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut machine = match Machine::stm32g0(part, &bytes).and_then(|mut m| m.set_core(core).map(|()| m)) {
+    set_part_clock(&part);
+    let machine = Machine::new(part, &bytes).and_then(|mut m| match core {
+        Some(core) if core != m.core => m.set_core(core).map(|()| m),
+        _ => Ok(m),
+    });
+    let mut machine = match machine {
         Ok(machine) => machine,
         Err(e) => {
             eprintln!("zaqaru-m0: {e}");
@@ -87,14 +102,14 @@ fn main() -> ExitCode {
         }
     };
 
-    let end = ms * CYCLES_PER_MS;
+    let end = ms * cycles_per_ms();
     let started = Instant::now();
     let mut shown = 0;
     let mut faults = 0;
     let mut resets = 0;
     let outcome = loop {
         // In slices, so events print as they happen rather than at the end.
-        let slice = (end - machine.cycles).min(10 * CYCLES_PER_MS);
+        let slice = (end - machine.cycles).min(10 * cycles_per_ms());
         let outcome = machine.run(slice);
         for event in &machine.events[shown..] {
             if let Event::Fault { .. } = event {
@@ -153,8 +168,8 @@ fn main() -> ExitCode {
         if mpu.ctrl & 1 != 0 { "on" } else { "off" },
         mpu.regions.iter().filter(|r| r.rasr & 1 != 0).count(),
     );
-    if !machine.bus.soc.unmodelled.is_empty() {
-        let regs: Vec<String> = machine.bus.soc.unmodelled.iter().map(|a| format!("0x{a:08x}")).collect();
+    if !machine.bus.soc.unmodelled().is_empty() {
+        let regs: Vec<String> = machine.bus.soc.unmodelled().iter().map(|a| format!("0x{a:08x}")).collect();
         println!("unmodelled peripheral registers touched: {}", regs.join(" "));
     }
 
@@ -165,7 +180,7 @@ fn main() -> ExitCode {
 }
 
 pub(crate) fn ms_at(cycles: u64) -> f64 {
-    cycles as f64 / CYCLES_PER_MS as f64
+    cycles as f64 / cycles_per_ms() as f64
 }
 
 pub(crate) fn describe(event: &Event) -> String {

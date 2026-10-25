@@ -1,4 +1,4 @@
-//! The G0's USARTs, as a serial console: what a byte written to TDR
+//! The STM32 USART, as the G0s and the H7s both have it, as a serial console: what a byte written to TDR
 //! becomes, what a byte arriving is, and when each raises its interrupt.
 //!
 //! Modelled at the level a driver sees, not the wire's: a byte written to
@@ -10,15 +10,14 @@
 //!
 //! The interrupt is the reference manual's (RM0444 33.8): the USART's one
 //! line is asserted while an enabled event holds — TXE with TXEIE, TC with
-//! TCIE, RXNE or ORE with RXNEIE — and the machine samples it into the NVIC
+//! TCIE, RXNE or ORE with RXNEIE, and the FIFO thresholds with their own
+//! enables, which the H7's driver uses — and the machine samples it into the NVIC
 //! (see `Machine::sample_interrupts`). A level, not an edge, so a driver
 //! that leaves TXEIE set with nothing to send is interrupted again, as on
 //! the part.
 
 use std::collections::VecDeque;
 
-/// The two USARTs a G0 has: their bases, and their interrupt numbers.
-pub const USARTS: [(u32, u32); 2] = [(0x4001_3800, 27), (0x4000_4400, 28)];
 pub const SIZE: u32 = 0x400;
 
 // CR1.
@@ -28,6 +27,9 @@ const TE: u32 = 1 << 3;
 const RXNEIE: u32 = 1 << 5;
 const TCIE: u32 = 1 << 6;
 const TXEIE: u32 = 1 << 7;
+// CR3: the FIFO thresholds' interrupts.
+const TXFTIE: u32 = 1 << 23;
+const RXFTIE: u32 = 1 << 28;
 // ISR.
 const ORE: u32 = 1 << 3;
 const RXNE: u32 = 1 << 5;
@@ -35,6 +37,11 @@ const TC: u32 = 1 << 6;
 const TXE: u32 = 1 << 7;
 const TEACK: u32 = 1 << 21;
 const REACK: u32 = 1 << 22;
+/// The transmit FIFO is empty, and so at any threshold: a byte written
+/// leaves at once.
+const TXFE: u32 = 1 << 23;
+const RXFT: u32 = 1 << 26;
+const TXFT: u32 = 1 << 27;
 // ICR.
 const ORECF: u32 = 1 << 3;
 const TCCF: u32 = 1 << 6;
@@ -68,12 +75,14 @@ impl Usart {
     }
 
     fn isr(&self) -> u32 {
-        let mut isr = TXE;
+        let mut isr = TXE | TXFE | TXFT;
         if self.tc {
             isr |= TC;
         }
         if !self.received.is_empty() {
-            isr |= RXNE;
+            // One byte waiting is at the threshold for the queue standing
+            // in for the FIFO.
+            isr |= RXNE | RXFT;
         }
         if self.overrun {
             isr |= ORE;
@@ -151,7 +160,9 @@ impl Usart {
         self.cr1 & UE != 0
             && (self.cr1 & TXEIE != 0 && isr & TXE != 0
                 || self.cr1 & TCIE != 0 && isr & TC != 0
-                || self.cr1 & RXNEIE != 0 && isr & (RXNE | ORE) != 0)
+                || self.cr1 & RXNEIE != 0 && isr & (RXNE | ORE) != 0
+                || self.cr3 & TXFTIE != 0 && isr & TXFT != 0
+                || self.cr3 & RXFTIE != 0 && isr & RXFT != 0)
     }
 }
 

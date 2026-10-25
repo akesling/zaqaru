@@ -13,48 +13,83 @@
 //! | `0x0800_0000..0x0801_0000`  | main flash, 64 KiB                    |
 //! | `0x1FFF_0000..0x2000_0000`  | system memory and option bytes        |
 //! | `0x2000_0000..0x2000_2000`  | SRAM, 8 KiB                           |
-//! | `0x4002_2000..0x4002_2400`  | the flash interface; see [`crate::flash`] |
 //! | `0x4000_0000..0x5000_1800`  | peripherals; see [`crate::stm32g0`]   |
 //! | `0xE000_0000..0xE010_0000`  | the PPB; see [`crate::scs`]           |
+//!
+//! And the H743/753's:
+//!
+//! | range                       | what                                  |
+//! |-----------------------------|---------------------------------------|
+//! | `0x0000_0000..0x0001_0000`  | ITCM, 64 KiB                          |
+//! | `0x0800_0000..0x0820_0000`  | main flash, two banks of 1 MiB        |
+//! | `0x1FF0_0000..0x1FF2_0000`  | system memory: the UID, FLASH_SIZE    |
+//! | `0x2000_0000..0x2002_0000`  | DTCM, 128 KiB                         |
+//! | `0x2400_0000..0x2408_0000`  | AXI SRAM, 512 KiB                     |
+//! | `0x3000_0000..0x3004_8000`  | SRAM1, 2 and 3, 288 KiB               |
+//! | `0x3800_0000..0x3801_0000`  | SRAM4, 64 KiB                         |
+//! | `0x3880_0000..0x3880_1000`  | backup SRAM, 4 KiB                    |
+//! | `0x4000_0000..0x5C00_2000`  | peripherals; see [`crate::stm32h7`]   |
+//! | `0xE000_0000..0xE010_0000`  | the PPB; see [`crate::scs`]           |
 
-use crate::flash;
-use crate::part::Part;
+use crate::flash_h7;
+use crate::gpio::Edge;
+use crate::part::{Family, Part};
 use crate::scs::Scs;
 use crate::stm32g0::Stm32g0;
+use crate::stm32h7::Stm32h7;
+use crate::usart;
 
 pub const FLASH_BASE: u32 = 0x0800_0000;
 /// The G031's, which the tests are written against; a board's own are
 /// its [`Part`]'s.
 pub const FLASH_SIZE: usize = 64 * 1024;
-pub const SYSTEM_BASE: u32 = 0x1FFF_0000;
-pub const SYSTEM_SIZE: usize = 64 * 1024;
 pub const SRAM_BASE: u32 = 0x2000_0000;
 pub const SRAM_SIZE: usize = 8 * 1024;
-/// FLASHSIZE, in system memory: main flash in KiB, which a flash
+pub const AXI_SRAM_BASE: u32 = 0x2400_0000;
+/// FLASHSIZE, in a G0's system memory: main flash in KiB, which a flash
 /// algorithm reads to know the part.
-const FLASHSIZE: usize = 0x75E0;
+const G0_FLASHSIZE: usize = 0x75E0;
+/// An H7's UID and FLASH_SIZE, in its system memory.
+const H7_UID: usize = 0x1_E800;
+const H7_FLASHSIZE: usize = 0x1_E880;
 
 /// Nothing answered: a bus fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Unmapped;
 
+/// A RAM, at its address.
+#[derive(Clone, Debug)]
+pub struct Ram {
+    pub base: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// The chip around the core: its peripherals, by family.
+#[derive(Clone, Debug)]
+pub enum Soc {
+    G0(Box<Stm32g0>),
+    H7(Box<Stm32h7>),
+}
+
 #[derive(Clone, Debug)]
 pub struct Bus {
     pub flash: Vec<u8>,
+    /// Whether flash answers at zero too, as a G0 booting from it has it.
+    flash_alias: bool,
     /// System memory holds ST's bootloader, the unique ID and the option
-    /// bytes. Of it only FLASHSIZE is modelled; the rest reads as erased
-    /// flash.
+    /// bytes. Of it only the flash size and an H7's UID are modelled; the
+    /// rest reads as erased flash.
     pub system: Vec<u8>,
-    pub sram: Vec<u8>,
+    system_base: u32,
+    /// The RAMs, the one used most first.
+    pub rams: Vec<Ram>,
     pub scs: Scs,
-    pub flash_interface: flash::Interface,
-    pub soc: Stm32g0,
+    pub soc: Soc,
 }
 
 enum Target {
     Memory { region: Region, offset: usize },
     Scs,
-    FlashInterface,
     Soc,
 }
 
@@ -62,7 +97,7 @@ enum Target {
 enum Region {
     Flash,
     System,
-    Sram,
+    Ram(usize),
 }
 
 impl Bus {
@@ -72,18 +107,52 @@ impl Bus {
         }
         let mut flash = vec![0xFF; part.flash];
         flash[..image.len()].copy_from_slice(image);
-        let mut system = vec![0xFF; SYSTEM_SIZE];
-        system[FLASHSIZE..FLASHSIZE + 2].copy_from_slice(&((part.flash / 1024) as u16).to_le_bytes());
-        let mut soc = Stm32g0::default();
-        soc.dev_id = part.dev_id;
-        Ok(Bus {
-            flash,
-            system,
-            sram: vec![0; part.sram],
-            scs: Scs::default(),
-            flash_interface: flash::Interface::default(),
-            soc,
+        let kib = ((part.flash / 1024) as u16).to_le_bytes();
+        Ok(match part.family {
+            Family::G0 => {
+                let mut system = vec![0xFF; 64 * 1024];
+                system[G0_FLASHSIZE..G0_FLASHSIZE + 2].copy_from_slice(&kib);
+                let mut soc = Stm32g0::default();
+                soc.dev_id = part.dev_id;
+                Bus {
+                    flash,
+                    flash_alias: true,
+                    system,
+                    system_base: 0x1FFF_0000,
+                    rams: vec![Ram { base: SRAM_BASE, bytes: vec![0; part.sram] }],
+                    scs: Scs::default(),
+                    soc: Soc::G0(Box::new(soc)),
+                }
+            }
+            Family::H7 => {
+                let mut system = vec![0xFF; 128 * 1024];
+                system[H7_FLASHSIZE..H7_FLASHSIZE + 2].copy_from_slice(&kib);
+                // A UID: the wafer's coordinates, its number, and its lot.
+                system[H7_UID..H7_UID + 12].copy_from_slice(b"\x1a\x00\x2b\x00\x0eQZARU75");
+                let ram = |base: u32, kib: usize| Ram { base, bytes: vec![0; kib * 1024] };
+                Bus {
+                    flash,
+                    flash_alias: false,
+                    system,
+                    system_base: 0x1FF0_0000,
+                    rams: vec![
+                        ram(AXI_SRAM_BASE, 512),
+                        ram(SRAM_BASE, 128),
+                        ram(0x3000_0000, 288),
+                        ram(0x3800_0000, 64),
+                        ram(0x3880_0000, 4),
+                        ram(0x0000_0000, 64),
+                    ],
+                    scs: Scs::default(),
+                    soc: Soc::H7(Box::default()),
+                }
+            }
         })
+    }
+
+    /// The RAM at `base`, if there is one there.
+    pub fn ram(&mut self, base: u32) -> Option<&mut Vec<u8>> {
+        self.rams.iter_mut().find(|ram| ram.base == base).map(|ram| &mut ram.bytes)
     }
 
     fn decode(&self, addr: u32) -> Option<Target> {
@@ -91,22 +160,24 @@ impl Bus {
             addr.checked_sub(base).filter(|&o| (o as usize) < size).map(|o| o as usize)
         };
         let flash = self.flash.len();
-        if let Some(offset) = within(0, flash).or_else(|| within(FLASH_BASE, flash)) {
+        if let Some(offset) = within(FLASH_BASE, flash) {
             return Some(Target::Memory { region: Region::Flash, offset });
         }
-        if let Some(offset) = within(SYSTEM_BASE, SYSTEM_SIZE) {
+        for (i, ram) in self.rams.iter().enumerate() {
+            if let Some(offset) = within(ram.base, ram.bytes.len()) {
+                return Some(Target::Memory { region: Region::Ram(i), offset });
+            }
+        }
+        if let Some(offset) = within(0, flash).filter(|_| self.flash_alias) {
+            return Some(Target::Memory { region: Region::Flash, offset });
+        }
+        if let Some(offset) = within(self.system_base, self.system.len()) {
             return Some(Target::Memory { region: Region::System, offset });
         }
-        if let Some(offset) = within(SRAM_BASE, self.sram.len()) {
-            return Some(Target::Memory { region: Region::Sram, offset });
-        }
-        if (0xE000_0000..0xE010_0000).contains(&addr) {
+        if (0xE000_0000..0xE010_0000).contains(&addr) && !self.soc.contains(addr) {
             return Some(Target::Scs);
         }
-        if flash::Interface::contains(addr) {
-            return Some(Target::FlashInterface);
-        }
-        if Stm32g0::contains(addr) {
+        if self.soc.contains(addr) {
             return Some(Target::Soc);
         }
         None
@@ -116,7 +187,7 @@ impl Bus {
         match region {
             Region::Flash => &self.flash,
             Region::System => &self.system,
-            Region::Sram => &self.sram,
+            Region::Ram(i) => &self.rams[i].bytes,
         }
     }
 
@@ -126,7 +197,6 @@ impl Bus {
         match self.decode(addr).ok_or(Unmapped)? {
             Target::Memory { region, offset } => Ok(little_endian(self.memory(region), offset, size)),
             Target::Scs => Ok(subword(self.scs.read(addr & !3).ok_or(Unmapped)?, addr, size)),
-            Target::FlashInterface => Ok(subword(self.flash_interface.read(addr & !3), addr, size)),
             Target::Soc => Ok(subword(self.soc.read(addr & !3).ok_or(Unmapped)?, addr, size)),
         }
     }
@@ -148,7 +218,6 @@ impl Bus {
         match self.decode(addr).ok_or(Unmapped)? {
             Target::Memory { region, offset } => Ok(little_endian(self.memory(region), offset, size)),
             Target::Scs => Ok(subword(self.scs.peek(addr & !3).ok_or(Unmapped)?, addr, size)),
-            Target::FlashInterface => Ok(subword(self.flash_interface.read(addr & !3), addr, size)),
             Target::Soc => Ok(subword(self.soc.peek(addr & !3), addr, size)),
         }
     }
@@ -162,16 +231,17 @@ impl Bus {
             // interface decides; it answers in its status register, not
             // with a bus error.
             Target::Memory { region: Region::Flash, offset } => {
-                self.flash_interface.program(&mut self.flash, offset, size, value);
+                self.soc.program(&mut self.flash, offset, size, value);
                 Ok(())
             }
             Target::Memory { region: Region::System, .. } => Err(Unmapped),
-            Target::Memory { region: Region::Sram, offset } => {
+            Target::Memory { region: Region::Ram(i), offset } => {
                 let bytes = value.to_le_bytes();
+                let ram = &mut self.rams[i].bytes;
                 match size {
-                    1 => self.sram[offset] = bytes[0],
-                    2 => self.sram[offset..offset + 2].copy_from_slice(&bytes[..2]),
-                    _ => self.sram[offset..offset + 4].copy_from_slice(&bytes),
+                    1 => ram[offset] = bytes[0],
+                    2 => ram[offset..offset + 2].copy_from_slice(&bytes[..2]),
+                    _ => ram[offset..offset + 4].copy_from_slice(&bytes),
                 }
                 Ok(())
             }
@@ -183,15 +253,107 @@ impl Bus {
                 };
                 self.scs.write(addr & !3, word).ok_or(Unmapped)
             }
-            Target::FlashInterface => {
-                let word = if size != 4 { self.flash_interface.read(addr & !3) & !mask | placed } else { placed };
-                self.flash_interface.write(addr & !3, word, &mut self.flash);
-                Ok(())
-            }
             Target::Soc => {
                 let word = if size != 4 { self.soc.peek(addr & !3) & !mask | placed } else { placed };
-                self.soc.write(addr & !3, word).ok_or(Unmapped)
+                self.soc.write(addr & !3, word, &mut self.flash).ok_or(Unmapped)
             }
+        }
+    }
+
+    /// A system reset of the chip around the core.
+    pub fn reset_soc(&mut self) {
+        match &mut self.soc {
+            Soc::G0(soc) => soc.reset(),
+            Soc::H7(soc) => soc.reset(&mut self.flash),
+        }
+    }
+}
+
+impl Soc {
+    pub fn contains(&self, addr: u32) -> bool {
+        match self {
+            Soc::G0(_) => Stm32g0::contains(addr),
+            Soc::H7(_) => Stm32h7::contains(addr),
+        }
+    }
+
+    pub fn read(&mut self, addr: u32) -> Option<u32> {
+        match self {
+            Soc::G0(soc) => soc.read(addr),
+            Soc::H7(soc) => soc.read(addr),
+        }
+    }
+
+    pub fn peek(&self, addr: u32) -> u32 {
+        match self {
+            Soc::G0(soc) => soc.peek(addr),
+            Soc::H7(soc) => soc.peek(addr),
+        }
+    }
+
+    pub fn write(&mut self, addr: u32, value: u32, flash: &mut [u8]) -> Option<()> {
+        match self {
+            Soc::G0(soc) => soc.write(addr, value, flash),
+            Soc::H7(soc) => soc.write(addr, value, flash),
+        }
+    }
+
+    /// A store into main flash, which the flash interface programs or
+    /// refuses.
+    fn program(&mut self, flash: &mut [u8], offset: usize, size: u32, value: u32) {
+        match self {
+            Soc::G0(soc) => soc.flash_interface.program(flash, offset, size, value),
+            Soc::H7(soc) => soc.flash_interface.store(flash, offset % (2 * flash_h7::BANK), size, value),
+        }
+    }
+
+    /// The interrupt lines the peripherals assert, as a mask by IRQ number.
+    pub fn interrupts(&self) -> [u32; 8] {
+        match self {
+            Soc::G0(soc) => soc.interrupts(),
+            Soc::H7(soc) => soc.interrupts(),
+        }
+    }
+
+    /// A byte arriving on USART `port`'s line; false if it was not taken.
+    pub fn receive(&mut self, port: usize, byte: u8) -> bool {
+        match self {
+            Soc::G0(soc) => soc.receive(port, byte),
+            Soc::H7(soc) => soc.receive(port, byte),
+        }
+    }
+
+    /// Something outside drives a pin to a level, or lets go of it.
+    pub fn drive(&mut self, port: usize, pin: u8, level: Option<bool>) {
+        match self {
+            Soc::G0(soc) => soc.drive(port, pin, level),
+            Soc::H7(soc) => soc.drive(port, pin, level),
+        }
+    }
+
+    /// What the peripherals produced since last asked: output edges and
+    /// serial bytes.
+    pub fn outputs(&mut self) -> (&mut Vec<Edge>, &mut Vec<usart::Byte>) {
+        match self {
+            Soc::G0(soc) => (&mut soc.edges, &mut soc.serial),
+            Soc::H7(soc) => (&mut soc.edges, &mut soc.serial),
+        }
+    }
+
+    /// Whether there are outputs waiting.
+    pub fn has_outputs(&self) -> bool {
+        match self {
+            Soc::G0(soc) => !soc.edges.is_empty() || !soc.serial.is_empty(),
+            Soc::H7(soc) => !soc.edges.is_empty() || !soc.serial.is_empty(),
+        }
+    }
+
+    /// Register addresses software touched that the model only pretends
+    /// to have.
+    pub fn unmodelled(&self) -> &std::collections::BTreeSet<u32> {
+        match self {
+            Soc::G0(soc) => &soc.unmodelled,
+            Soc::H7(soc) => &soc.unmodelled,
         }
     }
 }

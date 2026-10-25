@@ -14,6 +14,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::flash;
+pub use crate::gpio::Edge;
+use crate::gpio::Gpio;
 use crate::usart::{self, Usart};
 
 const RCC: u32 = 0x4002_1000;
@@ -21,58 +24,18 @@ const DBGMCU_IDCODE: u32 = 0x4001_5800;
 const IOPORT: u32 = 0x5000_0000;
 const PORTS: usize = 6;
 
+/// The two USARTs a G0 has: their bases, and their interrupt numbers.
+pub const USARTS: [(u32, u32); 2] = [(0x4001_3800, 27), (0x4000_4400, 28)];
+
 /// REV_ID 0x1000, above the part's DEV_ID.
 const REV_ID: u32 = 0x1000;
 
-/// A change in a port's output data register.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Edge {
-    /// 0 for port A, 1 for B, and so on.
-    pub port: u8,
-    pub before: u16,
-    pub after: u16,
-}
-
-#[derive(Clone, Debug)]
-struct Gpio {
-    moder: u32,
-    otyper: u32,
-    ospeedr: u32,
-    pupdr: u32,
-    odr: u32,
-    lckr: u32,
-    afr: [u32; 2],
-}
-
-impl Gpio {
-    /// RM0444 7.4: port A comes out of reset with its SWD pins configured,
-    /// the rest of the ports all-analog.
-    fn reset(port: usize) -> Gpio {
-        let a = port == 0;
-        Gpio {
-            moder: if a { 0xEBFF_FFFF } else { 0xFFFF_FFFF },
-            otyper: 0,
-            ospeedr: if a { 0x0C00_0000 } else { 0 },
-            pupdr: if a { 0x2400_0000 } else { 0 },
-            odr: 0,
-            lckr: 0,
-            afr: [0; 2],
-        }
-    }
-
-    /// IDR: an output reads back what it drives; an input reads its pull,
-    /// since nothing outside the chip drives a pin.
-    fn idr(&self) -> u32 {
-        (0..16)
-            .map(|pin| {
-                let level = match (self.moder >> (2 * pin) & 3, self.pupdr >> (2 * pin) & 3) {
-                    (0b01, _) => self.odr >> pin & 1,
-                    (_, 0b01) => 1,
-                    _ => 0,
-                };
-                level << pin
-            })
-            .sum()
+/// RM0444 7.4: port A comes out of reset with its SWD pins configured,
+/// the rest of the ports all-analog.
+fn port_reset(port: usize) -> Gpio {
+    match port {
+        0 => Gpio::new(0xEBFF_FFFF, 0x0C00_0000, 0x2400_0000),
+        _ => Gpio::new(0xFFFF_FFFF, 0, 0),
     }
 }
 
@@ -92,6 +55,7 @@ pub struct Stm32g0 {
     pub serial: Vec<usart::Byte>,
     /// The part's DEV_ID, which DBGMCU_IDCODE reports.
     pub dev_id: u16,
+    pub flash_interface: flash::Interface,
 }
 
 impl Default for Stm32g0 {
@@ -105,6 +69,7 @@ impl Default for Stm32g0 {
             usarts: Default::default(),
             serial: Vec::new(),
             dev_id: crate::part::STM32G031.dev_id,
+            flash_interface: flash::Interface::default(),
         };
         soc.reset();
         soc
@@ -116,7 +81,13 @@ impl Stm32g0 {
         self.rcc = [0; 0x100];
         // RCC_CR: HSI16 on (its ready bit follows; see `rcc_read`).
         self.rcc[0] = 1 << 8;
-        self.gpio = (0..PORTS).map(Gpio::reset).collect();
+        if self.gpio.is_empty() {
+            self.gpio = (0..PORTS).map(port_reset).collect();
+        }
+        for (port, gpio) in self.gpio.iter_mut().enumerate() {
+            gpio.reset_to(&port_reset(port));
+        }
+        self.flash_interface.reset();
         self.other.clear();
         for usart in &mut self.usarts {
             usart.reset();
@@ -125,21 +96,21 @@ impl Stm32g0 {
 
     /// Which USART, and the offset into it, an address names.
     fn usart(addr: u32) -> Option<(usize, u32)> {
-        usart::USARTS
+        USARTS
             .iter()
             .position(|&(base, _)| (base..base + usart::SIZE).contains(&addr))
-            .map(|n| (n, addr - usart::USARTS[n].0))
+            .map(|n| (n, addr - USARTS[n].0))
     }
 
     /// The interrupt lines the peripherals assert, as a mask by IRQ number.
-    pub fn interrupts(&self) -> u32 {
+    pub fn interrupts(&self) -> [u32; 8] {
         let mut lines = 0;
         for (n, usart) in self.usarts.iter().enumerate() {
             if usart.interrupt() {
-                lines |= 1 << usart::USARTS[n].1;
+                lines |= 1 << USARTS[n].1;
             }
         }
-        lines
+        [lines, 0, 0, 0, 0, 0, 0, 0]
     }
 
     /// A byte arriving on USART `port`'s line; false if it was not taken.
@@ -151,6 +122,13 @@ impl Stm32g0 {
     /// single-cycle IOPORT bus the GPIOs sit on.
     pub fn contains(addr: u32) -> bool {
         matches!(addr, 0x4000_0000..=0x4002_63FF | 0x5000_0000..=0x5000_17FF)
+    }
+
+    /// Something outside drives a pin, or lets go of it.
+    pub fn drive(&mut self, port: usize, pin: u8, level: Option<bool>) {
+        if let Some(gpio) = self.gpio.get_mut(port) {
+            gpio.drive(pin, level);
+        }
     }
 
     pub fn read(&mut self, addr: u32) -> Option<u32> {
@@ -171,19 +149,10 @@ impl Stm32g0 {
             return self.rcc_read(addr - RCC);
         }
         if let Some((gpio, offset)) = self.port(addr) {
-            return match offset {
-                0x00 => gpio.moder,
-                0x04 => gpio.otyper,
-                0x08 => gpio.ospeedr,
-                0x0C => gpio.pupdr,
-                0x10 => gpio.idr(),
-                0x14 => gpio.odr,
-                0x1C => gpio.lckr,
-                0x20 => gpio.afr[0],
-                0x24 => gpio.afr[1],
-                // BSRR and BRR are write-only.
-                _ => 0,
-            };
+            return gpio.read(offset);
+        }
+        if flash::Interface::contains(addr) {
+            return self.flash_interface.read(addr);
         }
         if addr == DBGMCU_IDCODE {
             return REV_ID << 16 | u32::from(self.dev_id);
@@ -196,9 +165,15 @@ impl Stm32g0 {
         self.other.get(&addr).copied().unwrap_or(0)
     }
 
-    pub fn write(&mut self, addr: u32, value: u32) -> Option<()> {
+    /// A register write; `flash` is main flash, which the flash
+    /// interface erases.
+    pub fn write(&mut self, addr: u32, value: u32, flash: &mut [u8]) -> Option<()> {
         if !Self::contains(addr) {
             return None;
+        }
+        if flash::Interface::contains(addr) {
+            self.flash_interface.write(addr, value, flash);
+            return Some(());
         }
         if (RCC..RCC + 0x400).contains(&addr) {
             self.rcc[((addr - RCC) / 4) as usize] = value;
@@ -214,20 +189,7 @@ impl Stm32g0 {
             let port = ((addr - IOPORT) / 0x400) as usize;
             let gpio = &mut self.gpio[port];
             let before = gpio.odr;
-            match (addr - IOPORT) % 0x400 {
-                0x00 => gpio.moder = value,
-                0x04 => gpio.otyper = value & 0xFFFF,
-                0x08 => gpio.ospeedr = value,
-                0x0C => gpio.pupdr = value,
-                0x14 => gpio.odr = value & 0xFFFF,
-                // BSRR: set wins over reset when a write asks for both.
-                0x18 => gpio.odr = (gpio.odr & !(value >> 16)) | (value & 0xFFFF),
-                0x1C => gpio.lckr = value,
-                0x20 => gpio.afr[0] = value,
-                0x24 => gpio.afr[1] = value,
-                0x28 => gpio.odr &= !(value & 0xFFFF),
-                _ => {}
-            }
+            gpio.write((addr - IOPORT) % 0x400, value, true);
             if gpio.odr != before {
                 self.edges.push(Edge { port: port as u8, before: before as u16, after: gpio.odr as u16 });
             }
@@ -239,7 +201,11 @@ impl Stm32g0 {
     }
 
     fn modelled(&self, addr: u32) -> bool {
-        (RCC..RCC + 0x400).contains(&addr) || addr >= IOPORT || addr == DBGMCU_IDCODE || Self::usart(addr).is_some()
+        (RCC..RCC + 0x400).contains(&addr)
+            || addr >= IOPORT
+            || addr == DBGMCU_IDCODE
+            || flash::Interface::contains(addr)
+            || Self::usart(addr).is_some()
     }
 
     fn port(&self, addr: u32) -> Option<(&Gpio, u32)> {

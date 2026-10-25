@@ -386,7 +386,7 @@ mod tests {
 
         // Writes to SRAM, then back.
         set_word(&mut port, &mut m, SRAM_BASE + 0x40, 0xDEAD_BEEF);
-        assert_eq!(m.bus.sram[0x40..0x44], 0xDEAD_BEEFu32.to_le_bytes());
+        assert_eq!(m.bus.rams[0].bytes[0x40..0x44], 0xDEAD_BEEFu32.to_le_bytes());
 
         port.ap_write(&mut m, TAR, 0x3000_0000).unwrap();
         assert_eq!(port.ap_read(&mut m, DRW), Err(Ack::Fault));

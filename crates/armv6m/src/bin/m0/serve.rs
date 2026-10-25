@@ -35,7 +35,7 @@ use armv6m::scs::exception;
 use armv6m::{Event, Machine, Outcome};
 
 use crate::door::{FrontDoor, accept_requests};
-use crate::{CYCLES_PER_MS, describe, ms_at, usage};
+use crate::{cycles_per_ms, describe, ms_at, usage};
 
 /// How long the board sleeps between catching up with the wall clock when
 /// nothing asks anything of it. A message wakes it at once, so this is not
@@ -55,6 +55,7 @@ struct Options {
     archive: Option<String>,
     humility: String,
     board: Option<String>,
+    part: String,
 }
 
 enum Message {
@@ -73,6 +74,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
         archive: None,
         humility: "humility".into(),
         board: None,
+        part: "stm32g031".into(),
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -82,6 +84,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
             "--humility" => &mut options.humility,
             "--archive" => options.archive.insert(String::new()),
             "--board" => options.board.insert(String::new()),
+            "--part" => &mut options.part,
             _ if options.image.is_empty() && !arg.starts_with('-') => {
                 options.image = arg;
                 continue;
@@ -97,7 +100,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
         return usage();
     }
 
-    let machine = match std::fs::read(&options.image).map_err(|e| e.to_string()).and_then(|b| Machine::stm32g031(&b)) {
+    let Some(part) = armv6m::part::Part::named(&options.part) else { return usage() };
+    crate::set_part_clock(&part);
+    let machine = match std::fs::read(&options.image).map_err(|e| e.to_string()).and_then(|b| Machine::new(part, &b)) {
         Ok(machine) => machine,
         Err(e) => {
             eprintln!("zaqaru-m0: {}: {e}", options.image);
@@ -202,16 +207,16 @@ impl Board {
 
     /// Restarts the clock from where the board is now.
     fn rebase(&mut self) {
-        let ran = Duration::from_micros(self.machine.cycles * 1000 / CYCLES_PER_MS);
+        let ran = Duration::from_micros(self.machine.cycles * 1000 / cycles_per_ms());
         self.origin = Instant::now().checked_sub(ran).unwrap_or_else(Instant::now);
     }
 
     fn advance(&mut self) {
-        let due = self.origin.elapsed().as_micros() as u64 * CYCLES_PER_MS / 1000;
+        let due = self.origin.elapsed().as_micros() as u64 * cycles_per_ms() / 1000;
         let behind = due.saturating_sub(self.machine.cycles);
-        let budget = behind.min(MAX_BEHIND_MS * CYCLES_PER_MS);
+        let budget = behind.min(MAX_BEHIND_MS * cycles_per_ms());
         let outcome = self.machine.run(budget);
-        if behind > MAX_BEHIND_MS * CYCLES_PER_MS {
+        if behind > MAX_BEHIND_MS * cycles_per_ms() {
             self.rebase();
         }
         self.report();

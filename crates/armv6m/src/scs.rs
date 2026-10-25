@@ -477,6 +477,10 @@ pub struct Scs {
     pub fpccr: u32,
     pub fpcar: u32,
     pub fpdscr: u32,
+    /// Where the part boots, which VTOR comes out of reset holding.
+    pub boot: u32,
+    /// CSSELR: which cache CCSIDR describes.
+    pub csselr: u32,
 }
 
 /// CCR.UNALIGN_TRP: fault every unaligned access, as ARMv6-M always does.
@@ -511,10 +515,13 @@ impl Scs {
         let epoch = self.mpu.epoch.wrapping_add(1);
         let core = self.core;
         let irq_lines = self.irq_lines.max(32);
+        let boot = self.boot;
         *self = Scs::default();
         self.mpu.epoch = epoch;
         self.core = core;
         self.irq_lines = irq_lines;
+        self.boot = boot;
+        self.vtor = boot;
         match core {
             Core::CortexM0Plus => {
                 self.ccr = CCR_STKALIGN | CCR_UNALIGN_TRP;
@@ -636,6 +643,17 @@ impl Scs {
             0xE000_ED34 if v7 => self.faults.mmfar,
             0xE000_ED38 if v7 => self.faults.bfar,
             0xE000_ED88 if v7 => self.cpacr,
+            // The caches' identification (B4.8): CLIDR, a level of separate
+            // instruction and data caches; CTR, 32-byte lines; CCSIDR, the
+            // M7's 16 KiB of each as an H7 has them, the data cache 4-way
+            // and write-back, the instruction cache 2-way.
+            0xE000_ED78 if v7 => 0x0900_0003,
+            0xE000_ED7C if v7 => 0x8303_C003,
+            0xE000_ED80 if v7 => if self.csselr & 1 == 0 { 0xF00F_E019 } else { 0x201F_E009 },
+            0xE000_ED84 if v7 => self.csselr,
+            // ITM's stimulus ports, whose reads say whether the FIFO can take
+            // a write. It always can: what is written goes nowhere.
+            0xE000_0000..=0xE000_007F if v7 => 1,
             0xE000_EF34 if v7 => self.fpccr,
             0xE000_EF38 if v7 => self.fpcar,
             0xE000_EF3C if v7 => self.fpdscr,
@@ -766,6 +784,7 @@ impl Scs {
             0xE000_ED34 if v7 => self.faults.mmfar = value,
             0xE000_ED38 if v7 => self.faults.bfar = value,
             0xE000_ED88 if v7 => self.cpacr = value & 0x00F0_0000,
+            0xE000_ED84 if v7 => self.csselr = value & 1,
             // ASPEN, LSPEN and the context bits; LSPACT stays clear, since
             // stacking is never lazy here.
             0xE000_EF34 if v7 => self.fpccr = value & 0xC000_013A,

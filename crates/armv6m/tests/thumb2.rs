@@ -89,9 +89,9 @@ fn run(m: &mut Machine, base: &[u8], case: &Case) -> Option<(Vec<u32>, Vec<(u32,
         })
         .collect();
     m.reset().unwrap();
-    m.bus.sram.copy_from_slice(base);
+    m.bus.rams[0].bytes.copy_from_slice(base);
     let at = (CODE - SRAM_BASE) as usize;
-    m.bus.sram[at..at + code.len()].copy_from_slice(&code);
+    m.bus.rams[0].bytes[at..at + code.len()].copy_from_slice(&code);
     let b = &case.before;
     m.cpu.r[..13].copy_from_slice(&b[..13]);
     m.cpu.msp = b[13];
@@ -117,8 +117,8 @@ fn run(m: &mut Machine, base: &[u8], case: &Case) -> Option<(Vec<u32>, Vec<(u32,
     regs.extend([m.cpu.msp, m.cpu.r[14], m.cpu.pc, m.cpu.apsr()]);
     regs[13] &= !3;
     let writes = (0..SRAM_SIZE)
-        .filter(|&i| m.bus.sram[i] != base[i] && !(at..at + code.len()).contains(&i))
-        .map(|i| (SRAM_BASE + i as u32, m.bus.sram[i]))
+        .filter(|&i| m.bus.rams[0].bytes[i] != base[i] && !(at..at + code.len()).contains(&i))
+        .map(|i| (SRAM_BASE + i as u32, m.bus.rams[0].bytes[i]))
         .collect();
     Some((regs, writes))
 }
@@ -209,9 +209,9 @@ fn run_fp(m: &mut Machine, base: &[u8], case: &FpCase) -> Option<(Vec<u32>, Vec<
     let (hw1, hw2) = (hex(&case.instr[..4]) as u16, hex(&case.instr[4..]) as u16);
     let code = [hw1.to_le_bytes(), hw2.to_le_bytes()].concat();
     m.reset().unwrap();
-    m.bus.sram.copy_from_slice(base);
+    m.bus.rams[0].bytes.copy_from_slice(base);
     let at = (CODE - SRAM_BASE) as usize;
-    m.bus.sram[at..at + 4].copy_from_slice(&code);
+    m.bus.rams[0].bytes[at..at + 4].copy_from_slice(&code);
     let b = &case.before;
     m.cpu.r[..13].copy_from_slice(&b[..13]);
     m.cpu.msp = b[13];
@@ -239,8 +239,8 @@ fn run_fp(m: &mut Machine, base: &[u8], case: &FpCase) -> Option<(Vec<u32>, Vec<
     let mut initial = base.to_vec();
     initial[at..at + 4].copy_from_slice(&code);
     let writes = (0..SRAM_SIZE)
-        .filter(|&i| m.bus.sram[i] != initial[i])
-        .map(|i| (SRAM_BASE + i as u32, m.bus.sram[i]))
+        .filter(|&i| m.bus.rams[0].bytes[i] != initial[i])
+        .map(|i| (SRAM_BASE + i as u32, m.bus.rams[0].bytes[i]))
         .collect();
     Some((regs, writes))
 }
