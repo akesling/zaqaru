@@ -18,6 +18,8 @@
 //! - [`exception`] — entering and leaving handlers, and deciding which one.
 //! - [`scs`] — SysTick, the NVIC, the SCB and the MPU, as memory-mapped
 //!   registers.
+//! - [`debug`] and [`dap`] — halting debug, and the debug port a probe
+//!   reaches it through.
 //! - [`bus`] and [`stm32g0`] — the rest of the address space.
 //! - [`Machine`] — the run loop.
 //!
@@ -28,6 +30,8 @@
 //! to the next event, which is also what makes an idle system cheap to run.
 
 pub mod bus;
+pub mod dap;
+pub mod debug;
 pub mod exception;
 pub mod exec;
 pub mod gdb;
@@ -96,9 +100,12 @@ pub enum Outcome {
     /// `wfi` with nothing that could ever wake it: no timer running and
     /// nothing pending.
     Asleep,
-    /// The pc reached one of [`Machine::breakpoints`], which a debugger
-    /// set. The instruction there has not executed.
+    /// The pc reached one of [`Machine::breakpoints`], or a BPU
+    /// comparator a debugger set. The instruction there has not executed.
     Stopped { pc: u32 },
+    /// The core is halted in Debug state, by a debugger or by a stop above:
+    /// it does nothing until a debugger lets it go.
+    Halted,
 }
 
 /// Something a run did that is worth seeing afterwards, stamped with the
@@ -131,6 +138,8 @@ pub struct Machine {
     /// instruction executes — the way a Cortex-M0+'s BPU compares, with no
     /// `bkpt` written into the image.
     pub breakpoints: BTreeSet<u32>,
+    /// Halting debug: whether the core is halted, and the debug registers.
+    pub debug: debug::Debug,
     /// A breakpoint address to execute through once rather than stop at:
     /// a debugger resuming from the breakpoint it stopped on.
     skip_breakpoint: Option<u32>,
@@ -178,6 +187,7 @@ impl Machine {
             priority: scs::BASE_PRIORITY,
             sleeping: false,
             breakpoints: BTreeSet::new(),
+            debug: debug::Debug::default(),
             skip_breakpoint: None,
             ticked_at: 0,
             tick_due: u64::MAX,
@@ -205,11 +215,35 @@ impl Machine {
         self.cpu.pc = entry & !1;
         self.cpu.t = entry & 1 != 0;
         self.update_priority();
+        self.debug_reset();
         Ok(())
     }
 
-    /// Runs for `budget` cycles, or until something stops it.
+    /// Runs for `budget` cycles, or until something stops it. A halted core
+    /// runs nothing, though a reset asked for still answers; a core told to
+    /// step runs one instruction and halts again.
     pub fn run(&mut self, budget: u64) -> Outcome {
+        if self.bus.scs.reset_requested {
+            return Outcome::SystemReset;
+        }
+        if self.debug.halted {
+            return Outcome::Halted;
+        }
+        if self.debug.stepping {
+            self.debug.stepping = false;
+            let outcome = self.execute_for(budget.min(1));
+            if self.debug.halted {
+                return self.settle(outcome);
+            }
+            self.settle(outcome);
+            self.debug.halt(debug::DFSR_HALTED);
+            return Outcome::Halted;
+        }
+        let outcome = self.execute_for(budget);
+        self.settle(outcome)
+    }
+
+    fn execute_for(&mut self, budget: u64) -> Outcome {
         let end = self.cycles.saturating_add(budget);
         while self.cycles < end {
             if self.bus.scs.reset_requested {
@@ -219,7 +253,7 @@ impl Machine {
             // An exception that can preempt is taken before the next
             // instruction — and between any two, which is the whole of
             // "asynchronous" on a core this simple.
-            if let Some((n, p)) = self.bus.scs.nvic.highest_pending() {
+            if let Some((n, p)) = self.bus.scs.nvic.highest_pending().filter(|_| !self.debug.maskints) {
                 if p < self.priority {
                     if let Err(outcome) = self.enter(n) {
                         return outcome;
@@ -242,10 +276,12 @@ impl Machine {
                 continue;
             }
 
-            if !self.breakpoints.is_empty() && self.breakpoints.contains(&self.cpu.pc)
-                && self.skip_breakpoint.take() != Some(self.cpu.pc) {
-                    return Outcome::Stopped { pc: self.cpu.pc };
-                }
+            if (self.debug.breaking && self.debug.breaks_at(self.cpu.pc)
+                || !self.breakpoints.is_empty() && self.breakpoints.contains(&self.cpu.pc))
+                && self.skip_breakpoint.take() != Some(self.cpu.pc)
+            {
+                return Outcome::Stopped { pc: self.cpu.pc };
+            }
             self.skip_breakpoint = None;
 
             let flow = if self.cpu.t { self.execute() } else { Err(Fault::InvState) };
@@ -267,16 +303,20 @@ impl Machine {
         Outcome::Budget
     }
 
-    /// Resumes after a debugger stop: the next [`run`](Machine::run)
-    /// executes the instruction at the pc even if a breakpoint is set on it.
+    /// Resumes after a debugger stop: the core leaves Debug state, and the
+    /// next [`run`](Machine::run) executes the instruction at the pc even
+    /// if a breakpoint is set on it.
     pub fn resume(&mut self) {
+        self.debug.halted = false;
+        self.debug.stepping = false;
         self.skip_breakpoint = Some(self.cpu.pc);
     }
 
     /// Executes one instruction, or takes one exception — whichever the
-    /// machine would do next.
+    /// machine would do next — and halts.
     pub fn step(&mut self) -> Outcome {
         self.resume();
+        self.debug.stepping = true;
         self.run(1)
     }
 
@@ -303,7 +343,13 @@ impl Machine {
             self.sync_systick();
         }
         (0..len as u32)
-            .map(|i| self.bus.peek(addr.wrapping_add(i), 1).ok().map(|b| b as u8))
+            .map(|i| {
+                let a = addr.wrapping_add(i);
+                match self.debug_register(a, true) {
+                    Some(word) => Some((word >> (8 * (a & 3))) as u8),
+                    None => self.bus.peek(a, 1).ok().map(|b| b as u8),
+                }
+            })
             .collect()
     }
 
@@ -318,7 +364,7 @@ impl Machine {
             let ok = if a & 3 == 0 && bytes.len() - at >= 4 {
                 let word = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
                 at += 4;
-                self.bus.write(a, 4, word).is_ok()
+                if debug::answers(a) { self.set_debug_register(a, word) } else { self.bus.write(a, 4, word).is_ok() }
             } else {
                 at += 1;
                 self.bus.write(a, 1, bytes[at - 1] as u32).is_ok()
@@ -369,7 +415,12 @@ impl Machine {
         if self.priority < 0 {
             return Err(Outcome::Lockup { pc: self.cpu.pc, fault });
         }
-        self.enter(HARD_FAULT)
+        self.enter(HARD_FAULT)?;
+        if self.catches_hard_fault() {
+            self.debug.halt(debug::DFSR_VCATCH);
+            return Err(Outcome::Halted);
+        }
+        Ok(())
     }
 
     /// Moves the GPIO edges a store produced into the event log.

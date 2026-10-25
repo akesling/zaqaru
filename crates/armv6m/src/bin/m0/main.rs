@@ -112,7 +112,7 @@ fn main() -> ExitCode {
         Outcome::Lockup { pc, fault } => println!("LOCKUP at pc=0x{pc:08x}: {fault:?}"),
         Outcome::Breakpoint { pc, imm } => println!("bkpt #{imm} at pc=0x{pc:08x}"),
         Outcome::Asleep => println!("asleep with nothing to wake it, at pc=0x{:08x}", machine.cpu.pc),
-        Outcome::Stopped { .. } => unreachable!("no breakpoints are set"),
+        Outcome::Stopped { .. } | Outcome::Halted => unreachable!("no debugger is attached"),
         Outcome::SystemReset => unreachable!(),
     }
     let secs = wall.as_secs_f64();

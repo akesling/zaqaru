@@ -165,14 +165,17 @@ impl Board {
     /// should wake to move the board on — `None` when it is halted, since
     /// then only a debugger moves it.
     pub fn wake(&self) -> Option<u64> {
-        (!self.debugger.halted).then_some(self.now + TICK_NS)
+        (!self.machine.halted()).then_some(self.now + TICK_NS)
     }
 
     /// Brings simulated time up to `now`.
     fn advance(&mut self, now: u64) {
         let origin = *self.origin.get_or_insert(now);
         self.now = now;
-        if self.debugger.halted {
+        // A halted board's time stands still; a reset asked for while
+        // halted is still taken.
+        if self.machine.halted() && !self.machine.bus.scs.reset_requested {
+            self.rebase(now);
             return;
         }
         let due = now.saturating_sub(origin) / 1000 * CYCLES_PER_MICROSECOND;
@@ -184,7 +187,7 @@ impl Board {
         }
         self.collect();
         match outcome {
-            Outcome::Budget | Outcome::Asleep => {}
+            Outcome::Budget | Outcome::Asleep | Outcome::Halted => {}
             Outcome::SystemReset => {
                 self.console.push(format!("{} system reset", self.stamp()));
                 if let Err(e) = self.machine.reset() {
@@ -256,8 +259,8 @@ impl Board {
             match buffer[at] {
                 0x03 => {
                     at += 1;
-                    if !self.debugger.halted {
-                        let stop = self.debugger.interrupt();
+                    if !self.machine.halted() {
+                        let stop = self.debugger.interrupt(&mut self.machine);
                         self.reply(&gdb::frame(&stop));
                     }
                 }
@@ -269,13 +272,13 @@ impl Board {
                     }
                     let payload = String::from_utf8_lossy(&buffer[at + 1..at + hash]).into_owned();
                     at += hash + 3;
-                    let was_halted = self.debugger.halted;
+                    let was_halted = self.machine.halted();
                     match self.debugger.packet(&mut self.machine, &payload) {
                         Response::Reply(reply) => self.reply(&format!("+{}", gdb::frame(&reply))),
                         Response::Resumed => self.reply("+"),
                         Response::Detach(reply) => self.reply(&format!("+{}", gdb::frame(&reply))),
                     }
-                    if was_halted && !self.debugger.halted {
+                    if was_halted && !self.machine.halted() {
                         self.rebase(self.now);
                     }
                     // A debugger's write can change a pin.
@@ -295,8 +298,9 @@ impl Board {
     /// probe does.
     fn release(&mut self) {
         self.machine.breakpoints.clear();
-        if self.debugger.halted {
-            self.debugger.halted = false;
+        let halted = self.machine.halted();
+        self.machine.debug.release();
+        if halted {
             self.machine.resume();
             self.rebase(self.now);
         }
@@ -333,7 +337,7 @@ impl Board {
             r#"{{"chip":{},"image":{},"state":{},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"faults":{},"probe":{},"debugger":{},"exceptions":{{{}}},"registers":{{{}}}}}"#,
             quoted(&self.chip),
             quoted(&self.image),
-            quoted(if self.debugger.halted { "halted" } else { "running" }),
+            quoted(if self.machine.halted() { "halted" } else { "running" }),
             quoted(&format!("{:?}", cpu.mode)),
             cpu.privileged(),
             m.cycles as f64 / (CYCLES_PER_MICROSECOND * 1000) as f64,
@@ -355,7 +359,7 @@ impl Board {
     /// show it.
     pub fn status(&self) -> String {
         let m = &self.machine;
-        let state = match self.debugger.halted {
+        let state = match self.machine.halted() {
             true => format!("halted at pc=0x{:08x}", m.cpu.pc),
             false => "running".to_string(),
         };

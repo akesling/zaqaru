@@ -179,7 +179,7 @@ impl Board {
     fn run(mut self, rx: Receiver<Message>) {
         self.publish();
         loop {
-            let halted = self.debugger.halted;
+            let halted = self.machine.halted();
             let wait = if halted { Duration::from_secs(3600) } else { SLICE };
             match rx.recv_timeout(wait) {
                 Ok(message) => {
@@ -191,10 +191,10 @@ impl Board {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
-            if halted && !self.debugger.halted {
+            if halted && !self.machine.halted() {
                 self.rebase();
             }
-            if !self.debugger.halted {
+            if !self.machine.halted() {
                 self.advance();
             }
         }
@@ -216,7 +216,7 @@ impl Board {
         }
         self.report();
         match outcome {
-            Outcome::Budget | Outcome::Asleep => {}
+            Outcome::Budget | Outcome::Asleep | Outcome::Halted => {}
             Outcome::SystemReset => {
                 println!("{:>10.3} ms  system reset", ms_at(self.machine.cycles));
                 if let Err(e) = self.machine.reset() {
@@ -258,8 +258,8 @@ impl Board {
                 // A debugger's write can change a pin.
                 self.report();
             }
-            Message::Interrupt { id } if self.is_client(id) && !self.debugger.halted => {
-                let stop = self.debugger.interrupt();
+            Message::Interrupt { id } if self.is_client(id) && !self.machine.halted() => {
+                let stop = self.debugger.interrupt(&mut self.machine);
                 self.send(&stop);
             }
             Message::Closed { id } if self.is_client(id) => {
@@ -279,8 +279,8 @@ impl Board {
 
     fn release(&mut self) {
         self.machine.breakpoints.clear();
-        if self.debugger.halted {
-            self.debugger.halted = false;
+        if self.machine.halted() {
+            self.machine.debug.release();
             self.machine.resume();
         }
     }
@@ -329,7 +329,7 @@ impl Board {
 
     fn status(&self) -> String {
         let m = &self.machine;
-        let state = if self.debugger.halted {
+        let state = if self.machine.halted() {
             format!("halted at pc=0x{:08x}", m.cpu.pc)
         } else {
             "running".into()

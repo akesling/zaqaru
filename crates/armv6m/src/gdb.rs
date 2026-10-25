@@ -19,7 +19,7 @@
 //!   and 20 packs CONTROL and PRIMASK. The target description given to
 //!   GDB says so, so GDB numbers them the same way.
 
-use crate::state::Mode;
+use crate::debug::{register, set_register};
 use crate::{Machine, Outcome};
 
 /// What the target description tells GDB the registers are: the M-profile
@@ -70,16 +70,15 @@ pub enum Response {
     Detach(String),
 }
 
-/// One debugger's view of the machine: whether it has the target halted.
+/// A GDB client of the machine. Whether the target is halted is the
+/// machine's own state ([`Machine::halted`]), which a debug port sees too.
 #[derive(Debug, Default)]
-pub struct Debugger {
-    pub halted: bool,
-}
+pub struct Debugger;
 
 impl Debugger {
     /// Halts the target, as an interrupt (`^C`) asks. The stop reply.
-    pub fn interrupt(&mut self) -> String {
-        self.halted = true;
+    pub fn interrupt(&mut self, m: &mut Machine) -> String {
+        m.halt();
         "S02".into()
     }
 
@@ -91,7 +90,6 @@ impl Debugger {
             Outcome::Lockup { .. } => 11,
             _ => return None,
         };
-        self.halted = true;
         Some(format!("S{signal:02x}"))
     }
 
@@ -102,7 +100,7 @@ impl Debugger {
         match command {
             // Attaching: GDB expects a stopped target, as OpenOCD gives it.
             "?" => {
-                self.halted = true;
+                m.halt();
                 reply("S05")
             }
             "g" => Reply(G_REGISTERS.iter().map(|&n| hex32(register(m, n))).collect()),
@@ -137,12 +135,10 @@ impl Debugger {
                     m.cpu.pc = addr & !1;
                 }
                 m.resume();
-                self.halted = false;
                 Response::Resumed
             }
             "s" => {
                 let outcome = m.step();
-                self.halted = true;
                 Reply(match outcome {
                     Outcome::Lockup { .. } => "S0b".into(),
                     _ => "S05".into(),
@@ -166,7 +162,6 @@ impl Debugger {
                 }
             }
             "D" => {
-                self.halted = false;
                 m.breakpoints.clear();
                 m.resume();
                 Response::Detach("OK".into())
@@ -199,7 +194,7 @@ impl Debugger {
             return match command.as_deref() {
                 Some("reset" | "reset halt") => {
                     let _ = m.reset();
-                    self.halted = true;
+                    m.halt();
                     reply("OK")
                 }
                 _ => reply(""),
@@ -219,47 +214,6 @@ impl Debugger {
 pub fn frame(payload: &str) -> String {
     let sum = payload.bytes().fold(0u8, |a, b| a.wrapping_add(b));
     format!("${payload}#{sum:02x}")
-}
-
-/// Register `n` by its DCRSR selector.
-pub fn register(m: &Machine, n: u32) -> u32 {
-    let cpu = &m.cpu;
-    match n {
-        15 => cpu.pc,
-        0..=14 => cpu.reg(n as usize),
-        16 => cpu.xpsr(),
-        17 => cpu.msp,
-        18 => cpu.psp,
-        // CONTROL in 31:24, PRIMASK in 7:0; FAULTMASK and BASEPRI do not
-        // exist on this profile.
-        20 => ((cpu.npriv as u32) | (cpu.spsel as u32) << 1) << 24 | cpu.primask as u32,
-        _ => 0,
-    }
-}
-
-fn set_register(m: &mut Machine, n: u32, value: u32) -> bool {
-    let cpu = &mut m.cpu;
-    match n {
-        0..=12 | 14 => cpu.r[n as usize] = value,
-        13 => cpu.set_sp(value),
-        15 => cpu.pc = value & !1,
-        16 => {
-            cpu.set_apsr(value);
-            cpu.t = value & 1 << 24 != 0;
-        }
-        17 => cpu.msp = value & !3,
-        18 => cpu.psp = value & !3,
-        20 => {
-            cpu.primask = value & 1 != 0;
-            cpu.npriv = value >> 24 & 1 != 0;
-            if cpu.mode == Mode::Thread {
-                cpu.spsel = value >> 25 & 1 != 0;
-            }
-            m.update_priority();
-        }
-        _ => return false,
-    }
-    true
 }
 
 fn address_length(s: &str) -> Option<(u32, usize)> {
