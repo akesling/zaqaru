@@ -19,7 +19,7 @@
 
 use crate::errno::Errno;
 use crate::image::{Image, Inode};
-use crate::overlay::{Dirent, Overlay};
+use crate::overlay::{Dirent, Overlay, Shared};
 
 /// How many filesystems can be attached at once. Small on purpose — a
 /// container's namespace is the image, an overlay over it, and the handful
@@ -52,21 +52,21 @@ pub enum Filesystem<'a> {
     /// are built at boot in the same format.
     Image(Image<'a>),
     /// The image with a writable layer over it.
-    Overlay(Overlay<'a>),
+    Overlay(Shared<'a>),
 }
 
 impl<'a> Filesystem<'a> {
     pub fn root(&self) -> u32 {
         match self {
             Self::Image(image) => image.root(),
-            Self::Overlay(overlay) => overlay.root(),
+            Self::Overlay(overlay) => overlay.get().root(),
         }
     }
 
     pub fn inode(&self, number: u32) -> Result<Inode, Errno> {
         match self {
             Self::Image(image) => image.inode(number).map_err(|_| Errno::Io),
-            Self::Overlay(overlay) => overlay.inode(number),
+            Self::Overlay(overlay) => overlay.get().inode(number),
         }
     }
 
@@ -81,14 +81,14 @@ impl<'a> Filesystem<'a> {
                 .lookup(directory, name)
                 .map_err(|_| Errno::Io)?
                 .map(|entry| entry.inode)),
-            Self::Overlay(overlay) => overlay.lookup(directory, number, name),
+            Self::Overlay(overlay) => overlay.get().lookup(directory, number, name),
         }
     }
 
     pub fn entry_count(&self, directory: &Inode, number: u32) -> Result<u32, Errno> {
         match self {
             Self::Image(image) => image.entry_count(directory).map_err(|_| Errno::Io),
-            Self::Overlay(overlay) => overlay.entry_count(directory, number),
+            Self::Overlay(overlay) => overlay.get().entry_count(directory, number),
         }
     }
 
@@ -107,28 +107,28 @@ impl<'a> Filesystem<'a> {
                     entry_type: entry.entry_type,
                 })
             }
-            Self::Overlay(overlay) => overlay.entry(directory, number, position),
+            Self::Overlay(overlay) => overlay.get().entry(directory, number, position),
         }
     }
 
     pub fn symlink_target(&self, inode: &Inode, number: u32) -> Result<&[u8], Errno> {
         match self {
             Self::Image(image) => image.symlink_target(inode).map_err(|_| Errno::Io),
-            Self::Overlay(overlay) => overlay.symlink_target(inode, number),
+            Self::Overlay(overlay) => overlay.get().symlink_target(inode, number),
         }
     }
 
     pub fn contents(&self, inode: &Inode, number: u32) -> Result<&[u8], Errno> {
         match self {
             Self::Image(image) => image.contents(inode).map_err(|_| Errno::Io),
-            Self::Overlay(overlay) => overlay.contents(inode, number),
+            Self::Overlay(overlay) => overlay.get().contents(inode, number),
         }
     }
 
     pub fn xattr_count(&self, inode: &Inode, number: u32) -> Result<u32, Errno> {
         match self {
             Self::Image(image) => image.xattr_count(inode).map_err(|_| Errno::Io),
-            Self::Overlay(overlay) => overlay.xattr_count(inode, number),
+            Self::Overlay(overlay) => overlay.get().xattr_count(inode, number),
         }
     }
 
@@ -140,7 +140,7 @@ impl<'a> Filesystem<'a> {
     ) -> Result<(&[u8], &[u8]), Errno> {
         match self {
             Self::Image(image) => image.xattr(inode, position).map_err(|_| Errno::Io),
-            Self::Overlay(overlay) => overlay.xattr(inode, number, position),
+            Self::Overlay(overlay) => overlay.get().xattr(inode, number, position),
         }
     }
 
@@ -159,6 +159,7 @@ impl<'a> Filesystem<'a> {
                 count: image.entry_count(directory).map_err(|_| Errno::Io)?,
             }),
             Self::Overlay(overlay) => {
+                let overlay = overlay.get();
                 if crate::overlay::is_upper(number) {
                     return Ok(Entries::Merged(overlay.merge(number)?));
                 }
@@ -183,7 +184,7 @@ impl<'a> Filesystem<'a> {
     pub fn promote(&self, number: u32) -> u32 {
         match self {
             Self::Image(_) => number,
-            Self::Overlay(overlay) => overlay.promote(number),
+            Self::Overlay(overlay) => overlay.get().promote(number),
         }
     }
 
@@ -191,7 +192,24 @@ impl<'a> Filesystem<'a> {
     pub fn lower(&self) -> &Image<'a> {
         match self {
             Self::Image(image) => image,
-            Self::Overlay(overlay) => overlay.lower(),
+            Self::Overlay(overlay) => overlay.get().lower(),
+        }
+    }
+
+    /// Whether an upper node has no names left. Never, for an image.
+    pub fn is_orphaned(&self, number: u32) -> bool {
+        match self {
+            Self::Image(_) => false,
+            Self::Overlay(overlay) => overlay.get().is_orphaned(number),
+        }
+    }
+
+    /// How many processes share this filesystem's writable layer; see
+    /// [`Shared::holders`]. An image has nothing to share.
+    pub fn holders(&self) -> usize {
+        match self {
+            Self::Image(_) => 1,
+            Self::Overlay(overlay) => overlay.holders(),
         }
     }
 
@@ -201,7 +219,7 @@ impl<'a> Filesystem<'a> {
     pub fn writable(&mut self) -> Option<&mut Overlay<'a>> {
         match self {
             Self::Image(_) => None,
-            Self::Overlay(overlay) => Some(overlay),
+            Self::Overlay(overlay) => Some(overlay.get_mut()),
         }
     }
 }
@@ -285,7 +303,7 @@ impl<'a> Mounts<'a> {
     pub fn new(image: Image<'a>) -> Self {
         let mut entries = [const { None }; MAX_MOUNTS];
         entries[0] = Some(Mount {
-            filesystem: Filesystem::Overlay(Overlay::new(image)),
+            filesystem: Filesystem::Overlay(Shared::new(Overlay::new(image))),
             covers: None,
             device: FIRST_DEVICE,
         });

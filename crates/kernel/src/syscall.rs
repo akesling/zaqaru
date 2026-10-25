@@ -1335,9 +1335,12 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // The same program, until the child execs.
             executable: self.executable.clone(),
             comm: self.comm.clone(),
-            // The working directory and the writable layer both come along,
-            // and both are *copies*: what the child writes afterwards is the
-            // child's, which is what fork means.
+            // The working directory comes along as a copy, which is what
+            // fork means for it. The writable layer is *shared*: it is the
+            // container's filesystem, not the process's, and what the child
+            // writes the parent reads — see `overlay::Shared`. The mount
+            // table itself is copied, which gives each process its own
+            // `/proc` and `/dev` to rebuild at `execve`.
             vfs: self.vfs.clone(),
             // Every open descriptor, with its flags — including
             // close-on-exec, which does not help here: cloexec clears at
@@ -1474,9 +1477,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // which is what `/proc/self/exe` has to answer afterwards.
             executable: String::new(),
             comm: String::new(),
-            // The working directory, the root, and the writable layer: all
-            // properties of the process, and the process is the thing that
-            // survives.
+            // The working directory and the root, which are properties of
+            // the process, and the process is the thing that survives; and
+            // the container's writable layer, shared as it always is.
             vfs: self.vfs.clone(),
             // The same process, running a different program: `execve` does
             // not change either number, which is what makes a shell's

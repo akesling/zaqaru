@@ -1094,6 +1094,82 @@ int main(void) {
     );
 }
 
+/// The filesystem is the container's, not the process's: what a child
+/// writes, its parent reads.
+///
+/// An earlier version forked the writable layer along with the address
+/// space, so a child's files vanished with the child and every
+/// `program > file` a shell ran left nothing behind. The second half is the
+/// here-document's shape — a file unlinked while a child still has it open,
+/// whose bytes must outlive the parent's close.
+#[test]
+fn a_child_s_files_are_its_parent_s_files() {
+    agrees_with_native(
+        "fork-files",
+        r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    const char *path = "written-by-the-child";
+    unlink(path);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        write(fd, "from the child\n", 15);
+        close(fd);
+        mkdir("made-by-the-child", 0755);
+        _exit(0);
+    }
+    waitpid(child, 0, 0);
+    char buffer[64] = {0};
+    int fd = open(path, O_RDONLY);
+    printf("parent opens it: %d\n", fd >= 0);
+    read(fd, buffer, sizeof buffer - 1);
+    close(fd);
+    printf("parent reads: %s", buffer);
+    printf("parent sees the directory: %d\n", access("made-by-the-child", F_OK) == 0);
+    unlink(path);
+    rmdir("made-by-the-child");
+
+    /* Opened, unlinked, forked, closed by the parent: the child still reads. */
+    const char *doc = "here-document";
+    fd = open(doc, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    write(fd, "still here\n", 11);
+    lseek(fd, 0, SEEK_SET);
+    unlink(doc);
+    int go[2];
+    pipe(go);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        close(go[1]);
+        char byte;
+        read(go[0], &byte, 1);
+        memset(buffer, 0, sizeof buffer);
+        read(fd, buffer, sizeof buffer - 1);
+        printf("child reads: %s", buffer);
+        fflush(stdout);
+        _exit(0);
+    }
+    close(fd);
+    close(go[0]);
+    write(go[1], "x", 1);
+    close(go[1]);
+    waitpid(child, 0, 0);
+    printf("gone by name: %d\n", access(doc, F_OK) != 0);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
 /// Several children, each with its own address space, reaped in turn.
 ///
 /// The shape a shell has and a build system has: fan out, wait for each. It

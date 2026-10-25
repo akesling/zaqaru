@@ -142,6 +142,49 @@ pub struct Overlay<'a> {
     orphaned: Vec<u32>,
 }
 
+/// The writable layer as each process holds it: one layer for the whole
+/// container, so that what a child writes its parent reads. A copy per
+/// process — which is what forking the mount table used to make — loses
+/// every file a child creates the moment it exits, and with it every
+/// `program > file` a shell runs.
+///
+/// Shared the way the rings and sockets are, by reference, but handing out
+/// plain references rather than guards: everything above reads a file's
+/// bytes and a directory's entries as slices borrowed from the filesystem,
+/// and those borrows are already ordered by the borrow checker within a
+/// process — they come from `&Vfs` or `&mut Vfs`. What it cannot see is two
+/// processes, and that is what the invariant below is about.
+#[derive(Clone)]
+pub struct Shared<'a>(std::rc::Rc<core::cell::UnsafeCell<Overlay<'a>>>);
+
+impl<'a> Shared<'a> {
+    pub fn new(overlay: Overlay<'a>) -> Self {
+        Self(std::rc::Rc::new(core::cell::UnsafeCell::new(overlay)))
+    }
+
+    pub fn get(&self) -> &Overlay<'a> {
+        // SAFETY: the container runs one process at a time, and a borrow
+        // taken through one process's handle ends before another process's
+        // kernel is entered — nothing holds a vnode's bytes across a switch,
+        // and the system never walks two processes' filesystems at once.
+        // Within one process the handle is reached only through its `Vfs`,
+        // whose own borrows keep `get` and `get_mut` apart.
+        unsafe { &*self.0.get() }
+    }
+
+    pub fn get_mut(&mut self) -> &mut Overlay<'a> {
+        // SAFETY: as for `get`.
+        unsafe { &mut *self.0.get() }
+    }
+
+    /// How many processes hold the layer: one when nothing else can have a
+    /// file in it open. Zombies count until reaped, which only errs on the
+    /// side of keeping bytes a little longer.
+    pub fn holders(&self) -> usize {
+        std::rc::Rc::strong_count(&self.0)
+    }
+}
+
 impl<'a> Overlay<'a> {
     /// An overlay with an empty upper: every read goes to the image, and the
     /// first write is what creates anything here.
@@ -950,6 +993,14 @@ impl Overlay<'_> {
     /// filesystem into a cycle that neither owns.
     pub fn take_orphans(&mut self) -> Vec<u32> {
         core::mem::take(&mut self.orphaned)
+    }
+
+    /// Puts an orphan back on the list, for a holder this process cannot
+    /// see to be asked about.
+    pub fn defer(&mut self, node: u32) {
+        if !self.orphaned.contains(&node) {
+            self.orphaned.push(node);
+        }
     }
 
     /// Frees a node's contents. The node stays; see [`Body::Released`].

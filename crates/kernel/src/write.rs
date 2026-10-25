@@ -555,18 +555,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             overlay.take_orphans()
         };
         for node in orphans {
-            if self.files.holds(node) {
-                // A descriptor still has it. The name is gone and the bytes
-                // are not, which is exactly what an unlinked-but-open file
-                // is; `close` runs this again.
-                continue;
-            }
-            let root = self.vfs.root();
-            if let Ok(filesystem) = self.vfs.filesystem_of_mut(root)
-                && let Some(overlay) = filesystem.writable()
-            {
-                let _ = overlay.release(node);
-            }
+            self.release_if_unheld(node);
         }
     }
 
@@ -576,15 +565,43 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         let Some(node) = node else {
             return;
         };
-        if !crate::overlay::is_upper(node.inode) || self.files.holds(node.inode) {
+        let root = self.vfs.root();
+        let orphaned = crate::overlay::is_upper(node.inode)
+            && self
+                .vfs
+                .filesystem_of(root)
+                .is_ok_and(|filesystem| filesystem.is_orphaned(node.inode));
+        if orphaned {
+            self.release_if_unheld(node.inode);
+        }
+    }
+
+    /// Frees an orphan's bytes if no descriptor anywhere still has it.
+    ///
+    /// The layer is the container's, so "anywhere" is every process, and
+    /// this one can only see its own table. When it is the only process
+    /// that is the whole answer; otherwise the node goes back on the list
+    /// for the system to check against every table — see
+    /// [`crate::system::System`]'s sweep.
+    fn release_if_unheld(&mut self, node: u32) {
+        if self.files.holds(node) {
+            // A descriptor still has it. The name is gone and the bytes
+            // are not, which is exactly what an unlinked-but-open file
+            // is; `close` runs this again.
             return;
         }
         let root = self.vfs.root();
-        if let Ok(filesystem) = self.vfs.filesystem_of_mut(root)
-            && let Some(overlay) = filesystem.writable()
-            && overlay.is_orphaned(node.inode)
-        {
-            let _ = overlay.release(node.inode);
+        let Ok(filesystem) = self.vfs.filesystem_of_mut(root) else {
+            return;
+        };
+        let alone = filesystem.holders() == 1;
+        if let Some(overlay) = filesystem.writable() {
+            match alone {
+                true => {
+                    let _ = overlay.release(node);
+                }
+                false => overlay.defer(node),
+            }
         }
     }
 
@@ -1251,14 +1268,14 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// back rather than taking it on trust.
     pub fn held_bytes(&self) -> usize {
         match self.vfs.filesystem_of(self.vfs.root()) {
-            Ok(crate::mount::Filesystem::Overlay(overlay)) => overlay.held_bytes(),
+            Ok(crate::mount::Filesystem::Overlay(overlay)) => overlay.get().held_bytes(),
             _ => 0,
         }
     }
 
     pub fn released_bytes(&self) -> usize {
         match self.vfs.filesystem_of(self.vfs.root()) {
-            Ok(crate::mount::Filesystem::Overlay(overlay)) => overlay.released(),
+            Ok(crate::mount::Filesystem::Overlay(overlay)) => overlay.get().released(),
             _ => 0,
         }
     }

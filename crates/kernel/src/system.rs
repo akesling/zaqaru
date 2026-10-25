@@ -231,9 +231,45 @@ impl<'a, S: Store + Clone> System<'a, S> {
         if index == self.current {
             return;
         }
+        self.sweep_orphans();
         self.containers[self.current].process.kernel.deactivate();
         self.current = index;
         self.containers[index].process.kernel.activate();
+    }
+
+    /// Frees the unlinked files no process has open any more.
+    ///
+    /// The writable layer is the container's, and a process deciding
+    /// whether an unlinked file's bytes can go sees only its own
+    /// descriptors: a shell that unlinks a here-document after forking the
+    /// command that reads it must not free it under that command. So a
+    /// process that is not alone leaves the decision here, where every
+    /// table can be asked. Run at every switch and every exit, which bounds
+    /// how long the bytes outstay their last reader.
+    fn sweep_orphans(&mut self) {
+        let orphans = {
+            let vfs = &mut self.containers[self.current].process.kernel.vfs;
+            let root = vfs.root();
+            match vfs.filesystem_of_mut(root).ok().and_then(|filesystem| filesystem.writable()) {
+                Some(overlay) => overlay.take_orphans(),
+                None => return,
+            }
+        };
+        for node in orphans {
+            let held = self
+                .containers
+                .iter()
+                .any(|container| container.process.kernel.files.holds(node));
+            if held {
+                // Its holder's `close` puts it back on the list.
+                continue;
+            }
+            let vfs = &mut self.containers[self.current].process.kernel.vfs;
+            let root = vfs.root();
+            if let Some(overlay) = vfs.filesystem_of_mut(root).ok().and_then(|filesystem| filesystem.writable()) {
+                let _ = overlay.release(node);
+            }
+        }
     }
 
     /// Picks the next process with something to run, round-robin.
@@ -1077,6 +1113,8 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 thread.tcb.accelerated = 0;
             }
         }
+        // Its descriptors were the last on some unlinked file, perhaps.
+        self.sweep_orphans();
         let parent = self.containers[index].parent;
         // Whatever this process was the parent of is now `init`'s, which is
         // the first process — the same rule Linux has, and here it is what
