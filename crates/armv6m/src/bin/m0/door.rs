@@ -107,6 +107,10 @@ const HELP: &str = "\
                             uploaded (drop an archive on the terminal)
     button                  press and release the Nucleo's user button,
                             PC13 on an H7's
+    udp [PORT] TEXT         send TEXT to the board's UDP PORT (7, echo, if
+                            none) from the host on its Ethernet cable,
+                            and show what comes back — an H7's
+    ping                    an ICMPv6 echo request to the board
     humility -p VID:PID …   the same against a probe connected from the
                             page — its USB panel, 'connect a USB
                             device…' — on real hardware
@@ -169,11 +173,19 @@ fn session(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
                 let pressed = ["pin PC13 high\n", "pin PC13 low\n"].iter().all(|line| std::fs::write("/dev/board", line).is_ok());
                 out.write_all(if pressed { b"pressed and released B1\n" } else { b"the board has no button to press\n" })?
             }
+            Some("udp") => {
+                let (port, text) = match words.get(1).and_then(|w| w.parse::<u16>().ok()) {
+                    Some(port) => (port, words[2..].join(" ")),
+                    None => (7, words[1..].join(" ")),
+                };
+                door.network(&format!("udp {port} {text}\n"), &out)?
+            }
+            Some("ping") => door.network("ping\n", &out)?,
             Some("flash") => match words.get(1) {
                 Some(name) => door.flash(name, &out)?,
                 None => out.write_all(b"flash NAME: an archive `archives` lists, or one uploaded\n")?,
             },
-            Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, button, flash, help and exit\n").as_bytes())?,
+            Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, button, udp, ping, flash, help and exit\n").as_bytes())?,
         }
         out.write_all(PROMPT)?;
     }
@@ -270,6 +282,40 @@ impl FrontDoor {
         }
         let file = if name.ends_with(".zip") { name.to_string() } else { format!("{name}.zip") };
         [UPLOADS, ARCHIVES].iter().map(|d| format!("{d}/{file}")).find(|p| std::path::Path::new(p).is_file())
+    }
+
+    /// Sends a frame from the host on the board's cable, by a `/dev/board`
+    /// command, and shows what the host hears in the next few seconds: the
+    /// `heard #N` lines of the board's state it had not shown before.
+    fn network(&self, command: &str, out: &TcpStream) -> std::io::Result<()> {
+        let mut out = out;
+        let heard = |status: Option<String>| -> Vec<String> {
+            status.unwrap_or_default().lines().filter(|l| l.starts_with("heard #")).map(str::to_string).collect()
+        };
+        let before = heard((self.status)());
+        if let Err(e) = std::fs::write("/dev/board", command) {
+            return out.write_all(format!("the board would not: {e}\n").as_bytes());
+        }
+        let started = std::time::Instant::now();
+        let mut shown = 0;
+        while started.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let new: Vec<String> = heard((self.status)()).into_iter().filter(|l| !before.contains(l)).collect();
+            for line in &new[shown.min(new.len())..] {
+                let line = line.split_once(' ').map_or(line.as_str(), |(_, rest)| rest).trim_start();
+                let line = line.split_once(' ').map_or(line, |(_, rest)| rest).trim_start();
+                out.write_all(format!("{line}\n").as_bytes())?;
+            }
+            shown = shown.max(new.len());
+            // A reply has come; give a moment for more, then stop.
+            if shown > 0 && started.elapsed() > std::time::Duration::from_millis(1500) {
+                break;
+            }
+        }
+        if shown == 0 {
+            out.write_all(b"nothing came back\n")?;
+        }
+        Ok(())
     }
 
     /// `flash NAME`: the board becomes the part the archive was built for,

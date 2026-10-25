@@ -109,7 +109,16 @@ pub struct Board {
     /// The USB probe, and the responses it has for the host to read.
     usb_probe: Probe,
     usb_responses: VecDeque<Vec<u8>>,
+    /// The host at the other end of the board's Ethernet cable, and the
+    /// latest of what it heard, numbered.
+    pub host: armv6m::net::Peer,
+    pub heard: VecDeque<(u64, String)>,
+    heard_count: u64,
+    pings: u16,
 }
+
+/// How many of what the host heard the board keeps.
+const HEARD_KEPT: usize = 16;
 
 /// The debugger connected to the probe.
 struct Client {
@@ -140,6 +149,8 @@ pub struct Led {
     pub port: u8,
     pub pin: u8,
     pub active_low: bool,
+    /// What it lights, for the page to draw.
+    pub color: &'static str,
 }
 
 impl Led {
@@ -148,12 +159,14 @@ impl Led {
     /// the Nucleo-64 wires it), the G030 oxcon2023g0 badge's PB7, and the
     /// Nucleo-144 H7s' green PB0, red PB14 and yellow PE1.
     pub fn of(part: &str) -> Vec<Led> {
-        let led = |port: u8, pin: u8, active_low: bool| Led { port, pin, active_low };
+        let led = |port: u8, pin: u8, active_low: bool, color: &'static str| Led { port, pin, active_low, color };
         match part {
-            "stm32g031" => vec![led(2, 6, true)],
-            "stm32g070" => vec![led(0, 5, false)],
-            "stm32g030" => vec![led(1, 7, true)],
-            "stm32h743" | "stm32h753" => vec![led(1, 0, false), led(1, 14, false), led(4, 1, false)],
+            "stm32g031" => vec![led(2, 6, true, "green")],
+            "stm32g070" => vec![led(0, 5, false, "green")],
+            "stm32g030" => vec![led(1, 7, true, "green")],
+            "stm32h743" | "stm32h753" => {
+                vec![led(1, 0, false, "green"), led(1, 14, false, "red"), led(4, 1, false, "yellow")]
+            }
             _ => Vec::new(),
         }
     }
@@ -172,7 +185,7 @@ impl Led {
             "high" => false,
             _ => return None,
         };
-        Some(Led { port, pin, active_low })
+        Some(Led { port, pin, active_low, color: "green" })
     }
 
     fn name(&self) -> String {
@@ -227,6 +240,21 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
     })
 }
 
+/// What the host heard, as a line: a datagram's text and where from, or
+/// an echo reply.
+fn heard_line(heard: &armv6m::net::Heard) -> String {
+    use armv6m::net::{Heard, show};
+    match heard {
+        Heard::Udp { from, source, port, payload } => {
+            let text = String::from_utf8_lossy(payload);
+            let printable = text.chars().all(|c| !c.is_control() || c == '\n');
+            let body = if printable { format!("{:?}", text.trim_end_matches('\n')) } else { format!("{} bytes", payload.len()) };
+            format!("{body} from [{}]:{source} to port {port}", show(from))
+        }
+        Heard::Pong { from, sequence } => format!("an echo reply from [{}], sequence {sequence}", show(from)),
+    }
+}
+
 fn lit_json(lit: Option<bool>) -> String {
     use crate::system::server::quoted;
     match lit {
@@ -264,7 +292,10 @@ impl Board {
     ///   blank part, for `humility flash` to program;
     /// - `image TEXT` says what is in its flash now, for the panel;
     /// - `pin PC13 high`, `low` or `float` drives a pin from outside the
-    ///   chip, or lets it go: a button pressed and released.
+    ///   chip, or lets it go: a button pressed and released;
+    /// - `udp PORT TEXT` sends a datagram to the board's port from the host
+    ///   at the other end of its Ethernet cable, and `ping` an echo
+    ///   request; what comes back is in the board's state.
     pub fn command(&mut self, line: &str) -> Result<(), String> {
         let (verb, rest) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
         match verb {
@@ -277,6 +308,8 @@ impl Board {
                 self.chip = part.name.to_string();
                 self.image = "(erased)".to_string();
                 self.leds = Led::of(part.name).into_iter().map(|led| (led, None)).collect();
+                self.host = armv6m::net::Peer::default();
+                self.heard.clear();
                 self.serial.clear();
                 self.faults = 0;
                 self.usb_probe = Probe::default();
@@ -293,6 +326,17 @@ impl Board {
                 self.image = rest.trim().to_string();
                 Ok(())
             }
+            "udp" => {
+                let (port, text) = rest.trim().split_once(char::is_whitespace).unwrap_or((rest.trim(), ""));
+                let port = port.parse().map_err(|_| format!("udp `{port}`: expected a port, then the text"))?;
+                let frame = self.host.udp(port, text.as_bytes());
+                self.send_frame(frame)
+            }
+            "ping" => {
+                self.pings = self.pings.wrapping_add(1);
+                let frame = self.host.ping(self.pings);
+                self.send_frame(frame)
+            }
             "pin" => {
                 let (pin, level) = rest.trim().split_once(char::is_whitespace).unwrap_or((rest.trim(), ""));
                 let (port, pin) = parse_pin(pin).ok_or_else(|| format!("pin `{pin}`: expected a pin, `PC13`"))?;
@@ -306,8 +350,13 @@ impl Board {
                 Ok(())
             }
             "" => Ok(()),
-            other => Err(format!("`{other}`: the board takes `part NAME`, `image TEXT` and `pin PIN LEVEL`")),
+            other => Err(format!("`{other}`: the board takes `part NAME`, `image TEXT`, `pin PIN LEVEL`, `udp PORT TEXT` and `ping`")),
         }
+    }
+
+    /// A frame onto the board's Ethernet, from the host.
+    fn send_frame(&mut self, frame: Vec<u8>) -> Result<(), String> {
+        if self.machine.deliver(frame) { Ok(()) } else { Err(format!("the {} has no Ethernet", self.chip)) }
     }
 
     /// The instant, in monotonic nanoseconds, by which an idle container
@@ -413,6 +462,22 @@ impl Board {
                     self.serial.push(byte.byte);
                     if self.serial.len() > 2 * SERIAL_KEPT {
                         self.serial.drain(..self.serial.len() - SERIAL_KEPT);
+                    }
+                }
+                // What the board sends reaches the host, which may answer.
+                Event::Frame { cycle, frame } => {
+                    let (replies, heard) = self.host.receive(&frame);
+                    for reply in replies {
+                        self.machine.deliver(reply);
+                    }
+                    for heard in heard {
+                        self.heard_count += 1;
+                        let line = heard_line(&heard);
+                        self.console.push(format!("[board {:>10.3} ms] the host heard {line}", self.ms(cycle)));
+                        self.heard.push_back((self.heard_count, line));
+                        if self.heard.len() > HEARD_KEPT {
+                            self.heard.pop_front();
+                        }
                     }
                 }
                 Event::Fault { cycle, pc, fault, mode, privileged } => {
@@ -580,7 +645,7 @@ impl Board {
             _ => String::new(),
         };
         format!(
-            r#"{{"chip":{},"core":{},"image":{},"state":{},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"exceptions":{{{}}},"registers":{{{}}}}}"#,
+            r#"{{"chip":{},"core":{},"image":{},"state":{},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"exceptions":{{{}}},"registers":{{{}}}}}"#,
             quoted(&self.chip),
             quoted(core_name(m.core)),
             quoted(&self.image),
@@ -593,7 +658,9 @@ impl Board {
             self.leds.first().map_or("null".into(), |(led, _)| quoted(&led.name())),
             self.leds
                 .iter()
-                .map(|(led, lit)| format!(r#"{{"pin":{},"state":{}}}"#, quoted(&led.name()), lit_json(*lit)))
+                .map(|(led, lit)| {
+                    format!(r#"{{"pin":{},"color":{},"state":{}}}"#, quoted(&led.name()), quoted(led.color), lit_json(*lit))
+                })
                 .collect::<Vec<_>>()
                 .join(","),
             self.faults,
@@ -602,6 +669,7 @@ impl Board {
             // The tail, as text: enough for the panel to show, and no more
             // than a read of the lens should carry.
             quoted(&String::from_utf8_lossy(&self.serial[self.serial.len().saturating_sub(4096)..])),
+            self.heard.iter().map(|(_, line)| quoted(line)).collect::<Vec<_>>().join(","),
             exceptions.join(","),
             registers.join(","),
         )
@@ -628,6 +696,14 @@ impl Board {
             })
             .collect();
         let leds = if leds.is_empty() { "LED         none".to_string() } else { leds.join("\n") };
+        let mut network = String::new();
+        if matches!(m.bus.soc, armv6m::bus::Soc::H7(_)) {
+            let board = self.host.board.map_or("not heard from yet".into(), |(_, ip)| armv6m::net::show(&ip));
+            network = format!("network     the host is {}, the board {board}\n", armv6m::net::show(&self.host.ip));
+            for (n, line) in &self.heard {
+                network += &format!("heard #{n:<4} {line}\n");
+            }
+        }
         let taken: Vec<String> = m
             .taken
             .iter()
@@ -636,7 +712,7 @@ impl Board {
             .map(|(n, count)| format!("{} {count}", armv6m::scs::exception::name(n as u32)))
             .collect();
         format!(
-            "board       {} (emulated {}), in the kernel\nimage       {}\nstate       {state}\ntime        {:.3} s simulated, {} instructions\n{leds}\nfaults      {}\nexceptions  {}\n",
+            "board       {} (emulated {}), in the kernel\nimage       {}\nstate       {state}\ntime        {:.3} s simulated, {} instructions\n{leds}\nfaults      {}\nexceptions  {}\n{network}",
             self.chip,
             core_name(m.core),
             self.image,
@@ -779,6 +855,10 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             console: Vec::new(),
             usb_probe: Probe::default(),
             usb_responses: VecDeque::new(),
+            host: armv6m::net::Peer::default(),
+            heard: VecDeque::new(),
+            heard_count: 0,
+            pings: 0,
         }))
     }
 
@@ -871,7 +951,7 @@ mod tests {
                 chip: "stm32g031".into(),
                 image: "/hubris/final.bin".into(),
                 probe: (0x7F00_0001, 3333),
-                leds: vec![Led { port: 2, pin: 6, active_low: true }],
+                leds: vec![Led { port: 2, pin: 6, active_low: true, color: "green" }],
             }
         );
     }
@@ -879,9 +959,9 @@ mod tests {
     #[test]
     fn a_part_brings_its_board_s_led_unless_told_otherwise() {
         let g070 = parse("chip STM32G070RBTx\nimage /f.bin").unwrap();
-        assert_eq!((g070.chip.as_str(), g070.leds), ("stm32g070", vec![Led { port: 0, pin: 5, active_low: false }]));
+        assert_eq!((g070.chip.as_str(), g070.leds), ("stm32g070", vec![Led { port: 0, pin: 5, active_low: false, color: "green" }]));
         let told = parse("chip stm32g031\nimage /f.bin\nled PA12 low").unwrap();
-        assert_eq!(told.leds, vec![Led { port: 0, pin: 12, active_low: true }]);
+        assert_eq!(told.leds, vec![Led { port: 0, pin: 12, active_low: true, color: "green" }]);
         assert!(parse("image /f.bin\nled PZ9 low").is_err());
         let h753 = parse("chip STM32H753ZITx\nimage /f.bin").unwrap();
         assert_eq!((h753.chip.as_str(), h753.leds.len()), ("stm32h753", 3));

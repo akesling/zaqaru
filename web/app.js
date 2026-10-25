@@ -962,19 +962,25 @@ const renderers = {
     panel.body.querySelector(".connect").onclick = connectUsb;
   },
 
-  // A board on the container's bench: its LED drawn, and the core's state.
+  // A board on the container's bench: its LEDs drawn, and the core's state.
   board(value, panel) {
-    const on = value.led === "on";
+    const leds = value.leds ?? (value.led_pin ? [{ pin: value.led_pin, color: "green", state: value.led }] : []);
     const registers = Object.entries(value.registers ?? {})
       .map(([name, held]) => `<div><span class="key">${escape(name)}</span>${escape(held)}</div>`)
       .join("");
     const exceptions = Object.entries(value.exceptions ?? {})
       .map(([name, count]) => `${escape(name)} ${count.toLocaleString()}`)
       .join(" · ");
+    const lamps = leds
+      .map((led) => `<div class="led ${escape(led.color)}${led.state === "on" ? " on" : ""}" title="${escape(led.pin)}: ${escape(led.state ?? "never driven")}"></div>`)
+      .join("");
+    const lit = leds.map((led) => `${escape(led.pin)} ${escape(led.state ?? "never driven")}`).join(", ");
+    const heard = (value.heard ?? []).slice(-4).map((line) => `<div class="dim">heard ${escape(line)}</div>`).join("");
     panel.body.innerHTML = `<div class="board">
-      <div class="led${on ? " on" : ""}" title="the user LED, PC6, active low"></div>
-      <div><b>${escape(value.chip)}</b> · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated</div>
-      <div>LED ${escape(value.led ?? "never driven")} · ${value.faults} faults · probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
+      <div class="leds">${lamps}</div>
+      <div><b>${escape(value.chip)}</b>${value.core ? ` (${escape(value.core)})` : ""} · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated</div>
+      <div>LED${leds.length > 1 ? "s" : ""} ${lit || "none"} · ${value.faults} faults · probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
+      ${heard}
       <div class="dim">${escape(value.image)} · ${value.instructions.toLocaleString()} instructions · ${escape(value.mode)} mode, ${value.privileged ? "privileged" : "unprivileged"}</div>
       <div class="dim">${exceptions}</div>
       <div class="registers">${registers}</div>
