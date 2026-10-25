@@ -52,6 +52,11 @@ pub const REGISTERS: usize = 24;
 /// The first scratch register. Registers below this alias the guest file;
 /// registers from here up are the transpiler's temporaries.
 pub const SCRATCH: usize = 16;
+/// A register that always holds zero: past the twenty-four named ones, in
+/// the slot the five-bit field can still address. Nothing writes it — the
+/// transpiler never hands it out — so an absolute address is `[ZERO + disp]`
+/// in one op, rather than a constant materialised into a scratch first.
+pub const ZERO: u8 = 31;
 
 /// One decoded instruction of the bytecode.
 ///
@@ -87,7 +92,8 @@ pub enum Op {
     Mov = 6,
 
     /// The arithmetic and logical core. The right-hand side is `regs[b]`, or
-    /// the immediate when the immediate modifier is set. All record flags
+    /// the immediate — sign-extended to the op's width, as x86 extends an
+    /// `imm32` — when the immediate modifier is set. All record flags
     /// unless the no-flags modifier is set (dead-flag elimination). `Cmp`
     /// and `Test` do not write back.
     Add = 7,
@@ -233,9 +239,19 @@ pub enum Op {
     /// addressing still materialise. Can fault; `StoreX` dirties code pages.
     LoadX = 47,
     StoreX = 48,
+    /// `ExitTo` a constant: leave the trace with `rip` = the immediate. The
+    /// out-of-trace `jmp` and the fall-through off a trace's end, which
+    /// otherwise materialise the target into a scratch first — one of the
+    /// commonest op pairs a real workload dispatches. Retires as `ExitTo`.
+    ExitImm = 49,
 }
 
 impl Op {
+    /// The op's name, for a report. `None` for a byte no op uses.
+    pub fn name(byte: u8) -> String {
+        Op::from_byte(byte).map_or_else(|| format!("op{byte}"), |op| format!("{op:?}"))
+    }
+
     /// The op a raw byte encodes, or `None` for a byte no op uses — which a
     /// well-formed trace never contains, so the interpreter may treat the
     /// `None` as unreachable.
@@ -244,7 +260,7 @@ impl Op {
         // The discriminants are contiguous 0..=29, so a range check and a
         // transmute is the whole of it — the dense dispatch the format is
         // for.
-        (byte <= Op::StoreX as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
+        (byte <= Op::ExitImm as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
     }
 }
 
@@ -480,8 +496,10 @@ pub fn run<'a>(
         };
     }
 
+    crate::opcount::entered();
     loop {
         let word = code[pc];
+        crate::opcount::record((word >> field::OP) as u8);
         let op = match Op::from_byte((word >> field::OP) as u8) {
             Some(op) => op,
             // A well-formed trace never holds a byte no op uses.
@@ -495,7 +513,7 @@ pub fn run<'a>(
         pc += 1;
 
         match op {
-            Op::ExitTo => {
+            Op::ExitTo | Op::ExitImm => {
                 // A retiring `ExitTo` is a guest transfer (jmp/call/ret);
                 // a non-retiring one is a fall-through or stub exit that stands
                 // for no instruction, so it must not count. The budget is
@@ -507,7 +525,7 @@ pub fn run<'a>(
                 if retire {
                     spent += 1;
                 }
-                let target = regs[d];
+                let target = if matches!(op, Op::ExitImm) { u64::from(imm) } else { regs[d] };
                 if spent >= budget {
                     tcb.rip = target;
                     flush!();
@@ -602,7 +620,7 @@ pub fn run<'a>(
                 let width = width_of(word);
                 let left = read!(a, width);
                 let right = if (word >> field::IMMEDIATE) & 1 != 0 {
-                    imm as u64 & width.mask()
+                    imm as i32 as i64 as u64 & width.mask()
                 } else {
                     read!(b, width)
                 };
@@ -804,7 +822,7 @@ pub fn run<'a>(
                 let width = width_of(word);
                 let left = read!(a, width);
                 let right = if (word >> field::IMMEDIATE) & 1 != 0 {
-                    imm as u64 & width.mask()
+                    imm as i32 as i64 as u64 & width.mask()
                 } else {
                     read!(b, width)
                 };
@@ -867,7 +885,7 @@ pub fn run<'a>(
                 let width = width_of(word);
                 let left = read!(a, width);
                 let right = if (word >> field::IMMEDIATE) & 1 != 0 {
-                    imm as u64 & width.mask()
+                    imm as i32 as i64 as u64 & width.mask()
                 } else {
                     read!(b, width)
                 };
@@ -892,7 +910,7 @@ pub fn run<'a>(
                     .expect("a four-bit condition is one of sixteen");
                 let left = read!(a, width);
                 let right = if (word >> field::IMMEDIATE) & 1 != 0 {
-                    imm as u64 & width.mask()
+                    imm as i32 as i64 as u64 & width.mask()
                 } else {
                     read!(b, width)
                 };

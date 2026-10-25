@@ -724,8 +724,21 @@ impl Space {
 
     /// Queues the pages of a store for invalidation, if any holds code, and
     /// records them as written.
-    #[inline]
+    #[inline(always)]
     fn note_code_write(&mut self, address: u64, length: u64) {
+        // The fast path, inline at every store: one page, the one this way
+        // last found clean in this epoch. Everything else is the call.
+        if length != 0 {
+            let first = address >> PAGE_SHIFT;
+            if (address + length - 1) >> PAGE_SHIFT == first && first | EPOCH.get() == self.last_clean[way(first)] {
+                return;
+            }
+        }
+        self.note_code_write_slow(address, length);
+    }
+
+    #[inline(never)]
+    fn note_code_write_slow(&mut self, address: u64, length: u64) {
         if length == 0 {
             return;
         }

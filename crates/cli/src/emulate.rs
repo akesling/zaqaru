@@ -122,6 +122,10 @@ impl Emulate {
         if let Some(table) = cpu::histogram::report() {
             eprint!("{table}");
         }
+        // And `--features cpu/opcount`: the bytecode's op mix and pairs.
+        if let Some(table) = cpu::opcount::report(cpu::bytecode::Op::name) {
+            eprint!("{table}");
+        }
         // Likewise `--features zaqaru-cpu/profile`. Addresses are attributed
         // against *this* process's address space, so the report is honest
         // for a container running one process and misleading for a tree of

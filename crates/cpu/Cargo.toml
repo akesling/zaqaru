@@ -14,6 +14,9 @@ name = "cpu"
 # Off by default because it runs once per retired instruction, which is the
 # one place this engine cannot afford anything.
 histogram = []
+# And the bytecode's own: which ops it dispatches, and which pairs, for
+# choosing what to fuse. Off by default for the same reason.
+opcount = []
 # Instructions as text, for the debugger's disassembly panel: iced's fast
 # formatter, which the engine itself never needs. See `disassembly`.
 disassembly = ["iced-x86/fast_fmt"]

@@ -41,6 +41,7 @@ pub mod disassembly;
 pub mod exec;
 pub mod flags;
 pub mod histogram;
+pub mod opcount;
 pub mod profile;
 pub mod quick;
 pub mod space;

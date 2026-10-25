@@ -567,8 +567,13 @@ impl Emitter {
         self.push(encode(Op::ExitTo, register, 0, 0, Width::Qword, false, false, retire, 0, 0));
     }
 
-    /// Leaves the trace with `rip` set to a constant guest address.
+    /// Leaves the trace with `rip` set to a constant guest address: in one
+    /// op when it fits the immediate, as every address in the module does.
     fn exit_to_address(&mut self, address: u64, retire: bool) {
+        if let Ok(address) = u32::try_from(address) {
+            self.push(encode(Op::ExitImm, 0, 0, 0, Width::Qword, false, false, retire, 0, address));
+            return;
+        }
         let target = self.temp();
         self.li(target, address, false);
         self.exit_to_register(target, retire);
@@ -588,9 +593,12 @@ impl Emitter {
     /// base or index that is not a full register — so the caller defers.
     fn address(&mut self, quick: &Quick) -> Option<(u8, i32)> {
         match quick.address {
+            // A fixed (absolute or `%rip`-relative) address the displacement
+            // can carry: `[ZERO + at]`, no scratch.
+            Address::Fixed(at) if !quick.segmented && i32::try_from(at).is_ok() => Some((super::ZERO, at as i32)),
             Address::Fixed(at) if !quick.segmented => {
-                // A fixed (absolute or `%rip`-relative) address: materialise
-                // it into a scratch and load from `[scratch + 0]`.
+                // One the displacement cannot: materialise it into a scratch
+                // and load from `[scratch + 0]`.
                 let base = self.temp();
                 self.li(base, at, false);
                 Some((base, 0))
@@ -621,6 +629,29 @@ impl Emitter {
                     return Some((base.number, disp));
                 }
 
+                // Base, index and a displacement that fits: one `Lea` — the
+                // op computes all three — where the general case below takes
+                // a constant, an add and a `Lea`.
+                let log = match scale {
+                    1 => Some(0),
+                    2 => Some(1),
+                    4 => Some(2),
+                    8 => Some(3),
+                    _ => None,
+                };
+                if let (Ok(disp), Some(log)) = (i32::try_from(displacement as i64), log) {
+                    let base = base_slice.map_or(super::ZERO, |base| base.number);
+                    if index_slice.is_none() && !quick.segmented {
+                        return Some((base, disp));
+                    }
+                    let target = self.temp();
+                    let index = index_slice.map_or(super::ZERO, |index| index.number);
+                    self.push(encode(Op::Lea, target, base, index, Width::Qword, false, false, false, log, disp as u32));
+                    if quick.segmented {
+                        self.add_fs(target);
+                    }
+                    return Some((target, 0));
+                }
                 let target = self.temp();
                 self.li(target, displacement, false);
                 if let Some(base) = base_slice {
@@ -1554,10 +1585,16 @@ fn mem_rmw_sub(op: Op) -> Option<u8> {
 /// zero-extended: always for widths up to a dword, and for a qword only when
 /// the value is within 32 bits. A value outside it is materialised with
 /// `Li64` instead.
+/// Whether an operand's immediate rides in the op's 32-bit field, which an
+/// op sign-extends to its width — as x86 does an `imm32` for a 64-bit
+/// operation, so the negative constants code is full of (`add rsp, -0x18`,
+/// `and rsp, -16`, `cmp rax, -1`) take one op rather than a 64-bit constant
+/// materialised first. At a narrower width only the low bits matter, so
+/// everything fits.
 fn fits_immediate(width: Width, value: u64) -> bool {
     match width {
         Width::Byte | Width::Word | Width::Dword => true,
-        Width::Qword => value <= u64::from(u32::MAX),
+        Width::Qword => i32::try_from(value as i64).is_ok(),
     }
 }
 

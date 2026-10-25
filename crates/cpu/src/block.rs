@@ -188,7 +188,7 @@ pub struct BlockCache {
     /// a stale entry here would hand back a block decoded from bytes the
     /// guest has since overwritten, and that is the one bug this whole file
     /// exists to make impossible.
-    recent: Vec<(u64, usize)>,
+    recent: Vec<core::cell::Cell<(u64, usize)>>,
     /// Which blocks took bytes from each page. The list is short —
     /// a page holds a few dozen blocks — so removal is a scan.
     registry: FastMap<u64, Vec<usize>>,
@@ -227,7 +227,7 @@ impl BlockCache {
             entries: FastMap::default(),
             // Allocated once, here, rather than checked for on a path that
             // runs every fifth instruction.
-            recent: vec![(u64::MAX, 0); RECENT],
+            recent: vec![core::cell::Cell::new((u64::MAX, 0)); RECENT],
             registry: FastMap::default(),
             decoded: 0,
             flushes: 0,
@@ -265,7 +265,7 @@ impl BlockCache {
         // and their low bits are the ones that differ, but so are the bits
         // just above, and a block entry is never one byte from another.
         let slot = ((address >> 4) as usize) & (RECENT - 1);
-        let (cached, index) = self.recent[slot];
+        let (cached, index) = self.recent[slot].get();
         // `get`, not an index: a flush empties the slab, and a slot may
         // still name an index past its new end.
         if cached == address
@@ -275,12 +275,12 @@ impl BlockCache {
             return Ok(index);
         }
         if let Some(index) = self.entries.get(&address) {
-            self.recent[slot] = (address, *index);
+            self.recent[slot].set((address, *index));
             return Ok(*index);
         }
         let block = decode(address, space, self.accelerate)?;
         let index = self.install(block, space);
-        self.recent[slot] = (address, index);
+        self.recent[slot].set((address, index));
         Ok(index)
     }
 
@@ -303,7 +303,7 @@ impl BlockCache {
     ///
     pub fn resolve_trace(&self, address: u64) -> Option<&crate::bytecode::Trace> {
         let slot = ((address >> 4) as usize) & (RECENT - 1);
-        let (cached, index) = self.recent[slot];
+        let (cached, index) = self.recent[slot].get();
         if cached == address
             && let Some(Some(block)) = self.blocks.get(index)
             && block.entry == address
@@ -312,6 +312,10 @@ impl BlockCache {
         }
         let index = *self.entries.get(&address)?;
         let block = self.blocks[index].as_ref()?;
+        // Remembered, so the next transfer here is the slot's compare and
+        // not the hash — a `Cell` because this is the read-only probe the
+        // bytecode makes while it holds the cache shared.
+        self.recent[slot].set((address, index));
         (block.entry == address).then(|| block.trace.as_ref()).flatten()
     }
 
@@ -414,7 +418,9 @@ impl BlockCache {
         self.free.clear();
         self.entries.clear();
         self.registry.clear();
-        self.recent.fill((u64::MAX, 0));
+        for slot in &self.recent {
+            slot.set((u64::MAX, 0));
+        }
         self.flushes += 1;
     }
 }
