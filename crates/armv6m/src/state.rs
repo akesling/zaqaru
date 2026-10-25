@@ -72,6 +72,12 @@ pub struct Cpu {
     pub basepri: u8,
     /// FAULTMASK: raises the execution priority to -1.
     pub faultmask: bool,
+    /// The FPU's registers, s0–s31 (d0–d15 in pairs).
+    pub s: [u32; 32],
+    pub fpscr: u32,
+    /// CONTROL.FPCA: the current context has used the FPU, so an
+    /// exception stacks its FP state too.
+    pub fpca: bool,
 }
 
 impl Cpu {

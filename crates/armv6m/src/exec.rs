@@ -169,7 +169,7 @@ impl Machine {
 
     fn fetch(&mut self, addr: u32) -> Result<u32, Fault> {
         self.check(addr, Access::Execute)?;
-        self.bus.fetch(addr).ok_or(Fault::Bus { addr })
+        self.bus.fetch(addr).ok_or(Fault::InstructionBus { addr })
     }
 
     /// `BXWritePC`: an interworking branch, which in Handler mode is how an
@@ -507,7 +507,8 @@ impl Machine {
                     // instruction is done before the exception is pended —
                     // the run loop takes it before anything else executes.
                     self.cpu.pc = next;
-                    if self.bus.scs.nvic.priority(SVCALL) < self.priority {
+                    let nvic = &self.bus.scs.nvic;
+                    if nvic.group(nvic.priority(SVCALL)) < self.priority {
                         self.bus.scs.nvic.pend(SVCALL);
                         return Ok(Flow::Next);
                     }
@@ -706,10 +707,11 @@ impl Machine {
         Ok(Flow::Next)
     }
 
-    /// MSR (B4.2.3). Unprivileged code may write only the flags.
+    /// MSR (B4.2.3, B5.2.3). Unprivileged code may write only the flags.
     pub(crate) fn msr(&mut self, n: u32, sysm: u32) {
         let value = self.r(n);
         let privileged = self.cpu.privileged();
+        let v7 = self.core != Core::CortexM0Plus;
         match sysm {
             0..=3 => self.cpu.set_apsr(value),
             8 if privileged => self.cpu.msp = value & !3,
@@ -718,6 +720,25 @@ impl Machine {
                 self.cpu.primask = value & 1 != 0;
                 self.update_priority();
             }
+            17 if privileged && v7 => {
+                self.cpu.basepri = value as u8 & self.bus.scs.nvic.mask;
+                self.update_priority();
+            }
+            // BASEPRI_MAX: only ever raises the priority.
+            18 if privileged && v7 => {
+                let new = value as u8 & self.bus.scs.nvic.mask;
+                if new != 0 && (self.cpu.basepri == 0 || new < self.cpu.basepri) {
+                    self.cpu.basepri = new;
+                    self.update_priority();
+                }
+            }
+            // FAULTMASK cannot be set at HardFault's priority or above.
+            19 if privileged && v7 => {
+                if value & 1 == 0 || self.priority > -1 {
+                    self.cpu.faultmask = value & 1 != 0;
+                    self.update_priority();
+                }
+            }
             20 if privileged => {
                 self.cpu.npriv = value & 1 != 0;
                 // The stack selection is Thread mode's; Handler mode is on
@@ -725,24 +746,30 @@ impl Machine {
                 if self.cpu.mode == Mode::Thread {
                     self.cpu.spsel = value & 2 != 0;
                 }
+                if v7 {
+                    self.cpu.fpca = value & 4 != 0;
+                }
             }
             _ => {}
         }
     }
 
-    /// MRS (B4.2.2). EPSR always reads as zero.
+    /// MRS (B4.2.2, B5.2.2). EPSR always reads as zero.
     pub(crate) fn mrs(&self, sysm: u32) -> u32 {
         let privileged = self.cpu.privileged();
+        let v7 = self.core != Core::CortexM0Plus;
         match sysm {
             0..=7 => {
                 let apsr = if sysm & 4 == 0 { self.cpu.apsr() } else { 0 };
-                let ipsr = if sysm & 1 != 0 { self.cpu.ipsr & 0x3F } else { 0 };
+                let ipsr = if sysm & 1 != 0 { self.cpu.ipsr & 0x1FF } else { 0 };
                 apsr | ipsr
             }
             8 if privileged => self.cpu.msp,
             9 if privileged => self.cpu.psp,
             16 => self.cpu.primask as u32,
-            20 => (self.cpu.npriv as u32) | (self.cpu.spsel as u32) << 1,
+            17 | 18 if v7 => self.cpu.basepri as u32,
+            19 if v7 => self.cpu.faultmask as u32,
+            20 => (self.cpu.npriv as u32) | (self.cpu.spsel as u32) << 1 | (self.cpu.fpca as u32) << 2,
             _ => 0,
         }
     }

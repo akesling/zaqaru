@@ -83,6 +83,8 @@ pub enum Fault {
     InvPc,
     /// An `svc` at a priority that cannot take SVCall.
     SvcEscalation,
+    /// An instruction fetch nothing answered.
+    InstructionBus { addr: u32 },
     /// Pushing an exception frame faulted; the exception that wanted it is
     /// still pending.
     Stacking { exception: u32 },
@@ -90,6 +92,9 @@ pub enum Fault {
     DivideByZero,
     /// A coprocessor instruction with the coprocessor absent or disabled.
     NoCoprocessor { instr: u32 },
+    /// Popping an exception frame faulted, returning from `exception`.
+    /// ARMv7-M only: ARMv6-M reports it as the MemManage it is.
+    Unstacking { exception: u32 },
 }
 
 /// Why [`Machine::run`] returned.
@@ -152,7 +157,7 @@ pub struct Machine {
     pub retired: u64,
     pub events: Vec<Event>,
     /// How many times each exception has been entered.
-    pub taken: [u64; 48],
+    pub taken: Box<[u64; scs::exception::COUNT]>,
     /// The execution priority, kept current by everything that changes it
     /// (see [`Machine::update_priority`]) rather than recomputed for every
     /// access that needs it.
@@ -217,7 +222,7 @@ impl Machine {
             cycles: 0,
             retired: 0,
             events: Vec::new(),
-            taken: [0; 48],
+            taken: Box::new([0; scs::exception::COUNT]),
             priority: scs::BASE_PRIORITY,
             sleeping: false,
             breakpoints: BTreeSet::new(),
@@ -307,7 +312,7 @@ impl Machine {
                 }
                 // `wfi` wakes for anything that would preempt with PRIMASK
                 // clear, and then carries on without taking it.
-                if self.sleeping && p < self.bus.scs.nvic.execution_priority(false) {
+                if self.sleeping && p < self.bus.scs.nvic.execution_priority(false, self.cpu.basepri, self.cpu.faultmask) {
                     self.sleeping = false;
                 }
             }
@@ -443,12 +448,14 @@ impl Machine {
     }
 
     pub(crate) fn update_priority(&mut self) {
-        self.priority = self.bus.scs.nvic.execution_priority(self.cpu.primask);
+        self.priority = self.bus.scs.nvic.execution_priority(self.cpu.primask, self.cpu.basepri, self.cpu.faultmask);
     }
 
-    /// Takes a HardFault for `fault`, at the current pc. A fault the
-    /// processor cannot take — because it is already at HardFault's
-    /// priority or above — is a lockup.
+    /// Takes the exception for `fault`, at the current pc: HardFault on
+    /// ARMv6-M; on ARMv7-M the configurable fault it is, with its syndrome
+    /// in CFSR, unless it has to escalate (B1.5.15). A fault the processor
+    /// cannot take — because it is already at HardFault's priority or
+    /// above — is a lockup.
     pub(crate) fn fault(&mut self, fault: Fault) -> Result<(), Outcome> {
         self.events.push(Event::Fault {
             cycle: self.cycles,
@@ -457,15 +464,46 @@ impl Machine {
             mode: self.cpu.mode,
             privileged: self.cpu.privileged(),
         });
-        if self.priority < 0 {
+        let n = match self.core {
+            Core::CortexM0Plus => (self.priority >= 0).then_some(HARD_FAULT),
+            Core::CortexM7 => {
+                let n = self.syndrome(fault);
+                self.escalate(n)
+            }
+        };
+        let Some(n) = n else {
             return Err(Outcome::Lockup { pc: self.cpu.pc, fault });
-        }
-        self.enter(HARD_FAULT)?;
+        };
+        self.enter(n)?;
         if self.catches_hard_fault() {
             self.debug.halt(debug::DFSR_VCATCH);
             return Err(Outcome::Halted);
         }
         Ok(())
+    }
+
+    /// Which configurable fault an ARMv7-M fault is, recorded in CFSR.
+    fn syndrome(&mut self, fault: Fault) -> u32 {
+        use scs::cfsr;
+        use scs::exception::{BUS_FAULT, MEM_MANAGE, USAGE_FAULT};
+        match fault {
+            Fault::MemManage { access: Access::Execute, .. } => self.record_fault(MEM_MANAGE, cfsr::IACCVIOL, None),
+            Fault::MemManage { addr, .. } => self.record_fault(MEM_MANAGE, cfsr::DACCVIOL, Some(addr)),
+            Fault::Bus { addr } => self.record_fault(BUS_FAULT, cfsr::PRECISERR, Some(addr)),
+            Fault::InstructionBus { .. } => self.record_fault(BUS_FAULT, cfsr::IBUSERR, None),
+            Fault::Unaligned { .. } => self.record_fault(USAGE_FAULT, cfsr::UNALIGNED, None),
+            Fault::Undefined { .. } => self.record_fault(USAGE_FAULT, cfsr::UNDEFINSTR, None),
+            Fault::InvState => self.record_fault(USAGE_FAULT, cfsr::INVSTATE, None),
+            Fault::InvPc => self.record_fault(USAGE_FAULT, cfsr::INVPC, None),
+            Fault::NoCoprocessor { .. } => self.record_fault(USAGE_FAULT, cfsr::NOCP, None),
+            Fault::DivideByZero => self.record_fault(USAGE_FAULT, cfsr::DIVBYZERO, None),
+            // An SVC that could not be taken, and a fault deriving from a
+            // frame, are HardFaults by the time they get here.
+            Fault::SvcEscalation | Fault::Stacking { .. } | Fault::Unstacking { .. } => {
+                self.bus.scs.faults.hfsr |= scs::HFSR_FORCED;
+                HARD_FAULT
+            }
+        }
     }
 
     /// Moves the GPIO edges and the serial bytes a store produced into the
@@ -484,7 +522,7 @@ impl Machine {
     pub(crate) fn sample_interrupts(&mut self) {
         let lines = self.bus.soc.interrupts();
         if lines != 0 {
-            self.bus.scs.nvic.pending |= u64::from(lines) << scs::exception::IRQ0;
+            self.bus.scs.nvic.pending.set_irq_word(0, lines, true);
         }
     }
 
