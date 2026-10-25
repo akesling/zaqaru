@@ -428,6 +428,12 @@ impl Machine for Interpreted {
         // handing a new thread the parent's is the cross-thread corruption
         // the thread design was written to avoid.
         tcb.x87.reset();
+        // And its own share of the retired count, which starts at none. A
+        // copy of the parent's would count the parent's instructions twice,
+        // and the container's count — the time axis a debugger seeks along,
+        // and the clock `rdtsc` reads — would jump by all of them at once.
+        tcb.retired = 0;
+        tcb.accelerated = 0;
         let tid = self.threads.spawn(tcb);
         if let Some(thread) = self.threads.find_mut(tid) {
             thread.owned.clear_child_tid = request.clear_child_tid;

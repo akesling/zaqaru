@@ -270,6 +270,11 @@ impl Threads {
         let current = self.current();
         let mut thread = Thread::new(FIRST, current.tcb.clone());
         thread.owned = current.owned;
+        // The child's share of the retired count starts at none, as a new
+        // thread's does: a copy of the parent's would be counted twice, and
+        // the container's count would jump by it at the fork.
+        thread.tcb.retired = 0;
+        thread.tcb.accelerated = 0;
         Self {
             threads: vec![thread],
             current: 0,
