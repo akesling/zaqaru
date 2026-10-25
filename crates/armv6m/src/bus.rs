@@ -12,9 +12,11 @@
 //! | `0x0800_0000..0x0801_0000`  | main flash, 64 KiB                    |
 //! | `0x1FFF_0000..0x2000_0000`  | system memory and option bytes        |
 //! | `0x2000_0000..0x2000_2000`  | SRAM, 8 KiB                           |
+//! | `0x4002_2000..0x4002_2400`  | the flash interface; see [`crate::flash`] |
 //! | `0x4000_0000..0x5000_1800`  | peripherals; see [`crate::stm32g0`]   |
 //! | `0xE000_0000..0xE010_0000`  | the PPB; see [`crate::scs`]           |
 
+use crate::flash;
 use crate::scs::Scs;
 use crate::stm32g0::Stm32g0;
 
@@ -24,6 +26,9 @@ pub const SYSTEM_BASE: u32 = 0x1FFF_0000;
 pub const SYSTEM_SIZE: usize = 64 * 1024;
 pub const SRAM_BASE: u32 = 0x2000_0000;
 pub const SRAM_SIZE: usize = 8 * 1024;
+/// FLASHSIZE, in system memory: main flash in KiB, which a flash
+/// algorithm reads to know the part.
+const FLASHSIZE: usize = 0x75E0;
 
 /// Nothing answered: a bus fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,16 +38,19 @@ pub struct Unmapped;
 pub struct Bus {
     pub flash: Vec<u8>,
     /// System memory holds ST's bootloader, the unique ID and the option
-    /// bytes. None of it is modelled; it reads as erased flash.
+    /// bytes. Of it only FLASHSIZE is modelled; the rest reads as erased
+    /// flash.
     pub system: Vec<u8>,
     pub sram: Vec<u8>,
     pub scs: Scs,
+    pub flash_interface: flash::Interface,
     pub soc: Stm32g0,
 }
 
 enum Target {
     Memory { region: Region, offset: usize },
     Scs,
+    FlashInterface,
     Soc,
 }
 
@@ -60,11 +68,14 @@ impl Bus {
         }
         let mut flash = vec![0xFF; FLASH_SIZE];
         flash[..image.len()].copy_from_slice(image);
+        let mut system = vec![0xFF; SYSTEM_SIZE];
+        system[FLASHSIZE..FLASHSIZE + 2].copy_from_slice(&((FLASH_SIZE / 1024) as u16).to_le_bytes());
         Ok(Bus {
             flash,
-            system: vec![0xFF; SYSTEM_SIZE],
+            system,
             sram: vec![0; SRAM_SIZE],
             scs: Scs::default(),
+            flash_interface: flash::Interface::default(),
             soc: Stm32g0::default(),
         })
     }
@@ -84,6 +95,9 @@ impl Bus {
         }
         if (0xE000_0000..0xE010_0000).contains(&addr) {
             return Some(Target::Scs);
+        }
+        if flash::Interface::contains(addr) {
+            return Some(Target::FlashInterface);
         }
         if Stm32g0::contains(addr) {
             return Some(Target::Soc);
@@ -105,6 +119,7 @@ impl Bus {
         match Self::decode(addr).ok_or(Unmapped)? {
             Target::Memory { region, offset } => Ok(little_endian(self.memory(region), offset, size)),
             Target::Scs => Ok(subword(self.scs.read(addr & !3).ok_or(Unmapped)?, addr, size)),
+            Target::FlashInterface => Ok(subword(self.flash_interface.read(addr & !3), addr, size)),
             Target::Soc => Ok(subword(self.soc.read(addr & !3).ok_or(Unmapped)?, addr, size)),
         }
     }
@@ -126,6 +141,7 @@ impl Bus {
         match Self::decode(addr).ok_or(Unmapped)? {
             Target::Memory { region, offset } => Ok(little_endian(self.memory(region), offset, size)),
             Target::Scs => Ok(subword(self.scs.peek(addr & !3).ok_or(Unmapped)?, addr, size)),
+            Target::FlashInterface => Ok(subword(self.flash_interface.read(addr & !3), addr, size)),
             Target::Soc => Ok(subword(self.soc.peek(addr & !3), addr, size)),
         }
     }
@@ -135,9 +151,14 @@ impl Bus {
         let mask = if size == 4 { u32::MAX } else { ((1 << (8 * size)) - 1) << shift };
         let placed = value << shift & mask;
         match Self::decode(addr).ok_or(Unmapped)? {
-            // Programming flash goes through the flash interface, which is
-            // not modelled; a plain store to it is a bus error.
-            Target::Memory { region: Region::Flash | Region::System, .. } => Err(Unmapped),
+            // A store to main flash is programming it, which the flash
+            // interface decides; it answers in its status register, not
+            // with a bus error.
+            Target::Memory { region: Region::Flash, offset } => {
+                self.flash_interface.program(&mut self.flash, offset, size, value);
+                Ok(())
+            }
+            Target::Memory { region: Region::System, .. } => Err(Unmapped),
             Target::Memory { region: Region::Sram, offset } => {
                 let bytes = value.to_le_bytes();
                 match size {
@@ -154,6 +175,11 @@ impl Bus {
                     placed
                 };
                 self.scs.write(addr & !3, word).ok_or(Unmapped)
+            }
+            Target::FlashInterface => {
+                let word = if size != 4 { self.flash_interface.read(addr & !3) & !mask | placed } else { placed };
+                self.flash_interface.write(addr & !3, word, &mut self.flash);
+                Ok(())
             }
             Target::Soc => {
                 let word = if size != 4 { self.soc.peek(addr & !3) & !mask | placed } else { placed };

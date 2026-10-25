@@ -34,6 +34,7 @@ pub mod dap;
 pub mod debug;
 pub mod exception;
 pub mod exec;
+pub mod flash;
 pub mod gdb;
 pub mod scs;
 pub mod state;
@@ -203,6 +204,7 @@ impl Machine {
         self.cpu = Cpu::default();
         self.bus.scs.reset();
         self.bus.soc.reset();
+        self.bus.flash_interface.reset();
         self.sleeping = false;
         *self.granted = [[Grant::NONE; GRANTS]; 3];
         self.ticked_at = self.cycles;
