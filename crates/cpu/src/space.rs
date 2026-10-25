@@ -181,7 +181,11 @@ pub struct Space {
     /// [`Space::mark_code`], the one place a page turns into code, and by
     /// [`take_written`], which starts a new epoch so that the first store
     /// to every page after it is recorded again.
-    last_clean: u64,
+    ///
+    /// [`WAYS`] of them, direct-mapped by page: a program's stores go to a
+    /// few pages at once — its stack, its heap, its globals — and a cache
+    /// of one page misses every time it moves between them.
+    last_clean: [u64; WAYS],
     /// The last single page each access kind — read, write, fetch — confirmed
     /// permitted, or `u64::MAX`. A guest's loads and stores have strong page
     /// locality, so remembering the last page that passed and skipping the
@@ -189,7 +193,19 @@ pub struct Space {
     /// test off the common path, the same trick `last_clean` plays for the
     /// code test. A `Cell` because a load confirms through `&self`; reset by
     /// `protect` and `unmap`, the only two that change what a page allows.
-    permitted_page: [core::cell::Cell<u64>; 3],
+    /// Direct-mapped, [`WAYS`] pages per kind, for the reason `last_clean`
+    /// is.
+    permitted_page: [[core::cell::Cell<u64>; WAYS]; 3],
+}
+
+/// How many pages the permission and clean-page caches remember per kind:
+/// enough for a program's working set of pages at any moment, few enough
+/// that forgetting them all on a `protect` or `munmap` costs nothing.
+pub const WAYS: usize = 64;
+
+#[inline(always)]
+fn way(page: u64) -> usize {
+    page as usize % WAYS
 }
 
 impl Default for Space {
@@ -210,8 +226,8 @@ impl Space {
             executable: Bitmap::default(),
             code: Bitmap::default(),
             dirty: Vec::new(),
-            last_clean: u64::MAX,
-            permitted_page: [const { core::cell::Cell::new(u64::MAX) }; 3],
+            last_clean: [u64::MAX; WAYS],
+            permitted_page: [const { [const { core::cell::Cell::new(u64::MAX) }; WAYS] }; 3],
         };
         space.set_limit(limit);
         space
@@ -294,8 +310,8 @@ impl Space {
     pub fn mark_code(&mut self, page: u64) {
         self.code.set(page as usize, true);
         // The clean-page cache must not name a page that just became code.
-        if page == self.last_clean & PAGE_BITS {
-            self.last_clean = u64::MAX;
+        if page == self.last_clean[way(page)] & PAGE_BITS {
+            self.last_clean[way(page)] = u64::MAX;
         }
     }
 
@@ -375,7 +391,7 @@ impl Space {
             && let Some(last_byte) = address.checked_add(length - 1)
         {
             let last = (last_byte >> PAGE_SHIFT) as usize;
-            if first == last && self.permitted_page[slot].get() == first as u64 {
+            if first == last && self.permitted_page[slot][way(first as u64)].get() == first as u64 {
                 return Ok(());
             }
         }
@@ -405,9 +421,9 @@ impl Space {
             }
         }
         // A single-page success is what the fast path replays; a straddling
-        // one is not cached, because the cache holds one page.
+        // one is not cached, because a cache entry holds one page.
         if first == last {
-            self.permitted_page[slot].set(first as u64);
+            self.permitted_page[slot][way(first as u64)].set(first as u64);
         }
         Ok(())
     }
@@ -415,7 +431,7 @@ impl Space {
     /// Forgets the per-access permitted-page cache, called wherever a page's
     /// permission changes — `protect` and `unmap`, the only two.
     fn forget_permissions(&self) {
-        for cell in &self.permitted_page {
+        for cell in self.permitted_page.iter().flatten() {
             cell.set(u64::MAX);
         }
     }
@@ -720,7 +736,7 @@ impl Space {
         // last found clean in this epoch.
         if first == last {
             let stamped = first | EPOCH.get();
-            if stamped == self.last_clean {
+            if stamped == self.last_clean[way(first)] {
                 return;
             }
             note_written(first);
@@ -732,7 +748,7 @@ impl Space {
                 self.dirty.push(first);
             }
             // Clean now, whether it was code and cleared or never code.
-            self.last_clean = stamped;
+            self.last_clean[way(first)] = stamped;
             return;
         }
         for page in first as usize..=last as usize {
