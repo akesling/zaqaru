@@ -769,3 +769,81 @@ fn indexed_loads_and_stores_agree() {
         a.syscall().unwrap();
     });
 }
+
+#[test]
+fn memory_compares_fused_with_their_branch_agree() {
+    // `cmp`/`test` against memory followed by a `jcc`: the operand loaded,
+    // then one fused compare-and-branch. Memory on either side, an immediate
+    // (negative, sign-extended) and a register, indexed addressing, a byte.
+    agree(|a, entry| {
+        let buf = entry + 0x1000;
+        a.mov(rbx, buf).unwrap();
+        a.mov(rcx, 2u64).unwrap();
+        a.mov(rax, 0xffff_ffff_ffff_ffffu64).unwrap();
+        a.mov(qword_ptr(rbx), rax).unwrap();
+        a.mov(rdx, 0x10u64).unwrap();
+        a.mov(qword_ptr(rbx + 8), rdx).unwrap();
+        a.mov(dword_ptr(rbx + rcx * 4 + 16), 7u32 as i32).unwrap();
+        a.mov(rsi, 0u64).unwrap();
+        let mut one = a.create_label();
+        a.cmp(qword_ptr(rbx), -1i32).unwrap();
+        a.jne(one).unwrap();
+        a.add(rsi, 1i32).unwrap();
+        a.set_label(&mut one).unwrap();
+        let mut two = a.create_label();
+        a.cmp(qword_ptr(rbx + 8), rdx).unwrap();
+        a.jne(two).unwrap();
+        a.add(rsi, 2i32).unwrap();
+        a.set_label(&mut two).unwrap();
+        let mut three = a.create_label();
+        a.mov(edi, 9u32).unwrap();
+        a.cmp(edi, dword_ptr(rbx + rcx * 4 + 16)).unwrap();
+        a.jb(three).unwrap();
+        a.add(rsi, 4i32).unwrap();
+        a.set_label(&mut three).unwrap();
+        let mut four = a.create_label();
+        a.test(byte_ptr(rbx), 1i32).unwrap();
+        a.jz(four).unwrap();
+        a.add(rsi, 8i32).unwrap();
+        a.set_label(&mut four).unwrap();
+        // Flags still live after the branch: a setcc reads the same compare.
+        let mut five = a.create_label();
+        a.cmp(qword_ptr(rbx + 8), 0x20i32).unwrap();
+        a.jge(five).unwrap();
+        a.set_label(&mut five).unwrap();
+        a.setl(cl).unwrap();
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn single_op_addressing_and_negative_immediates_agree() {
+    // The shapes the zero register and sign-extended immediates turn into
+    // one op: `lea` of every form, a %rip-relative load and `lea`, negative
+    // qword immediates on the ALU, `imul` and `adc`, and a constant exit.
+    agree(|a, entry| {
+        let mut data = a.create_label();
+        let mut out = a.create_label();
+        a.mov(rbx, entry + 0x1000).unwrap();
+        a.mov(rcx, 5u64).unwrap();
+        a.lea(rax, qword_ptr(rbx + rcx * 8 - 16)).unwrap();
+        a.lea(rdx, qword_ptr(rcx * 4 + 0x10)).unwrap();
+        a.lea(esi, dword_ptr(rbx + rcx * 2 + 7)).unwrap();
+        a.lea(rdi, qword_ptr(rbx - 0x30)).unwrap();
+        a.lea(r8, qword_ptr(data)).unwrap();
+        a.mov(r9, qword_ptr(data)).unwrap();
+        a.add(rax, -0x18i32).unwrap();
+        a.and(rdx, -16i32).unwrap();
+        a.cmp(rcx, -1i32).unwrap();
+        a.setg(r10b).unwrap();
+        a.imul_3(r11, rcx, -3i32).unwrap();
+        a.stc().unwrap();
+        a.adc(r12, -2i32).unwrap();
+        a.sub(r13, -0x7fff_ffffi32).unwrap();
+        a.jmp(out).unwrap();
+        a.set_label(&mut data).unwrap();
+        a.dq(&[0x0123_4567_89ab_cdef]).unwrap();
+        a.set_label(&mut out).unwrap();
+        a.syscall().unwrap();
+    });
+}

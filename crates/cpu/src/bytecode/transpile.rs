@@ -173,6 +173,7 @@ fn fused_flags_live_after(
 }
 
 /// A fused producer's right-hand side.
+#[derive(Clone, Copy)]
 enum Rhs {
     Register(u8),
     Immediate(u64),
@@ -416,9 +417,31 @@ impl Emitter {
             Source::Immediate(target) => target,
             _ => return false,
         };
-        let Some((producer_op, width, dest, rhs)) = fusible_producer(producer_quick, producer)
-        else {
-            return false;
+        let (producer_op, width, dest, rhs) = match fusible_producer(producer_quick, producer) {
+            Some(fused) => fused,
+            // `cmp`/`test` against memory: the operand loaded into a scratch
+            // (an op that retires nothing, tagged with the compare's address
+            // so a fault names it), and the compare fused with the branch as
+            // for registers — two dispatches where it took three. Only these
+            // two, which write nothing back.
+            None => match memory_compare(producer_quick) {
+                Some((op, width, memory_left, other)) => {
+                    if let Rhs::Immediate(value) = other
+                        && !fits_immediate(width, value)
+                    {
+                        return false;
+                    }
+                    let Some(loaded) = self.emit_scratch_load(producer_quick, width) else {
+                        return false;
+                    };
+                    match (memory_left, other) {
+                        (true, other) => (op, width, loaded, other),
+                        (false, Rhs::Register(left)) => (op, width, left, Rhs::Register(loaded)),
+                        _ => unreachable!("memory_compare puts an immediate only on the right"),
+                    }
+                }
+                None => return false,
+            },
         };
         let (immediate, b, imm) = match rhs {
             Rhs::Register(number) => (false, number, 0u32),
@@ -832,18 +855,32 @@ impl Emitter {
         // computed that way lands four gigabytes past its table.
         let narrow = quick.width == Width::Dword;
         let dst = self.register(quick.destination)?;
-        let (base, disp) = self.address(quick)?;
-        if disp == 0 {
-            self.push(encode(Op::Mov, dst.number, base, 0, Width::Qword, false, false, !narrow, 0, 0));
+        // The whole sum, straight into the destination, in one op — `Lea`
+        // computes base + index * scale + displacement, with the zero
+        // register standing in for a base or an index the operand has not.
+        if let Address::Computed { displacement, base, index, scale, narrow: false } = quick.address
+            && !quick.segmented
+            && let Ok(disp) = i32::try_from(displacement as i64)
+            && let Some(log) = match scale {
+                1 => Some(0),
+                2 => Some(1),
+                4 => Some(2),
+                8 => Some(3),
+                _ => None,
+            }
+            && let (Some(base), Some(index)) = (full_register(base), full_register(index))
+        {
+            let base = base.map_or(super::ZERO, |base| base.number);
+            let index = index.map_or(super::ZERO, |index| index.number);
+            self.push(encode(Op::Lea, dst.number, base, index, Width::Qword, false, false, !narrow, log, disp as u32));
         } else {
-            // `regs[dst] = regs[base] + sign_extend(disp)`. There is no zero
-            // register to feed `Lea`'s index, so the displacement — which is
-            // signed, and would be zero-extended by an immediate `Add` — is
-            // materialised full-width and added. (`Add` with the no-flags
-            // modifier, since `lea` touches no flags.)
-            let scratch = self.temp();
-            self.li(scratch, disp as i64 as u64, false);
-            self.push(encode(Op::Add, dst.number, base, scratch, Width::Qword, false, true, !narrow, 0, 0));
+            let (base, disp) = self.address(quick)?;
+            if disp == 0 {
+                self.push(encode(Op::Mov, dst.number, base, 0, Width::Qword, false, false, !narrow, 0, 0));
+            } else {
+                // `regs[dst] = regs[base] + sign_extend(disp)`.
+                self.push(encode(Op::Lea, dst.number, base, super::ZERO, Width::Qword, false, false, !narrow, 0, disp as u32));
+            }
         }
         if narrow {
             self.push(encode(Op::Narrow, dst.number, dst.number, 0, Width::Qword, false, true, true, 0, 0));
@@ -1488,6 +1525,28 @@ impl Emitter {
 /// pair — into its `FusedBranch` op-code, width, destination register, and
 /// right-hand side, or `None` when it cannot fuse (a memory operand, a
 /// high-byte register, or an op that is not a fusible flag producer).
+/// A `cmp` or `test` with one memory operand, which fuses with its branch
+/// once the operand is loaded: the op, the width, whether the memory is the
+/// left operand, and the other operand. An immediate only ever stands on
+/// the right, as x86 encodes it.
+fn memory_compare(quick: &Quick) -> Option<(Op, Width, bool, Rhs)> {
+    let op = match quick.op {
+        quick::Op::Cmp => Op::Cmp,
+        quick::Op::Test => Op::Test,
+        _ => return None,
+    };
+    let register = |source: Source| match source {
+        Source::Register(slice) if !slice.high_byte => Some(Rhs::Register(slice.number)),
+        _ => None,
+    };
+    match (quick.destination, quick.source) {
+        (Source::Memory, Source::Immediate(value)) => Some((op, quick.width, true, Rhs::Immediate(value))),
+        (Source::Memory, source) => Some((op, quick.width, true, register(source)?)),
+        (destination, Source::Memory) => Some((op, quick.width, false, register(destination)?)),
+        _ => None,
+    }
+}
+
 fn fusible_producer(quick: &Quick, instruction: &Instruction) -> Option<(Op, Width, u8, Rhs)> {
     let op = match quick.op {
         quick::Op::Add => Op::Add,
