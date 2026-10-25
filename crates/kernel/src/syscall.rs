@@ -1491,7 +1491,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             owners: self.owners.clone(),
             // A new address space has no vDSO in it yet; `exec` maps one.
             vdso: None,
-            timebase: crate::vdso::Timebase::default(),
+            // The container's timebase, which the new program's vDSO page
+            // is given as soon as it is mapped.
+            timebase: self.timebase,
             // And clears them at `execve` too, for the same reason: the
             // program that asked is gone.
             alarm: None,

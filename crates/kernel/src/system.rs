@@ -113,6 +113,15 @@ pub struct System<'a, S: Store> {
     departed: u64,
     departed_accelerated: u64,
     departed_blocks: u64,
+    /// The clock's rate, for every process's vDSO: nanoseconds per tick,
+    /// measured container-wide and only across stretches with no idle pass
+    /// in them — see `System::refresh_clock` for why — and the sample
+    /// the next measurement starts from, cleared by an idle pass.
+    clock_rate: u64,
+    clock_sample: Option<(u64, u64)>,
+    /// The container's timebase, which every process's vDSO page holds a
+    /// copy of. See `Kernel::adopt_timebase`.
+    clock: crate::vdso::Timebase,
 }
 
 impl<'a, S: Store + Clone> System<'a, S> {
@@ -131,6 +140,9 @@ impl<'a, S: Store + Clone> System<'a, S> {
             stopping: false,
             ending: None,
             departed: 0,
+            clock_rate: 0,
+            clock_sample: None,
+            clock: crate::vdso::Timebase::default(),
             departed_accelerated: 0,
             departed_blocks: 0,
         }
@@ -414,6 +426,11 @@ impl<'a, S: Store + Clone> System<'a, S> {
             .map(|thread| thread.tcb.retired)
             .sum();
         self.current().clock_base = total - own;
+        self.current().sync_clock();
+        // The container's clock, if it has moved since this process last
+        // had a turn.
+        let clock = self.clock;
+        self.current().kernel.adopt_timebase(clock);
         let progress = match stop_at.map(|target| target.saturating_sub(self.retired())) {
             Some(0) => return Turn::Stopped,
             Some(left) if left < cpu::QUANTUM => self.current().step_exact(left),
@@ -504,7 +521,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
         // worth, because it scales with the number of open connections.
         if why == Yield::Quantum && self.slice == 0 {
             self.current().kernel.pump(None);
-            self.current().kernel.refresh_timebase();
+            self.refresh_clock(true);
             // The board, if there is one, up to the clock just read.
             self.current().kernel.service_board();
             self.take_shutdown();
@@ -639,6 +656,43 @@ impl<'a, S: Store + Clone> System<'a, S> {
         text
     }
 
+    /// Samples the host clock and makes the container's timebase from it,
+    /// then hands it to the running process. `measure` says whether the
+    /// stretch since the last sample was spent running, so that its rate
+    /// means something: the counter is retired instructions, which stand
+    /// still while the container is idle and the clock does not, and a rate
+    /// measured across an idle sleep — the sleep over a handful of
+    /// instructions — runs every guest's clock seconds ahead.
+    fn refresh_clock(&mut self, measure: bool) {
+        let ticks = self.retired().wrapping_mul(cpu::exec::TIMESTAMP_STEP);
+        let kernel = &mut self.current().kernel;
+        let (Some(realtime), Some(monotonic)) = (kernel.realtime(), kernel.monotonic()) else {
+            // No clock mounted: every vDSO page stays unusable, and the
+            // syscall answers instead — `EINVAL`, as it always has.
+            return;
+        };
+        match (measure, self.clock_sample) {
+            (true, Some((then, before))) => {
+                if let Some(rate) = crate::vdso::Timebase::rate(monotonic.saturating_sub(then), ticks.wrapping_sub(before)) {
+                    self.clock_rate = rate;
+                }
+                self.clock_sample = Some((monotonic, ticks));
+            }
+            (true, None) => self.clock_sample = Some((monotonic, ticks)),
+            (false, _) => self.clock_sample = None,
+        }
+        // Before the container's first sample, the running process's own
+        // page is the timebase to continue from: its vDSO was published
+        // at `exec` from a sample of its own.
+        let previous = match self.clock.usable {
+            0 => self.current().kernel.timebase,
+            _ => self.clock,
+        };
+        self.clock = previous.next(realtime, monotonic, ticks, self.clock_rate);
+        let clock = self.clock;
+        self.current().kernel.adopt_timebase(clock);
+    }
+
     /// Nothing can run. Answers whether anything might, later.
     ///
     /// **This is the only place a clock is read for scheduling**, and it is
@@ -663,7 +717,14 @@ impl<'a, S: Store + Clone> System<'a, S> {
         // Nothing can run, so this is the other moment the container is
         // already crossing the boundary — and the clock a sleeping container
         // wakes to must be the time it woke, not the time it went to sleep.
-        self.current().kernel.refresh_timebase();
+        // Its counter brought up to the container's first, since other
+        // processes may have run since this one last did; and the rate not
+        // measured, since time passed here with nothing retiring.
+        let total = self.retired();
+        let own: u64 = self.current().kernel.machine.threads.all().iter().map(|thread| thread.tcb.retired).sum();
+        self.current().clock_base = total - own;
+        self.current().sync_clock();
+        self.refresh_clock(false);
         // First, because a pending shutdown is exactly what makes a
         // container that looks stuck not stuck: every process parked on a
         // signal that has not come is a deadlock until somebody sends one.

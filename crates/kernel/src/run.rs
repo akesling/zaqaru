@@ -321,6 +321,7 @@ impl<'a, S: Store> Process<'a, S> {
             return Progress::Finished(exit);
         }
 
+        self.sync_clock();
         // Three disjoint fields of one owner, which is what makes the
         // engine able to hold no state of its own.
         let run = match exact {
@@ -378,6 +379,22 @@ impl<'a, S: Store> Process<'a, S> {
             true => Progress::Preempted,
             false => Progress::Running,
         }
+    }
+
+    /// Tells the running thread what the rest of the container has
+    /// retired, so that its `rdtsc` — and the vDSO's clock, which reads
+    /// it — counts the container's instructions rather than its own. See
+    /// `cpu::state::Tcb::clock`.
+    pub fn sync_clock(&mut self) {
+        let threads = &mut self.kernel.machine.threads;
+        let current = threads.current().tid;
+        let others: u64 = threads
+            .all()
+            .iter()
+            .filter(|thread| thread.tid != current)
+            .map(|thread| thread.tcb.retired)
+            .fold(0, u64::wrapping_add);
+        threads.current_mut().tcb.clock = self.clock_base.wrapping_add(others);
     }
 
     /// Whether any of this process's threads could run now.

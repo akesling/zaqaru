@@ -89,6 +89,10 @@ pub struct Timebase {
 /// multiply.
 pub const SHIFT: u32 = 48;
 
+/// How far ahead of the host a guest's clock is let catch up over, in
+/// nanoseconds: see [`Timebase::next`].
+pub const SLEW_HORIZON: u64 = 100_000_000;
+
 /// The rate to use before two samples exist to measure one from.
 ///
 /// Fifty million instructions a second is what the engine measures on this
@@ -115,6 +119,47 @@ impl Timebase {
         let per_instruction = cpu::exec::TIMESTAMP_STEP;
         Self::rate(1_000_000_000, ASSUMED_MIPS * 1_000_000 * per_instruction)
             .unwrap_or(1)
+    }
+
+    /// The timebase after this one, from a fresh sample of both clocks at
+    /// `tsc`, with `rate` the multiplier to use from here (zero: keep this
+    /// one's, or guess).
+    ///
+    /// **Monotonic time may not go backwards**, and a fresh sample can
+    /// easily be behind what this timebase had already extrapolated to. So
+    /// the base is moved rather than the answer: the new monotonic base is
+    /// never less than what this one says at `tsc`.
+    ///
+    /// **And a clock that has run ahead is slowed until it is not.** Moving
+    /// the base only ever moves it forward, so every stretch whose rate was
+    /// a little high would otherwise add to how far ahead of the host the
+    /// guest reads — and a guest's deadline, computed from its clock, is
+    /// waited out against the host's. So while the base is ahead of the
+    /// sample, the rate published is cut in proportion, to as little as a
+    /// quarter, over [`SLEW_HORIZON`]: a slew, as a kernel slews a clock
+    /// rather than stepping it.
+    pub fn next(&self, realtime: u64, monotonic: u64, tsc: u64, rate: u64) -> Timebase {
+        let multiplier = match (rate, self.multiplier) {
+            (0, 0) => Timebase::assumed_rate(),
+            (0, kept) => kept,
+            (measured, _) => measured,
+        };
+        let extrapolated = match self.usable != 0 && tsc >= self.base_tsc {
+            true => self.at(tsc, true),
+            false => 0,
+        };
+        let ahead = extrapolated.saturating_sub(monotonic).min(SLEW_HORIZON * 3 / 4);
+        let multiplier = ((multiplier as u128 * (SLEW_HORIZON - ahead) as u128) / SLEW_HORIZON as u128).max(1) as u64;
+        Timebase {
+            sequence: 0,
+            usable: 1,
+            base_realtime: realtime,
+            base_monotonic: monotonic.max(extrapolated),
+            base_tsc: tsc,
+            multiplier,
+            shift: SHIFT,
+            padding: 0,
+        }
     }
 
     /// What the vDSO would compute from this timebase at `tsc`.
@@ -214,8 +259,17 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         });
         // Published straight away, so that a program which reads the clock
         // before the first scheduling point gets an answer rather than a
-        // fallback.
-        self.refresh_timebase();
+        // fallback: the container's timebase, which `exec` kept — or, before
+        // the container has sampled the clock at all, one sampled here.
+        let mut canonical = self.timebase;
+        if canonical.usable == 0 {
+            let tsc = self.machine.tcb().map(|thread| thread.timestamp());
+            if let (Some(tsc), Some(realtime), Some(monotonic)) = (tsc, self.realtime(), self.monotonic()) {
+                canonical = canonical.next(realtime, monotonic, tsc, 0);
+            }
+        }
+        self.timebase.usable = 0;
+        self.adopt_timebase(canonical);
         Ok(Placement {
             timebase,
             image,
@@ -223,57 +277,33 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         })
     }
 
-    /// Samples the host clock and publishes a new timebase.
+    /// Publishes the container's timebase into this process's page, if
+    /// the page does not hold it already.
     ///
-    /// At the points the container already crosses the boundary — a process
-    /// finishing its slice, and going idle — so this costs no crossing that
-    /// was not happening anyway.
-    ///
-    /// **Monotonic time may not go backwards**, and a fresh sample can
-    /// easily be behind what the last one's rate had already extrapolated
-    /// to. So the base is moved rather than the answer: the published
-    /// monotonic base is never less than what the previous timebase would
-    /// have said at this instant. Real kernels do the same thing when they
-    /// slew a clock, and for the same reason.
-    pub(crate) fn refresh_timebase(&mut self) {
+    /// **One timebase for the container**, the way Linux keeps one vDSO
+    /// page for every process: the system samples the host clock at the
+    /// points the container already crosses the boundary — a slice ending,
+    /// and going idle — and every process takes the result in its own turn,
+    /// when it is next switched in. A timebase kept per process goes stale
+    /// while its process is parked, and a stale one is a clock the process
+    /// reads wrong the moment it runs. See [`Timebase::next`] for how the
+    /// container's is made.
+    pub(crate) fn adopt_timebase(&mut self, canonical: Timebase) {
         let Some(placed) = self.vdso else {
             return;
         };
-        let Some(tsc) = self.machine.tcb().map(|thread| thread.timestamp()) else {
+        if canonical.usable == 0 {
             return;
-        };
-        let (Some(realtime), Some(monotonic)) = (self.realtime(), self.monotonic()) else {
-            // No clock mounted. The page stays unusable and the vDSO sends
-            // every caller to the syscall, which answers `EINVAL` — the same
-            // refusal by name a container with no `/iso/time` has always
-            // got.
+        }
+        let held = self.timebase;
+        if held.usable != 0
+            && held.base_tsc == canonical.base_tsc
+            && held.base_monotonic == canonical.base_monotonic
+            && held.multiplier == canonical.multiplier
+        {
             return;
-        };
-        let previous = self.timebase;
-        let multiplier = match previous.usable != 0 {
-            // Measured over the interval just ended, so the rate tracks
-            // whatever the machine actually does.
-            true => Timebase::rate(
-                monotonic.saturating_sub(previous.base_monotonic),
-                tsc.wrapping_sub(previous.base_tsc),
-            )
-            .unwrap_or(previous.multiplier),
-            false => Timebase::assumed_rate(),
-        };
-        let extrapolated = match previous.usable != 0 {
-            true => previous.at(tsc, true),
-            false => 0,
-        };
-        let published = Timebase {
-            sequence: previous.sequence,
-            usable: 1,
-            base_realtime: realtime,
-            base_monotonic: monotonic.max(extrapolated),
-            base_tsc: tsc,
-            multiplier,
-            shift: SHIFT,
-            padding: 0,
-        };
+        }
+        let published = Timebase { sequence: held.sequence, ..canonical };
         self.timebase = published;
         self.publish(placed.timebase, published);
     }

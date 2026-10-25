@@ -166,6 +166,14 @@ pub struct Tcb {
     /// preemption quantum and the deterministic time base `rdtsc` answers
     /// from: one mechanism, two jobs, no polling emitted anywhere.
     pub retired: u64,
+    /// What `rdtsc` counts from besides this thread's own share: everything
+    /// the rest of the container has retired, as the kernel last told it.
+    /// So the counter every thread reads is one counter — the container's —
+    /// which is what lets the vDSO publish one timebase against it. A
+    /// thread's own count alone is a different number in every thread, and
+    /// a time computed from one thread's count against a base taken from
+    /// another's is off by however far apart they have run.
+    pub clock: u64,
     /// The `%fs` base — the thread pointer, as far as every libc is
     /// concerned. `arch_prctl` is what moves it; guest code never writes it,
     /// because `wrfsbase` is not implemented and would be a loud error.
@@ -237,7 +245,7 @@ impl Tcb {
     /// jitter for its backoff, and an even step would hand it the same
     /// value every time.
     pub fn timestamp(&self) -> u64 {
-        self.retired.wrapping_mul(crate::exec::TIMESTAMP_STEP)
+        self.retired.wrapping_add(self.clock).wrapping_mul(crate::exec::TIMESTAMP_STEP)
     }
 
     /// The state Linux hands `_start`: every register zero, and a stack
@@ -253,6 +261,7 @@ impl Tcb {
             mxcsr: 0x1f80,
             x87: x87::state::X87State::new(),
             retired: 0,
+            clock: 0,
             accelerated: 0,
             flags_staleness: Staleness::Unknown,
         }
