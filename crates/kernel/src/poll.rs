@@ -325,6 +325,17 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 true => 0,
                 false => event::IN | event::RDNORM,
             },
+            // Readable once it has expired, which `Timers::observe` counts
+            // when the clock is read.
+            Backing::Timer(id) => match self.timers.borrow().readable(id) {
+                true => event::IN | event::RDNORM,
+                false => 0,
+            },
+            // `usbfs` says a URB is ready to reap as writable.
+            Backing::Usb(id) => match self.usb.borrow().reapable(id) {
+                true => event::OUT | event::WRNORM,
+                false => 0,
+            },
         };
         let always = event::ERR | event::HUP | event::NVAL;
         ready & (interest | always)
@@ -919,7 +930,11 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         // so a deadline and a `CLOCK_MONOTONIC` the guest reads itself
         // cannot disagree about what time it is.
         let nanoseconds = crate::syscall::parse_nanoseconds(&bytes)?;
-        u64::try_from(nanoseconds).ok()
+        let now = u64::try_from(nanoseconds).ok()?;
+        // Every reading moves the timers on, so one that has expired is
+        // readable to whoever looks next.
+        self.timers.borrow_mut().observe(now);
+        Some(now)
     }
 
     /// Whether a deadline has passed.

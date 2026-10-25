@@ -585,6 +585,9 @@ impl<'a, S: Store> Process<'a, S> {
             // nothing is parked on: `SIGALRM` arrives whatever the threads
             // are doing, so a container asleep past it would deliver late.
             .chain(self.kernel.alarm.map(|alarm| alarm.deadline))
+            // And every armed `timerfd`, which an `epoll` with no timeout of
+            // its own may be waiting on.
+            .chain(self.kernel.timers.borrow().earliest())
             .min()
     }
 
@@ -596,7 +599,9 @@ impl<'a, S: Store> Process<'a, S> {
     /// boundary, and one per process per pass is a boundary crossing in the
     /// scheduler's inner loop.
     pub fn expire(&mut self, now: u64) -> bool {
-        let mut woken = false;
+        // A timer that expires makes a parked `epoll` ready rather than
+        // waking anything itself; `resume_watches` finds it.
+        let mut woken = self.kernel.timers.borrow_mut().observe(now);
         // The interval timer first, because what it does is *raise a
         // signal*, and a thread woken by that signal has to see it pending
         // rather than be woken again a pass later.

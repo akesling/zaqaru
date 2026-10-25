@@ -54,6 +54,12 @@ pub const TIME_MONOTONIC: &[&[u8]] = &[b"iso", b"time", b"monotonic_ns"];
 pub const NET_LISTEN: &[&[u8]] = &[b"iso", b"net", b"listen"];
 pub const NET_EVENTS: &[&[u8]] = &[b"iso", b"net", b"events"];
 
+/// Where USB devices are granted: see [`crate::usb`] for what a provider
+/// serves there. A granted service rather than an `iso/` path, as the
+/// isotope spec asks of new capabilities; a container with nothing here
+/// has the board's probe, if it has a board, and no other device.
+pub const USB: &[&[u8]] = &[b"services", b"usb"];
+
 /// Kernel diagnostics. Distinct from guest stderr on purpose: a container's
 /// own output and the kernel's complaints about it must never be interleaved
 /// into one stream that nobody can separate afterwards.

@@ -1,8 +1,12 @@
 //! `zaqaru-m0 door`: a terminal session with Humility on the bench.
 //!
 //! ```sh
-//! zaqaru-m0 door --archive build-….zip --probe 127.0.0.1:3333 --listen 0.0.0.0:80
+//! zaqaru-m0 door --archive build-….zip --probe usb --listen 0.0.0.0:80
 //! ```
+//!
+//! `--probe` is the board's USB probe (`usb`), which Humility finds as
+//! probe-rs finds any probe plugged in, or a GDB server's address, which a
+//! Humility built with the GDB probe reaches as `gdb:ADDRESS`.
 //!
 //! Each connection is a session: a banner, a `$ ` prompt, and a line at a
 //! time. `humility …` runs Humility against the probe, its output streamed
@@ -46,7 +50,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("zaqaru-m0: a humility session on {listen}, against the probe on {probe}");
+    println!("zaqaru-m0: a humility session on {listen}, against the probe {probe}");
     let status = || std::fs::read_to_string("/proc/board").ok();
     accept_requests(listener, Arc::new(FrontDoor::new(humility, archive, probe, Box::new(status))));
     ExitCode::SUCCESS
@@ -55,8 +59,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
 pub(crate) struct FrontDoor {
     humility: String,
     archive: Option<String>,
-    /// The probe, as Humility is to reach it.
-    gdb: String,
+    /// The probe, as Humility is to reach it: `usb`, or a GDB server's
+    /// address.
+    probe: String,
     /// The probe has one debugger at a time, so Humility runs one at a time.
     one_at_a_time: Mutex<()>,
     /// The board's state, for `board`; `None` if there is none to ask.
@@ -67,16 +72,16 @@ impl FrontDoor {
     pub(crate) fn new(
         humility: String,
         archive: Option<String>,
-        gdb: String,
+        probe: String,
         status: Box<dyn Fn() -> Option<String> + Send + Sync>,
     ) -> FrontDoor {
-        FrontDoor { humility, archive, gdb, one_at_a_time: Mutex::new(()), status }
+        FrontDoor { humility, archive, probe, one_at_a_time: Mutex::new(()), status }
     }
 }
 
 const BANNER: &str = "\
-An STM32G031 Nucleo running Hubris, emulated in zaqaru's kernel, with its
-debug probe on 127.0.0.1:3333 and Humility attached through it.
+An STM32G031 Nucleo running Hubris, emulated in zaqaru's kernel, with a
+debug probe on it and Humility attached through it.
 Try `humility tasks`, or `help` for more.
 ";
 
@@ -90,6 +95,8 @@ const HELP: &str = "\
     humility hiffy -c UserLeds.led_toggle -a index=0
                             an IPC call made on the board: toggles the LED
     humility manifest       what the archive says was built
+    humility flash -F       flash the archive's image onto the board, and
+                            run it
     board                   the board itself: state, time, LED, faults
     exit                    end the session
 ";
@@ -150,7 +157,10 @@ impl FrontDoor {
         let mut command = Command::new(&self.humility);
         command
             .args(args)
-            .env("HUMILITY_PROBE", format!("gdb:{}", self.gdb))
+            .env("HUMILITY_PROBE", match self.probe.as_str() {
+                "usb" => "usb".to_string(),
+                address => format!("gdb:{address}"),
+            })
             .stdin(Stdio::null())
             .stdout(Stdio::from(OwnedFd::from(out.try_clone()?)))
             .stderr(Stdio::from(OwnedFd::from(out.try_clone()?)));

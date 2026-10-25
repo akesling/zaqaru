@@ -620,7 +620,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // so. `pwrite` does arrive, and a pipe has no position.
             crate::fd::Backing::Pipe { .. } => return Err(Errno::NotSeekable),
             crate::fd::Backing::Epoll(_) => return Err(Errno::Invalid),
-            crate::fd::Backing::Socket(_) | crate::fd::Backing::Event(_) => {
+            crate::fd::Backing::Socket(_) | crate::fd::Backing::Event(_) | crate::fd::Backing::Timer(_) | crate::fd::Backing::Usb(_) => {
                 return Err(Errno::NotSeekable);
             }
             crate::fd::Backing::Image(vnode) => {
@@ -855,7 +855,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 | crate::fd::Backing::Pipe { .. }
                 | crate::fd::Backing::Epoll(_)
                 | crate::fd::Backing::Socket(_)
-                | crate::fd::Backing::Event(_) => return Ok(()),
+                | crate::fd::Backing::Event(_) | crate::fd::Backing::Timer(_) | crate::fd::Backing::Usb(_) => return Ok(()),
             }
         } else {
             let text = self.path_at(path)?;
@@ -976,7 +976,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             | crate::fd::Backing::Pipe { .. }
             | crate::fd::Backing::Epoll(_)
             | crate::fd::Backing::Socket(_)
-            | crate::fd::Backing::Event(_) => return Outcome::Done(0),
+            | crate::fd::Backing::Event(_) | crate::fd::Backing::Timer(_) | crate::fd::Backing::Usb(_) => return Outcome::Done(0),
         };
         let outcome = self.change_mode_at(at::FDCWD, 0, vnode, mode);
         self.finish_change(arguments, outcome)

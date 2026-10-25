@@ -39,9 +39,18 @@
 //! would and serves the GDB remote protocol (`armv6m::gdb`) on its two
 //! rings. One debugger at a time: a second connection replaces the first,
 //! which is what a probe with one debug port does.
+//!
+//! And a second probe, on USB: a CMSIS-DAP v2 probe (`armv6m::cmsis_dap`)
+//! on the board's debug port, which the board serves as a USB provider
+//! (see [`crate::usb`]) under the id `board`. That is the one a debugger
+//! built on probe-rs finds by itself, as it would find a probe plugged in.
+//! Both reach the same core, and see the same halts.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
+
+use armv6m::cmsis_dap::{self, Probe};
 
 use armv6m::gdb::{self, Debugger, Response};
 use armv6m::stm32g0::Edge;
@@ -95,6 +104,9 @@ pub struct Board {
     pub faults: u64,
     /// Lines for the console, not yet written.
     pub console: Vec<String>,
+    /// The USB probe, and the responses it has for the host to read.
+    usb_probe: Probe,
+    usb_responses: VecDeque<Vec<u8>>,
 }
 
 /// The debugger connected to the probe.
@@ -306,6 +318,49 @@ impl Board {
         }
     }
 
+    /// A read of the USB probe's provider paths: see [`crate::usb`].
+    pub fn usb_read(&mut self, path: &[&[u8]], into: &mut Vec<u8>) -> crate::abi::StoreOutcome {
+        use crate::abi::StoreOutcome::{Absent, Failed, Present};
+        match path {
+            [b"descriptors"] => into.extend(cmsis_dap::descriptors()),
+            [b"strings", index] => {
+                let text = match std::str::from_utf8(index).ok().and_then(|i| i.parse::<usize>().ok()) {
+                    Some(4) => cmsis_dap::INTERFACE_STRING,
+                    Some(i) if (1..cmsis_dap::STRINGS.len()).contains(&i) => cmsis_dap::STRINGS[i],
+                    _ => return Absent,
+                };
+                into.extend(text.as_bytes());
+            }
+            [b"speed"] => into.extend(b"480"),
+            [b"endpoints", b"81", b"pending", _] => match self.usb_responses.pop_front() {
+                Some(response) => into.extend(response),
+                None => return Absent,
+            },
+            // No class or vendor requests: a stall.
+            _ => return Failed,
+        }
+        Present
+    }
+
+    /// A write to the USB probe: a command, answered at once, as the
+    /// probe's firmware would before it read the next.
+    pub fn usb_write(&mut self, path: &[&[u8]], data: &[u8]) -> crate::abi::StoreOutcome {
+        if path != [&b"endpoints"[..], b"01", b"tx"] {
+            return crate::abi::StoreOutcome::Failed;
+        }
+        let was_halted = self.machine.halted();
+        let response = self.usb_probe.command(&mut self.machine, data);
+        if !response.is_empty() {
+            self.usb_responses.push_back(response);
+        }
+        if was_halted && !self.machine.halted() {
+            self.rebase(self.now);
+        }
+        // A debugger's write can change a pin, or reset the part.
+        self.collect();
+        crate::abi::StoreOutcome::Present
+    }
+
     /// The board's state as the container's store serves it: what the
     /// page's board panel shows.
     pub fn json(&self) -> String {
@@ -396,14 +451,12 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// Kernel state only, like the edge pump it runs beside: the board,
     /// rings, the socket arena, and the store's clock and console.
     pub fn service_board(&mut self) -> bool {
-        if matches!(*self.board.borrow(), Slot::Unlooked) {
-            let slot = self.look_for_board();
-            *self.board.borrow_mut() = slot;
-        }
+        self.look_for_board_now();
         let board = Rc::clone(&self.board);
         let mut slot = board.borrow_mut();
         let Slot::Present(board) = &mut *slot else {
-            return false;
+            drop(slot);
+            return self.service_usb();
         };
 
         self.accept_debugger(board);
@@ -430,7 +483,19 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             line.push(b'\n');
             self.store.write(crate::paths::CONSOLE_STDERR, &line);
         }
-        moved
+        drop(slot);
+        // The USB probe's answers, and any other provider's, are what a
+        // parked process may be waiting for too.
+        self.service_usb() || moved
+    }
+
+    /// Looks for the board now rather than at the next service, for
+    /// whoever needs to know whether there is one.
+    pub(crate) fn look_for_board_now(&mut self) {
+        if matches!(*self.board.borrow(), Slot::Unlooked) {
+            let slot = self.look_for_board();
+            *self.board.borrow_mut() = slot;
+        }
     }
 
     /// When an idle container must wake to move the board on.
@@ -504,6 +569,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             led: None,
             faults: 0,
             console: Vec::new(),
+            usb_probe: Probe::default(),
+            usb_responses: VecDeque::new(),
         }))
     }
 

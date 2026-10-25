@@ -106,6 +106,9 @@ pub mod number {
     pub const NANOSLEEP: i64 = 35;
     pub const CLOCK_NANOSLEEP: i64 = 230;
     pub const EVENTFD2: i64 = 290;
+    pub const TIMERFD_CREATE: i64 = 283;
+    pub const TIMERFD_SETTIME: i64 = 286;
+    pub const TIMERFD_GETTIME: i64 = 287;
     pub const PSELECT6: i64 = 270;
     pub const SELECT: i64 = 23;
     pub const UMASK: i64 = 95;
@@ -250,6 +253,9 @@ pub mod number {
             NANOSLEEP => "nanosleep",
             CLOCK_NANOSLEEP => "clock_nanosleep",
             EVENTFD2 => "eventfd2",
+            TIMERFD_CREATE => "timerfd_create",
+            TIMERFD_SETTIME => "timerfd_settime",
+            TIMERFD_GETTIME => "timerfd_gettime",
             PSELECT6 => "pselect6",
             SELECT => "select",
             UMASK => "umask",
@@ -666,6 +672,11 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// Every `eventfd`, shared for the same reason: a copy of a
     /// notification notifies nobody.
     pub events: crate::eventfd::Shared,
+    /// Every `timerfd`, shared the same way.
+    pub timers: crate::timerfd::Shared,
+    /// The USB devices the providers offer, and every open device file.
+    /// See [`crate::usb`].
+    pub usb: crate::usb::Shared,
     /// Every `epoll` instance in *this* process. See [`crate::poll::Epolls`]
     /// for why this one is not shared where the pipes are.
     pub epolls: crate::poll::Held,
@@ -933,6 +944,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             sockets: crate::socket::Shared::default(),
             board: crate::board::Shared::default(),
             events: crate::eventfd::Shared::default(),
+            timers: crate::timerfd::Shared::default(),
+            usb: crate::usb::Shared::default(),
             epolls: crate::poll::Held::default(),
             clock: 1,
             status: None,
@@ -1108,9 +1121,17 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
 
     /// Attaches `/dev` and `/proc` over the directories the image provides.
     fn mount_synthetics(&mut self) {
+        // The USB devices first, since `/dev` and `/sys` both show them.
+        self.enumerate_usb();
+        let (addresses, sys) = {
+            let usb = self.usb.borrow();
+            let addresses: Vec<u8> = usb.devices.iter().map(|d| d.address).collect();
+            (addresses, crate::synthetic::sys(&usb))
+        };
         for (path, index) in [
-            (&b"/dev"[..], crate::synthetic::dev()),
+            (&b"/dev"[..], crate::synthetic::dev(&addresses)),
             (b"/proc", crate::synthetic::proc(self.executable.as_bytes())),
+            (b"/sys", sys),
         ] {
             let root = self.vfs.root();
             let Ok(point) = self.vfs.resolve(root, path, crate::vfs::Lookup::FOLLOW) else {
@@ -1287,6 +1308,14 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             for id in self.files.epoll_sets() {
                 epolls.acquire(id);
             }
+            let mut timers = self.timers.borrow_mut();
+            for id in self.files.timer_ids() {
+                timers.acquire(id);
+            }
+            let mut usb = self.usb.borrow_mut();
+            for id in self.files.usb_handles() {
+                usb.acquire(id);
+            }
         }
         Self {
             // The host boundary, which both processes reach. Sharing it is
@@ -1346,6 +1375,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             sockets: crate::socket::Shared::clone(&self.sockets),
             board: crate::board::Shared::clone(&self.board),
             events: crate::eventfd::Shared::clone(&self.events),
+            timers: crate::timerfd::Shared::clone(&self.timers),
+            usb: crate::usb::Shared::clone(&self.usb),
             // Copied, and marked: a registration names a description, and
             // a description is an index into a table the child has its own
             // copy of. See [`crate::poll::Epolls`].
@@ -1473,6 +1504,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             sockets: crate::socket::Shared::clone(&self.sockets),
             board: crate::board::Shared::clone(&self.board),
             events: crate::eventfd::Shared::clone(&self.events),
+            timers: crate::timerfd::Shared::clone(&self.timers),
+            usb: crate::usb::Shared::clone(&self.usb),
             // The same process, so not inherited: `execve` keeps the
             // descriptor table it did not close, and the indices with it.
             epolls: crate::poll::Held::new(self.epolls.borrow().clone()),
@@ -2448,6 +2481,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             }
             number::EPOLL_CTL => self.epoll_control(arguments),
             number::EVENTFD2 => self.make_eventfd(arguments),
+            number::TIMERFD_CREATE => self.timerfd_create(arguments),
+            number::TIMERFD_SETTIME => self.timerfd_settime(arguments),
+            number::TIMERFD_GETTIME => self.timerfd_gettime(arguments),
             number::SELECT | number::PSELECT6 => self.select(number, arguments),
             number::CLOSE_RANGE => self.close_range(arguments),
             number::FADVISE64 => self.fadvise(arguments),
@@ -3652,7 +3688,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 return Outcome::Done(Errno::Invalid.as_result());
             }
             // Answered before this row is reached; see `write_socket`.
-            crate::fd::Backing::Socket(_) | crate::fd::Backing::Event(_) => {
+            crate::fd::Backing::Socket(_) | crate::fd::Backing::Event(_) | crate::fd::Backing::Timer(_) | crate::fd::Backing::Usb(_) => {
                 return Outcome::Done(Errno::NotSeekable.as_result());
             }
             crate::fd::Backing::Image(vnode) => {

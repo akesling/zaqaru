@@ -63,6 +63,11 @@ pub enum Backing {
     /// reason. A descriptor that *is* a set rather than a file is the whole
     /// idea of `epoll`, and it is why it needs a backing of its own.
     Epoll(u32),
+    /// A `timerfd`. See [`crate::timerfd`].
+    Timer(u32),
+    /// An open USB device file, and the URBs submitted through it. See
+    /// [`crate::usb`].
+    Usb(u32),
 }
 
 /// What `dup` and friends share.
@@ -358,6 +363,28 @@ impl FdTable {
     }
 
     /// The same for `epoll` instances, once per descriptor.
+    pub fn timer_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.descriptors
+            .iter()
+            .flatten()
+            .filter_map(|descriptor| self.descriptions[descriptor.description].as_ref())
+            .filter_map(|file| match file.backing {
+                Backing::Timer(id) => Some(id),
+                _ => None,
+            })
+    }
+
+    pub fn usb_handles(&self) -> impl Iterator<Item = u32> + '_ {
+        self.descriptors
+            .iter()
+            .flatten()
+            .filter_map(|descriptor| self.descriptions[descriptor.description].as_ref())
+            .filter_map(|file| match file.backing {
+                Backing::Usb(id) => Some(id),
+                _ => None,
+            })
+    }
+
     pub fn epoll_sets(&self) -> impl Iterator<Item = u32> + '_ {
         self.descriptors
             .iter()
@@ -396,6 +423,8 @@ impl FdTable {
                     Backing::Pipe { ring, end } => format!("pipe{ring}:{end:?}"),
                     Backing::Socket(id) => format!("socket{id}"),
                     Backing::Event(id) => format!("event{id}"),
+                    Backing::Timer(id) => format!("timer{id}"),
+                    Backing::Usb(id) => format!("usb{id}"),
                     Backing::Epoll(id) => format!("epoll{id}"),
                 };
                 Some((fd, what))

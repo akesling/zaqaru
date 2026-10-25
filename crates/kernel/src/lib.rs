@@ -54,6 +54,8 @@ pub mod synthetic;
 pub mod syscall;
 pub mod system;
 pub mod thread;
+pub mod timerfd;
+pub mod usb;
 pub mod vdso;
 pub mod vfs;
 pub mod write;

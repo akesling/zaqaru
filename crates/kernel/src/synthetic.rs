@@ -42,6 +42,28 @@ pub mod view {
     /// `/proc/board`, the board on the container's bench (see
     /// `crate::board`), rendered from its state.
     pub const BOARD: u64 = 2;
+    /// A USB device's sysfs attribute, rendered from the device table (see
+    /// `crate::usb`). The low byte says so; above it, [`usb`] packs which
+    /// device, interface and attribute.
+    pub const USB: u64 = 3;
+
+    pub const fn usb(device: usize, interface: Option<usize>, attribute: usize) -> u64 {
+        let interface = match interface {
+            Some(n) => n as u64 + 1,
+            None => 0,
+        };
+        USB | (device as u64) << 8 | interface << 24 | (attribute as u64) << 32
+    }
+
+    /// The device, interface and attribute a [`usb`] view names.
+    pub const fn usb_parts(payload: u64) -> (usize, Option<usize>, usize) {
+        let interface = (payload >> 24 & 0xFF) as usize;
+        (
+            (payload >> 8 & 0xFFFF) as usize,
+            if interface == 0 { None } else { Some(interface - 1) },
+            (payload >> 32) as usize,
+        )
+    }
 }
 
 /// Linux's packed `dev_t`: minor's low eight bits, major's twelve above
@@ -49,6 +71,11 @@ pub mod view {
 /// difference is invisible until a minor exceeds 255.
 pub const fn make_device(major: u32, minor: u32) -> u64 {
     ((major as u64 & 0xfff) << 8) | (minor as u64 & 0xff) | ((minor as u64 & 0xfff00) << 12)
+}
+
+/// The inverse of [`make_device`]: a packed `dev_t`'s major and minor.
+pub const fn split_device(rdev: u64) -> (u32, u32) {
+    (((rdev >> 8) & 0xfff) as u32, ((rdev & 0xff) | ((rdev >> 12) & 0xfff00)) as u32)
 }
 
 /// One device node to build.
@@ -77,14 +104,102 @@ pub const CONSOLE_INPUT_DEVICE: (u32, u32) = (5, 100);
 pub const CONSOLE_OUTPUT_DEVICE: (u32, u32) = (5, 101);
 pub const CONSOLE_ERROR_DEVICE: (u32, u32) = (5, 102);
 
+/// A synthetic filesystem as a tree, for the ones too deep for [`build`].
+pub enum Node {
+    Directory(Vec<(Vec<u8>, Node)>),
+    Device { mode: u32, rdev: u64 },
+    /// A file rendered when read: a [`view`].
+    Generated(u64),
+}
+
+/// Builds a tree whose root is a directory of `entries`.
+pub fn tree(entries: Vec<(Vec<u8>, Node)>) -> Vec<u8> {
+    let mut index = Vec::new();
+    let mut inodes: Vec<Inode> = vec![directory(0)];
+    let mut strings = Strings::default();
+    let mut dirents = Vec::new();
+    // Breadth first: each directory's children get their numbers before any
+    // grandchild does, and its listing is written when it is reached.
+    let mut queue: std::collections::VecDeque<(u32, Vec<(Vec<u8>, Node)>)> = std::collections::VecDeque::new();
+    queue.push_back((0, entries));
+    while let Some((number, children)) = queue.pop_front() {
+        let mut listing: Vec<(Vec<u8>, u32, u8)> = Vec::new();
+        let mut subdirectories = 0;
+        for (name, node) in children {
+            let child = inodes.len() as u32;
+            match node {
+                Node::Directory(grandchildren) => {
+                    inodes.push(directory(number));
+                    subdirectories += 1;
+                    listing.push((name, child, directory_entry_type::DIRECTORY));
+                    queue.push_back((child, grandchildren));
+                }
+                Node::Device { mode, rdev } => {
+                    inodes.push(Inode { mode, payload: rdev, nlink: 1, ..blank() });
+                    listing.push((name, child, directory_entry_type::of_mode(mode)));
+                }
+                Node::Generated(payload) => {
+                    inodes.push(Inode {
+                        mode: file_type::REGULAR | 0o444,
+                        size: 0,
+                        payload,
+                        flags: inode_flags::GENERATED,
+                        nlink: 1,
+                        ..blank()
+                    });
+                    listing.push((name, child, directory_entry_type::REGULAR));
+                }
+            }
+        }
+        let borrowed: Vec<(&[u8], u32, u8)> = listing.iter().map(|(n, i, k)| (n.as_slice(), *i, *k)).collect();
+        let at = dirents.len() as u64;
+        write_entries(&mut dirents, &mut strings, &borrowed);
+        let inode = &mut inodes[number as usize];
+        inode.payload = at;
+        inode.size = (4 + 12 * listing.len()) as u64;
+        inode.nlink = 2 + subdirectories;
+    }
+    assemble(&mut index, &inodes, &dirents, &strings.bytes);
+    index
+}
+
+/// `/sys`: as much of Linux's as finds USB devices — `bus/usb/devices`,
+/// a directory per device with its attributes, and inside it a directory
+/// per interface with theirs, which is where libusb and nusb look.
+pub fn sys(usb: &crate::usb::Usb) -> Vec<u8> {
+    use crate::usb::{DEVICE_ATTRIBUTES, INTERFACE_ATTRIBUTES};
+    let mut devices = Vec::new();
+    for (n, device) in usb.devices.iter().enumerate() {
+        let name = format!("{}-{}", crate::usb::BUS, device.address - 1);
+        let mut entries: Vec<(Vec<u8>, Node)> = DEVICE_ATTRIBUTES
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| usb.attribute(n, None, a).is_some())
+            .map(|(k, a)| (a.as_bytes().to_vec(), Node::Generated(view::usb(n, None, k))))
+            .collect();
+        for i in 0..device.interfaces().len() {
+            let attributes = INTERFACE_ATTRIBUTES
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| usb.attribute(n, Some(i), a).is_some())
+                .map(|(k, a)| (a.as_bytes().to_vec(), Node::Generated(view::usb(n, Some(i), k))))
+                .collect();
+            entries.push((format!("{name}:1.{i}").into_bytes(), Node::Directory(attributes)));
+        }
+        devices.push((name.into_bytes(), Node::Directory(entries)));
+    }
+    let usb = Node::Directory(vec![(b"devices".to_vec(), Node::Directory(devices))]);
+    tree(vec![(b"bus".to_vec(), Node::Directory(vec![(b"usb".to_vec(), usb)]))])
+}
+
 /// `/dev`, with the character devices a libc actually opens.
 ///
 /// Not the whole of a real `/dev`: no `tty`, because v0 decides stdio is not
 /// a terminal and a `/dev/tty` that answered would contradict that. What is
 /// here is what a process opens before it does anything else, plus the three
 /// console devices above.
-pub fn dev() -> Vec<u8> {
-    build(&[
+pub fn dev(usb: &[u8]) -> Vec<u8> {
+    let flat = [
         Entry {
             name: b"null",
             mode: file_type::CHARACTER | 0o666,
@@ -129,7 +244,27 @@ pub fn dev() -> Vec<u8> {
             mode: file_type::CHARACTER | 0o666,
             rdev: make_device(URANDOM_DEVICE.0, URANDOM_DEVICE.1),
         },
-    ])
+    ];
+    if usb.is_empty() {
+        return build(&flat);
+    }
+    // With USB devices, `bus/usb/001/{address}` as well, which is two levels
+    // deeper than the rest.
+    let mut entries: Vec<(Vec<u8>, Node)> =
+        flat.iter().map(|e| (e.name.to_vec(), Node::Device { mode: e.mode, rdev: e.rdev })).collect();
+    let nodes = usb
+        .iter()
+        .map(|&address| {
+            let node = Node::Device {
+                mode: file_type::CHARACTER | 0o666,
+                rdev: make_device(crate::usb::MAJOR, u32::from(address) - 1),
+            };
+            (format!("{address:03}").into_bytes(), node)
+        })
+        .collect();
+    let bus = Node::Directory(vec![(format!("{:03}", crate::usb::BUS).into_bytes(), Node::Directory(nodes))]);
+    entries.push((b"bus".to_vec(), Node::Directory(vec![(b"usb".to_vec(), bus)])));
+    tree(entries)
 }
 
 /// `/proc`: `self/exe`, `self/maps`, `board`, and nothing else.
@@ -371,7 +506,7 @@ mod tests {
     /// than special-casing a path.
     #[test]
     fn dev_reads_back_as_an_image() {
-        let index = dev();
+        let index = dev(&[]);
         let image = parse(&index).expect("the built index parses");
         let root = image.inode(image.root()).expect("root");
         assert!(root.is_directory());
@@ -414,6 +549,52 @@ mod tests {
         sorted.sort();
         assert_eq!(names, sorted);
         assert!(image.lookup(&root, b"nothing").expect("lookup").is_none());
+    }
+
+    /// Walks `path` from the root of a built image.
+    fn walk(image: &Image<'_>, path: &[&[u8]]) -> Option<Inode> {
+        let mut inode = image.inode(image.root()).ok()?;
+        for name in path {
+            let entry = image.lookup(&inode, name).ok()??;
+            inode = image.inode(entry.inode).ok()?;
+        }
+        Some(inode)
+    }
+
+    #[test]
+    fn usb_devices_appear_in_dev_and_sys_where_libusb_looks() {
+        let index = dev(&[2]);
+        let image = parse(&index).expect("parse");
+        let node = walk(&image, &[b"bus", b"usb", b"001", b"002"]).expect("/dev/bus/usb/001/002");
+        assert_eq!(node.file_type(), file_type::CHARACTER);
+        assert_eq!(split_device(node.payload), (crate::usb::MAJOR, 1));
+        assert!(walk(&image, &[b"null"]).is_some(), "and the rest of /dev");
+
+        let device = crate::usb::Device {
+            id: crate::usb::BOARD.into(),
+            address: 2,
+            descriptors: armv6m::cmsis_dap::descriptors(),
+            strings: vec![(2, "zaqaru CMSIS-DAP".into()), (4, "zaqaru CMSIS-DAP v2".into())],
+            speed: "480".into(),
+        };
+        let usb = crate::usb::Usb { devices: vec![device], ..Default::default() };
+        let index = sys(&usb);
+        let image = parse(&index).expect("parse");
+        let vendor = walk(&image, &[b"bus", b"usb", b"devices", b"1-1", b"idVendor"]).expect("idVendor");
+        assert_eq!(vendor.flags & inode_flags::GENERATED, inode_flags::GENERATED);
+        let (device, interface, attribute) = view::usb_parts(vendor.payload);
+        assert_eq!(
+            usb.attribute(device, interface, crate::usb::DEVICE_ATTRIBUTES[attribute]).as_deref(),
+            Some("1209")
+        );
+        let name = walk(&image, &[b"bus", b"usb", b"devices", b"1-1", b"1-1:1.0", b"interface"]).expect("interface");
+        let (device, interface, attribute) = view::usb_parts(name.payload);
+        assert_eq!(interface, Some(0));
+        assert_eq!(
+            usb.attribute(device, interface, crate::usb::INTERFACE_ATTRIBUTES[attribute]).as_deref(),
+            Some("zaqaru CMSIS-DAP v2")
+        );
+        assert!(walk(&image, &[b"bus", b"usb", b"devices", b"1-1", b"serial"]).is_none(), "no string, no file");
     }
 
     #[test]

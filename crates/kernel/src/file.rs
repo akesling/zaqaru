@@ -250,7 +250,9 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             | Backing::Pipe { .. }
             | Backing::Epoll(_)
             | Backing::Socket(_)
-            | Backing::Event(_) => Err(not_a_file),
+            | Backing::Event(_)
+            | Backing::Timer(_)
+            | Backing::Usb(_) => Err(not_a_file),
         }
     }
 
@@ -418,6 +420,18 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             }
         }
 
+        // A USB device file has state of its own — the URBs submitted
+        // through it — so it is a description of its own kind rather than
+        // an inode.
+        if resolved.file_type() == file_type::CHARACTER {
+            let (major, minor) = crate::synthetic::split_device(resolved.payload);
+            if major == crate::usb::MAJOR {
+                return Outcome::Done(match self.open_usb(minor, flags) {
+                    Ok(fd) => fd as i64,
+                    Err(errno) => errno.as_result(),
+                });
+            }
+        }
         match self.files.open(
             Backing::Image(inode),
             flags & !open_flags::CLOEXEC,
@@ -494,6 +508,11 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             return Outcome::Done(Errno::BadFile.as_result());
         }
         let request = arguments.get(1) as u64;
+        if let Ok(Backing::Usb(id)) = self.files.description(fd).map(|file| file.backing) {
+            if !matches!(request, ioctl_request::FIOCLEX | ioctl_request::FIONCLEX | ioctl_request::FIONBIO) {
+                return self.usb_ioctl(id, arguments);
+            }
+        }
         match request {
             ioctl_request::TCGETS
             | ioctl_request::TCSETS
@@ -599,7 +618,9 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 | Backing::Pipe { .. }
                 | Backing::Epoll(_)
                 | Backing::Socket(_)
-                | Backing::Event(_) => None,
+                | Backing::Event(_)
+                | Backing::Timer(_)
+                | Backing::Usb(_) => None,
             },
             Err(_) => None,
         };
@@ -657,6 +678,9 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         }
         if let Some((event, flags)) = self.event_of(fd) {
             return self.transfer_event(event, flags, false, arguments.get(1) as u64, count as u64);
+        }
+        if let Ok(crate::fd::OpenFile { backing: Backing::Timer(id), flags, .. }) = self.files.description(fd).copied() {
+            return self.read_timer(id, flags, arguments.get(1) as u64, count as u64);
         }
         let offset = match self.files.description(fd) {
             Ok(file) => file.offset,
@@ -727,8 +751,11 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             // reason it answers a pipe: the transfer can park. `pread` on
             // a socket has no position to read at.
             Backing::Socket(_) => return Err(Errno::NotSeekable),
-            // Answered by `read` before this; an `eventfd` has no position.
-            Backing::Event(_) => return Err(Errno::NotSeekable),
+            // Answered by `read` before this; an `eventfd` has no position,
+            // and neither has a timer.
+            Backing::Event(_) | Backing::Timer(_) => return Err(Errno::NotSeekable),
+            // A USB device file reads as its descriptors.
+            Backing::Usb(id) => return self.read_usb(id, buffer as u64, count, offset),
         };
         // An `O_PATH` descriptor refers to a file without opening it, so
         // there is nothing to read from.
@@ -950,6 +977,17 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 crate::board::Slot::Present(board) => board.status(),
                 _ => return Err(Errno::NoDevice),
             },
+            v if v & 0xFF == crate::synthetic::view::USB => {
+                let (device, interface, attribute) = crate::synthetic::view::usb_parts(v);
+                let names = match interface {
+                    None => crate::usb::DEVICE_ATTRIBUTES,
+                    Some(_) => crate::usb::INTERFACE_ATTRIBUTES,
+                };
+                let name = names.get(attribute).ok_or(Errno::NoDevice)?;
+                let mut text = self.usb.borrow().attribute(device, interface, name).ok_or(Errno::NoDevice)?;
+                text.push('\n');
+                text
+            }
             // A view nothing renders would read as an empty file, which is
             // a plausible wrong answer to a program asking about the kernel.
             _ => return Err(Errno::NoDevice),
@@ -1097,7 +1135,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Backing::Pipe { ring, .. } => self.write_pipe_stat(ring, arguments.get(1)),
                 Backing::Epoll(id) => self.write_epoll_stat(id, arguments.get(1)),
                 Backing::Socket(id) => self.write_socket_stat(id, arguments.get(1)),
-                Backing::Event(id) => self.write_epoll_stat(id, arguments.get(1)),
+                Backing::Event(id) | Backing::Timer(id) | Backing::Usb(id) => self.write_epoll_stat(id, arguments.get(1)),
             },
             Err(errno) => Outcome::Done(errno.as_result()),
         }
@@ -1198,7 +1236,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Ok(Backing::Pipe { ring, .. }) => self.write_pipe_stat(ring, arguments.get(2)),
                 Ok(Backing::Epoll(id)) => self.write_epoll_stat(id, arguments.get(2)),
                 Ok(Backing::Socket(id)) => self.write_socket_stat(id, arguments.get(2)),
-                Ok(Backing::Event(id)) => self.write_epoll_stat(id, arguments.get(2)),
+                Ok(Backing::Event(id)) | Ok(Backing::Timer(id)) | Ok(Backing::Usb(id)) => self.write_epoll_stat(id, arguments.get(2)),
                 Err(errno) => Outcome::Done(errno.as_result()),
             };
         }
@@ -1271,7 +1309,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 // An `eventfd` reports the way an anonymous inode does, the
                 // same as an `epoll` descriptor: a mode with no file-type
                 // bits at all, which is what `fstat` on one answers.
-                Ok(Backing::Epoll(id)) | Ok(Backing::Event(id)) => {
+                Ok(Backing::Epoll(id)) | Ok(Backing::Event(id)) | Ok(Backing::Timer(id)) | Ok(Backing::Usb(id)) => {
                     let mut buffer = [0u8; STATX_SIZE];
                     let number = EPOLL_INODE_BASE + u64::from(id);
                     buffer[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
@@ -1582,7 +1620,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 | Ok(Backing::Pipe { .. })
                 | Ok(Backing::Epoll(_))
                 | Ok(Backing::Socket(_))
-                | Ok(Backing::Event(_)) => {
+                | Ok(Backing::Event(_) | Backing::Timer(_) | Backing::Usb(_)) => {
                     return Outcome::Done(Errno::Invalid.as_result());
                 }
                 Err(errno) => return Outcome::Done(errno.as_result()),
@@ -1686,7 +1724,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 }
                 // A socket is readable and writable and never executable,
                 // whichever direction it is currently able to move bytes in.
-                Ok(Backing::Socket(_)) | Ok(Backing::Event(_)) => {
+                Ok(Backing::Socket(_)) | Ok(Backing::Event(_) | Backing::Timer(_) | Backing::Usb(_)) => {
                     return Outcome::Done(match mode & access_mode::EXECUTE != 0 {
                         true => Errno::Access.as_result(),
                         false => 0,
@@ -1790,7 +1828,9 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                     | Backing::Pipe { .. }
                     | Backing::Epoll(_)
                     | Backing::Socket(_)
-                    | Backing::Event(_) => Ok(None),
+                    | Backing::Event(_)
+                    | Backing::Timer(_)
+                    | Backing::Usb(_) => Ok(None),
                 }
             }
             number::LGETXATTR | number::LLISTXATTR => self
@@ -2276,6 +2316,8 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             pipes: rings,
             sockets,
             epolls: self.files.epoll_sets().collect(),
+            timers: self.files.timer_ids().collect(),
+            usb: self.files.usb_handles().collect(),
         }
     }
 
@@ -2376,6 +2418,26 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             }
             for _ in now..was {
                 epolls.release(held);
+            }
+        }
+        drop(epolls);
+        let mut timers = self.timers.borrow_mut();
+        for held in distinct(&before.timers, &after.timers) {
+            for _ in count(&before.timers, &held)..count(&after.timers, &held) {
+                timers.acquire(held);
+            }
+            for _ in count(&after.timers, &held)..count(&before.timers, &held) {
+                timers.release(held);
+            }
+        }
+        drop(timers);
+        let mut usb = self.usb.borrow_mut();
+        for held in distinct(&before.usb, &after.usb) {
+            for _ in count(&before.usb, &held)..count(&after.usb, &held) {
+                usb.acquire(held);
+            }
+            for _ in count(&after.usb, &held)..count(&before.usb, &held) {
+                usb.release(held);
             }
         }
     }
@@ -2568,6 +2630,8 @@ pub struct Census {
     pipes: Vec<(u32, crate::ring::End)>,
     sockets: Vec<u32>,
     epolls: Vec<u32>,
+    timers: Vec<u32>,
+    usb: Vec<u32>,
 }
 
 /// Each value that appears in either list, once.
