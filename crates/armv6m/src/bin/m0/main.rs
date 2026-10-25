@@ -16,6 +16,7 @@
 //! something else runs — zaqaru's kernel, chiefly. See [`door`].
 
 mod door;
+mod zip;
 mod serve;
 
 use std::process::ExitCode;

@@ -831,6 +831,8 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             // Always at end of file. Reading `/dev/null` is how a program
             // asks for nothing at all.
             crate::synthetic::NULL_DEVICE => Ok(0),
+            // The board is told things, not asked: `/proc/board` answers.
+            crate::synthetic::BOARD_DEVICE => Ok(0),
             // Zeros, and `/dev/full` reads the same — its whole difference
             // is what happens when it is *written*.
             crate::synthetic::ZERO_DEVICE | crate::synthetic::FULL_DEVICE => {
@@ -884,6 +886,9 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         rdev: u64,
         bytes: &[u8],
     ) -> Option<Result<u64, Errno>> {
+        if split_device(rdev) == crate::synthetic::BOARD_DEVICE {
+            return Some(self.tell_board(bytes));
+        }
         let path = Self::console_device(rdev)?;
         let length = bytes.len() as u64;
         Some(match self.store.write(path, bytes) {
@@ -895,6 +900,35 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         })
     }
 
+    /// Bytes written to `/dev/board`: each line a command. A command the
+    /// board refuses is `EINVAL`, and says why on the console; no board is
+    /// `ENODEV`.
+    fn tell_board(&mut self, bytes: &[u8]) -> Result<u64, Errno> {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        let mut refusal = None;
+        {
+            let mut slot = self.board.borrow_mut();
+            let crate::board::Slot::Present(board) = &mut *slot else {
+                return Err(Errno::NoDevice);
+            };
+            for line in text.lines() {
+                if let Err(why) = board.command(line) {
+                    refusal = Some(why);
+                    break;
+                }
+            }
+        }
+        match refusal {
+            None => Ok(bytes.len() as u64),
+            Some(why) => {
+                let mut line = format!("board: {why}").into_bytes();
+                line.push(b'\n');
+                self.store.write(crate::paths::CONSOLE_STDERR, &line);
+                Err(Errno::Invalid)
+            }
+        }
+    }
+
     /// The same for bytes still in the guest's memory.
     pub(crate) fn write_console_device_from(
         &mut self,
@@ -902,6 +936,13 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         buffer: i64,
         count: u64,
     ) -> Option<Result<u64, Errno>> {
+        if split_device(rdev) == crate::synthetic::BOARD_DEVICE {
+            let mut bytes = vec![0u8; count as usize];
+            if self.pages.read(buffer as u64, &mut bytes).is_err() {
+                return Some(Err(Errno::Fault));
+            }
+            return Some(self.tell_board(&bytes));
+        }
         Self::console_device(rdev)?;
         // SAFETY: bounds-checked here, and the slice is handed straight to
         // the store without anything running in between.

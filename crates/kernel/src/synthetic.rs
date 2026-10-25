@@ -100,6 +100,11 @@ struct Entry {
 /// redirection changes. These mean the container's console, always. For a
 /// container whose stdout is the console that is the same thing, and it is
 /// what every image that logs to `/dev/stdout` is asking for.
+/// The board on the container's bench, as a device a program tells things
+/// to: see `crate::board::Board::command`. Reads are empty; `/proc/board`
+/// is its status. A misc-class number, as a Linux driver of its kind gets.
+pub const BOARD_DEVICE: (u32, u32) = (10, 245);
+
 pub const CONSOLE_INPUT_DEVICE: (u32, u32) = (5, 100);
 pub const CONSOLE_OUTPUT_DEVICE: (u32, u32) = (5, 101);
 pub const CONSOLE_ERROR_DEVICE: (u32, u32) = (5, 102);
@@ -250,6 +255,11 @@ pub fn dev(usb: &[u8]) -> Vec<u8> {
             name: b"random",
             mode: file_type::CHARACTER | 0o666,
             rdev: make_device(RANDOM_DEVICE.0, RANDOM_DEVICE.1),
+        },
+        Entry {
+            name: b"board",
+            mode: file_type::CHARACTER | 0o666,
+            rdev: make_device(BOARD_DEVICE.0, BOARD_DEVICE.1),
         },
         Entry {
             name: b"urandom",
@@ -522,7 +532,7 @@ mod tests {
         let image = parse(&index).expect("the built index parses");
         let root = image.inode(image.root()).expect("root");
         assert!(root.is_directory());
-        assert_eq!(image.entry_count(&root).expect("count"), 8);
+        assert_eq!(image.entry_count(&root).expect("count"), 9);
 
         for (name, (major, minor)) in [
             (&b"null"[..], NULL_DEVICE),

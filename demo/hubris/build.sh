@@ -56,11 +56,19 @@ else
   }
 fi
 
-echo "build: Hubris, app-g031.toml"
-(cd "$hubris" && cargo xtask dist app/demo-stm32g0-nucleo/app-g031.toml)
+# The board boots the G031 demo; the G070 demo — ping over USART1 — is
+# there to flash onto it (`flash g070` at the bench's prompt), and so is
+# anything else a user uploads.
+mkdir -p "$work/bench/archives"
+for app in g031 g070; do
+  echo "build: Hubris, app-$app.toml"
+  (cd "$hubris" && cargo xtask dist "app/demo-stm32g0-nucleo/app-$app.toml")
+  cp "$hubris/target/demo-stm32${app}-nucleo/dist/default/build-demo-stm32${app}-nucleo-image-default.zip" \
+    "$work/bench/archives/$app.zip"
+done
 dist="$hubris/target/demo-stm32g031-nucleo/dist/default"
 cp "$dist/final.bin" "$work/bench/final.bin"
-cp "$dist/build-demo-stm32g031-nucleo-image-default.zip" "$work/bench/hubris.zip"
+cp "$work/bench/archives/g031.zip" "$work/bench/hubris.zip"
 
 echo "build: Humility $humility_commit"
 if [ ! -d "$work/humility" ]; then

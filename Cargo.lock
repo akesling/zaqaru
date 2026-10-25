@@ -1860,6 +1860,7 @@ dependencies = [
 name = "zaqaru-armv6m"
 version = "0.1.0"
 dependencies = [
+ "miniz_oxide",
  "object 0.40.0",
 ]
 

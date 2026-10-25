@@ -12,6 +12,10 @@ name = "armv6m"
 name = "zaqaru-m0"
 path = "src/bin/m0/main.rs"
 
+[dependencies]
+# For the door's reading of a Hubris archive: one file out of a zip.
+miniz_oxide = "0.8.9"
+
 [dev-dependencies]
 # The ISA tests assemble their programs with clang and read the labels back
 # out of the object's symbol table, rather than checking in hand-encoded

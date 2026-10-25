@@ -9,6 +9,7 @@ FROM --platform=linux/amd64 debian:bookworm-slim
 
 COPY humility zaqaru-m0 /usr/local/bin/
 COPY final.bin hubris.zip /hubris/
+COPY archives /hubris/archives/
 COPY board /etc/zaqaru/board
 
 # One malloc arena. Every process here shares the module's one 4 GiB

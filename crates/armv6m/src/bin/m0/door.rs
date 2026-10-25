@@ -60,7 +60,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
 
 pub(crate) struct FrontDoor {
     humility: String,
-    archive: Option<String>,
+    /// The archive Humility is run against: the one the bench started
+    /// with, then whichever was last flashed.
+    archive: Mutex<Option<String>>,
     /// The probe, as Humility is to reach it: `usb`, or a GDB server's
     /// address.
     probe: String,
@@ -77,7 +79,7 @@ impl FrontDoor {
         probe: String,
         status: Box<dyn Fn() -> Option<String> + Send + Sync>,
     ) -> FrontDoor {
-        FrontDoor { humility, archive, probe, one_at_a_time: Mutex::new(()), status }
+        FrontDoor { humility, archive: Mutex::new(archive), probe, one_at_a_time: Mutex::new(()), status }
     }
 }
 
@@ -99,6 +101,10 @@ const HELP: &str = "\
     humility manifest       what the archive says was built
     humility flash -F       flash the archive's image onto the board, and
                             run it
+    archives                the Hubris builds there are to flash
+    flash NAME              make the board the part NAME was built for and
+                            flash it — g031, g070, or one you uploaded
+                            (drop an archive on the terminal to upload it)
     humility -p VID:PID …   the same against a probe connected from the
                             page — its USB panel, 'connect a USB
                             device…' — on real hardware
@@ -126,7 +132,7 @@ pub(crate) fn accept_requests(listener: TcpListener, door: Arc<FrontDoor>) {
 fn session(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
     // No read timeout: zaqaru's kernel refuses SO_RCVTIMEO outright, and a
     // session nobody types into costs one parked thread.
-    let mut lines = BufReader::new(stream.try_clone()?).take(1 << 20);
+    let mut lines = BufReader::new(stream.try_clone()?);
     let mut out = stream;
     out.write_all(TITLE)?;
     out.write_all(BANNER.as_bytes())?;
@@ -147,6 +153,19 @@ fn session(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
                 None => out.write_all(b"no board answered\n")?,
             },
             Some("humility") => door.humility(&words[1..], &out)?,
+            Some("archives") => out.write_all(door.archives().as_bytes())?,
+            Some("upload") => match (words.get(1), words.get(2).and_then(|n| n.parse::<usize>().ok())) {
+                (Some(name), Some(size)) if size <= UPLOAD_LIMIT => {
+                    let mut bytes = vec![0u8; size];
+                    lines.read_exact(&mut bytes)?;
+                    out.write_all(upload(name, &bytes).as_bytes())?;
+                }
+                _ => out.write_all(format!("upload NAME SIZE, then SIZE bytes; at most {} MiB\n", UPLOAD_LIMIT >> 20).as_bytes())?,
+            },
+            Some("flash") => match words.get(1) {
+                Some(name) => door.flash(name, &out)?,
+                None => out.write_all(b"flash NAME: an archive `archives` lists, or one uploaded\n")?,
+            },
             Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, help and exit\n").as_bytes())?,
         }
         out.write_all(PROMPT)?;
@@ -158,6 +177,11 @@ impl FrontDoor {
     /// Runs Humility with `args`, its output going straight into the
     /// session, so it arrives as Humility prints it.
     fn humility(&self, args: &[String], out: &TcpStream) -> std::io::Result<()> {
+        self.run_humility(args, out).map(|_| ())
+    }
+
+    /// The same, answering whether Humility succeeded.
+    fn run_humility(&self, args: &[String], out: &TcpStream) -> std::io::Result<bool> {
         let _turn = self.one_at_a_time.lock().unwrap_or_else(|e| e.into_inner());
         let mut command = Command::new(&self.humility);
         command
@@ -169,15 +193,107 @@ impl FrontDoor {
             .stdin(Stdio::null())
             .stdout(Stdio::from(OwnedFd::from(out.try_clone()?)))
             .stderr(Stdio::from(OwnedFd::from(out.try_clone()?)));
-        if let Some(archive) = &self.archive {
+        if let Some(archive) = &*self.archive.lock().unwrap_or_else(|e| e.into_inner()) {
             command.env("HUMILITY_ARCHIVE", archive);
         }
         let mut out = out;
         match command.status() {
-            Ok(status) if status.success() => Ok(()),
-            Ok(status) => out.write_all(format!("({status})\n").as_bytes()),
-            Err(e) => out.write_all(format!("can't run {}: {e}\n", self.humility).as_bytes()),
+            Ok(status) if status.success() => Ok(true),
+            Ok(status) => out.write_all(format!("({status})\n").as_bytes()).map(|()| false),
+            Err(e) => out.write_all(format!("can't run {}: {e}\n", self.humility).as_bytes()).map(|()| false),
         }
+    }
+}
+
+/// Where the image's own archives are, and where uploaded ones go.
+const ARCHIVES: &str = "/hubris/archives";
+const UPLOADS: &str = "/uploads";
+/// The largest archive `upload` takes.
+const UPLOAD_LIMIT: usize = 16 << 20;
+
+/// Saves an uploaded archive under [`UPLOADS`], by its base name alone, and
+/// says what happened.
+fn upload(name: &str, bytes: &[u8]) -> String {
+    let name: String = name
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' })
+        .collect();
+    if name.is_empty() || name.starts_with('.') {
+        return "upload: name the archive\n".into();
+    }
+    let path = format!("{UPLOADS}/{name}");
+    match std::fs::create_dir_all(UPLOADS).and_then(|()| std::fs::write(&path, bytes)) {
+        Ok(()) => format!("uploaded {name}, {} bytes — `flash {name}` puts it on the board\n", bytes.len()),
+        Err(e) => format!("upload: {path}: {e}\n"),
+    }
+}
+
+/// The part a Hubris archive was built for, from the `chip: Some("…")` its
+/// `img/flash.ron` says.
+fn part_of(flash_ron: &str) -> Option<&str> {
+    let after = flash_ron.split("Some(\"").nth(1)?;
+    Some(&after[..after.find('"')?])
+}
+
+impl FrontDoor {
+    /// The archives there are to flash: the image's, and any uploaded.
+    fn archives(&self) -> String {
+        let mut out = String::new();
+        for directory in [ARCHIVES, UPLOADS] {
+            let Ok(entries) = std::fs::read_dir(directory) else { continue };
+            let mut names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            for name in names.iter().filter(|n| n.ends_with(".zip")) {
+                out += &format!("    {:<24} {directory}/{name}\n", name.trim_end_matches(".zip"));
+            }
+        }
+        let current = self.archive.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        out += &format!("on the board: {}\n", current.as_deref().unwrap_or("nothing named"));
+        out
+    }
+
+    /// An archive by name — `g070`, `g070.zip`, an uploaded one's name — or
+    /// by path.
+    fn find(name: &str) -> Option<String> {
+        if name.contains('/') {
+            return std::path::Path::new(name).is_file().then(|| name.to_string());
+        }
+        let file = if name.ends_with(".zip") { name.to_string() } else { format!("{name}.zip") };
+        [UPLOADS, ARCHIVES].iter().map(|d| format!("{d}/{file}")).find(|p| std::path::Path::new(p).is_file())
+    }
+
+    /// `flash NAME`: the board becomes the part the archive was built for,
+    /// erased, and Humility flashes the archive onto it — `humility flash`,
+    /// as on a desk — and is pointed at it from then on.
+    fn flash(&self, name: &str, out: &TcpStream) -> std::io::Result<()> {
+        let mut out = out;
+        let Some(archive) = Self::find(name) else {
+            return out.write_all(format!("flash: no archive `{name}`; `archives` lists them\n").as_bytes());
+        };
+        // Read from the archive itself: `img/flash.ron` names the part.
+        let flash_ron = std::fs::read(&archive)
+            .ok()
+            .and_then(|bytes| crate::zip::entry(&bytes, "img/flash.ron"))
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        let Some(part) = part_of(&flash_ron) else {
+            return out.write_all(format!("flash: {archive} does not say what part it is for\n").as_bytes());
+        };
+        if let Err(e) = std::fs::write("/dev/board", format!("part {part}\n")) {
+            return out.write_all(format!("flash: the board would not become an {part}: {e}\n").as_bytes());
+        }
+        out.write_all(format!("the board is now an {part}, erased; flashing {archive}\n").as_bytes())?;
+        let previous = self.archive.lock().unwrap_or_else(|e| e.into_inner()).replace(archive.clone());
+        let flashed = self.run_humility(&["flash".to_string()], out)?;
+        if flashed {
+            let _ = std::fs::write("/dev/board", format!("image {archive}\n"));
+        } else {
+            *self.archive.lock().unwrap_or_else(|e| e.into_inner()) = previous;
+        }
+        Ok(())
     }
 }
 
@@ -206,6 +322,12 @@ fn split(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::split;
+
+    #[test]
+    fn an_archive_says_its_part_in_flash_ron() {
+        assert_eq!(super::part_of("(\n    chip: Some(\"STM32G070RBTx\"),\n)\n"), Some("STM32G070RBTx"));
+        assert_eq!(super::part_of("(chip: None)"), None);
+    }
 
     #[test]
     fn a_line_splits_as_a_shell_would() {
