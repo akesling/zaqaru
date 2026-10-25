@@ -348,8 +348,10 @@ pub enum Leave {
     Exit,
     /// The trace reached a `Defer`. `rip` is the guest address of the one
     /// instruction to run through the interpreter; after it, re-enter the
-    /// trace. Carries the stream offset to resume at.
-    Defer { resume: usize },
+    /// trace. Carries the trace — by its entry, since a trace can have
+    /// jumped into another before it deferred — and the stream offset to
+    /// resume at.
+    Defer { entry: u64, resume: usize },
     /// The preemption budget ran out at a back-edge. `rip` names the next
     /// instruction.
     Preempted,
@@ -407,7 +409,11 @@ pub fn run<'a>(
     resolver: Resolver<'a>,
 ) -> Leave {
     let mut code = &trace.code;
-    let mut regs = [0u64; REGISTERS];
+    // Thirty-two slots though only twenty-four are named: a register field
+    // is five bits, so with the file this size every `regs[field]` is in
+    // bounds by construction and the compiler drops the check — two or three
+    // of them per op, on the loop that is most of the engine's time.
+    let mut regs = [0u64; 32];
     regs[..crate::state::REGISTER_COUNT].copy_from_slice(&tcb.registers);
     // The lazy-flags record, held in a local copy through the trace and
     // flushed to the control block only at a leave — so a `cmp`/`jcc` pair, an
@@ -528,7 +534,7 @@ pub fn run<'a>(
                 pc += 1;
                 tcb.rip = address;
                 flush!();
-                return Leave::Defer { resume: pc };
+                return Leave::Defer { entry: trace.entry, resume: pc };
             }
             Op::Br => {
                 // The guest `jmp` retires; then, on a back-edge, the budget is
@@ -947,7 +953,7 @@ pub fn run<'a>(
                 if divisor == 0 {
                     tcb.rip = trace.ip[pc - 1];
                     flush!();
-                    return Leave::Defer { resume: pc };
+                    return Leave::Defer { entry: trace.entry, resume: pc };
                 }
                 let bits = u64::from(width.bits());
                 let low = regs[0] & width.mask(); // RAX
@@ -973,7 +979,7 @@ pub fn run<'a>(
                 if overflows {
                     tcb.rip = trace.ip[pc - 1];
                     flush!();
-                    return Leave::Defer { resume: pc };
+                    return Leave::Defer { entry: trace.entry, resume: pc };
                 }
                 write!(0, width, width.truncate(quotient as u64)); // RAX = quotient
                 write!(2, width, width.truncate(remainder as u64)); // RDX = remainder

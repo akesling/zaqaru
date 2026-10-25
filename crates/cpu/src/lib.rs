@@ -126,6 +126,54 @@ impl Engine {
         Self::run_with(tcb, space, cache, budget, true)
     }
 
+    /// Interprets the one instruction at `rip`, a trace's defer: as many
+    /// times as it stays put (a repeated string instruction with iterations
+    /// left) while there is budget. Answers whether it fell through to the
+    /// next instruction — the one place the trace can be re-entered — or
+    /// went elsewhere, or how the run ended there.
+    fn interpret_one(tcb: &mut Tcb, space: &mut Space, cache: &mut BlockCache, budget: &mut u64) -> Result<bool, Outcome> {
+        loop {
+            cache.drain_invalidations(space);
+            let index = match cache.entry(tcb.rip, space) {
+                Ok(index) => index,
+                Err(FetchError::Fault(fault)) => return Err(Outcome::Trap(Trap::Fault(fault))),
+                Err(FetchError::Undefined { address }) => return Err(Outcome::Trap(Trap::Undefined { address })),
+            };
+            if *budget == 0 {
+                return Err(Outcome::Preempted);
+            }
+            *budget -= 1;
+            let block = cache.block(index);
+            let (instruction, quick) = (&block.instructions[0], &block.quick[0]);
+            let mut cpu = Cpu::new(tcb, space);
+            match cpu.run(quick, instruction) {
+                Ok(Step::Retired) => {}
+                Ok(Step::Syscall) => return Err(Outcome::Syscall),
+                Err(trap) => {
+                    // As the block loop leaves it: past a breakpoint, at a
+                    // fault, which did not retire.
+                    cpu.tcb.rip = match trap {
+                        Trap::Breakpoint { .. } => instruction.next_ip(),
+                        _ => {
+                            cpu.tcb.retired -= 1;
+                            instruction.ip()
+                        }
+                    };
+                    return Err(Outcome::Trap(trap));
+                }
+            }
+            // A store on cached code: back to the top, where the drain makes
+            // the next fetch see current bytes. No trace is re-entered.
+            if cpu.space.has_dirty_code() {
+                return Ok(false);
+            }
+            if cpu.tcb.rip == instruction.ip() {
+                continue;
+            }
+            return Ok(cpu.tcb.rip == instruction.next_ip());
+        }
+    }
+
     fn run_with(
         tcb: &mut Tcb,
         space: &mut Space,
@@ -161,40 +209,58 @@ impl Engine {
             // `rip`, a fault traps, a preemption stops. Anything it cannot run
             // it declined at transpile time, so the interpreter below still
             // owns correctness.
-            if !interpret_next
-                && let Some(trace) = &block.trace
-            {
-                let before = tcb.retired;
-                // The address cache is the block cache itself: an indirect
-                // transfer whose target is already transpiled stays inside the
-                // interpreter, so a `call`/`ret` and CPython's computed goto do
-                // not round-trip this loop.
-                let leave = crate::bytecode::run(
-                    trace,
-                    0,
-                    tcb,
-                    space,
-                    budget,
-                    crate::bytecode::Resolver::Cache(cache),
-                );
-                // What ran via the accelerator, so the run's statistics report
-                // the bytecode's coverage — which says how much of a real
-                // workload it covers and how much still defers.
-                let ran = tcb.retired.wrapping_sub(before);
-                tcb.accelerated = tcb.accelerated.wrapping_add(ran);
-                budget = budget.saturating_sub(ran);
-                match leave {
-                    crate::bytecode::Leave::Exit | crate::bytecode::Leave::Preempted => continue,
-                    crate::bytecode::Leave::Fault(fault) => {
-                        return Outcome::Trap(Trap::Fault(fault));
-                    }
-                    crate::bytecode::Leave::Defer { .. } => {
+            if !interpret_next && block.trace.is_some() {
+                // The trace to run and where in it: the block's own from its
+                // start, and after a defer the deferring one from just past
+                // the instruction it handed back.
+                let mut entry = (index, 0usize);
+                loop {
+                    let Some(trace) = &cache.block(entry.0).trace else { break };
+                    let before = tcb.retired;
+                    // The address cache is the block cache itself: an indirect
+                    // transfer whose target is already transpiled stays inside the
+                    // interpreter, so a `call`/`ret` and CPython's computed goto do
+                    // not round-trip this loop.
+                    let leave = crate::bytecode::run(
+                        trace,
+                        entry.1,
+                        tcb,
+                        space,
+                        budget,
+                        crate::bytecode::Resolver::Cache(cache),
+                    );
+                    // What ran via the accelerator, so the run's statistics report
+                    // the bytecode's coverage — which says how much of a real
+                    // workload it covers and how much still defers.
+                    let ran = tcb.retired.wrapping_sub(before);
+                    tcb.accelerated = tcb.accelerated.wrapping_add(ran);
+                    budget = budget.saturating_sub(ran);
+                    match leave {
+                        crate::bytecode::Leave::Exit | crate::bytecode::Leave::Preempted => break,
+                        crate::bytecode::Leave::Fault(fault) => {
+                            return Outcome::Trap(Trap::Fault(fault));
+                        }
                         // `rip` names the one instruction the trace could not
-                        // run; interpret the block there once, then resume.
-                        interpret_next = true;
-                        continue;
+                        // run. Interpret it — just it, not the rest of its block,
+                        // which the trace covers — and go back into the trace
+                        // after it.
+                        crate::bytecode::Leave::Defer { entry: from, resume } => {
+                            match Self::interpret_one(tcb, space, cache, &mut budget) {
+                                Ok(true) => {}
+                                Ok(false) => break,
+                                Err(outcome) => return outcome,
+                            }
+                            // The trace that deferred, found again by its entry:
+                            // it is still cached, since nothing it decoded from
+                            // was written (`interpret_one` says no if it was).
+                            match cache.entry(from, space) {
+                                Ok(again) if cache.block(again).trace.is_some() => entry = (again, resume),
+                                _ => break,
+                            }
+                        }
                     }
                 }
+                continue;
             }
             interpret_next = exact;
             let mut cpu = Cpu::new(tcb, space);
