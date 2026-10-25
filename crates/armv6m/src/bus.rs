@@ -85,6 +85,9 @@ pub struct Bus {
     pub rams: Vec<Ram>,
     pub scs: Scs,
     pub soc: Soc,
+    /// The cycle it is, for the peripherals whose state is a function of
+    /// time; the machine sets it before an access reaches them.
+    pub now: u64,
 }
 
 enum Target {
@@ -122,6 +125,7 @@ impl Bus {
                     rams: vec![Ram { base: SRAM_BASE, bytes: vec![0; part.sram] }],
                     scs: Scs::default(),
                     soc: Soc::G0(Box::new(soc)),
+                    now: 0,
                 }
             }
             Family::H7 => {
@@ -145,6 +149,7 @@ impl Bus {
                     ],
                     scs: Scs::default(),
                     soc: Soc::H7(Box::default()),
+                    now: 0,
                 }
             }
         })
@@ -197,7 +202,7 @@ impl Bus {
         match self.decode(addr).ok_or(Unmapped)? {
             Target::Memory { region, offset } => Ok(little_endian(self.memory(region), offset, size)),
             Target::Scs => Ok(subword(self.scs.read(addr & !3).ok_or(Unmapped)?, addr, size)),
-            Target::Soc => Ok(subword(self.soc.read(addr & !3).ok_or(Unmapped)?, addr, size)),
+            Target::Soc => Ok(subword(self.soc.read(addr & !3, size, self.now).ok_or(Unmapped)?, addr, size)),
         }
     }
 
@@ -218,7 +223,7 @@ impl Bus {
         match self.decode(addr).ok_or(Unmapped)? {
             Target::Memory { region, offset } => Ok(little_endian(self.memory(region), offset, size)),
             Target::Scs => Ok(subword(self.scs.peek(addr & !3).ok_or(Unmapped)?, addr, size)),
-            Target::Soc => Ok(subword(self.soc.peek(addr & !3), addr, size)),
+            Target::Soc => Ok(subword(self.soc.peek(addr & !3, self.now), addr, size)),
         }
     }
 
@@ -254,8 +259,8 @@ impl Bus {
                 self.scs.write(addr & !3, word).ok_or(Unmapped)
             }
             Target::Soc => {
-                let word = if size != 4 { self.soc.peek(addr & !3) & !mask | placed } else { placed };
-                self.soc.write(addr & !3, word, &mut self.flash).ok_or(Unmapped)
+                let word = if size != 4 { self.soc.peek(addr & !3, self.now) & !mask | placed } else { placed };
+                self.soc.write(addr & !3, word, size, self.now, &mut self.flash).ok_or(Unmapped)
             }
         }
     }
@@ -277,24 +282,40 @@ impl Soc {
         }
     }
 
-    pub fn read(&mut self, addr: u32) -> Option<u32> {
+    /// A read of `size` bytes at the word `addr`, at cycle `now`.
+    pub fn read(&mut self, addr: u32, size: u32, now: u64) -> Option<u32> {
         match self {
             Soc::G0(soc) => soc.read(addr),
-            Soc::H7(soc) => soc.read(addr),
+            Soc::H7(soc) => soc.read(addr, size, now),
         }
     }
 
-    pub fn peek(&self, addr: u32) -> u32 {
+    pub fn peek(&self, addr: u32, now: u64) -> u32 {
         match self {
             Soc::G0(soc) => soc.peek(addr),
-            Soc::H7(soc) => soc.peek(addr),
+            Soc::H7(soc) => soc.peek(addr, now),
         }
     }
 
-    pub fn write(&mut self, addr: u32, value: u32, flash: &mut [u8]) -> Option<()> {
+    pub fn write(&mut self, addr: u32, value: u32, size: u32, now: u64, flash: &mut [u8]) -> Option<()> {
         match self {
             Soc::G0(soc) => soc.write(addr, value, flash),
-            Soc::H7(soc) => soc.write(addr, value, flash),
+            Soc::H7(soc) => soc.write(addr, value, size, now, flash),
+        }
+    }
+
+    /// The cycle the next timed event in the peripherals is due at.
+    pub fn due(&self) -> Option<u64> {
+        match self {
+            Soc::G0(_) => None,
+            Soc::H7(soc) => soc.due(),
+        }
+    }
+
+    /// Brings the peripherals' timed state up to cycle `now`.
+    pub fn advance(&mut self, now: u64) {
+        if let Soc::H7(soc) = self {
+            soc.advance(now);
         }
     }
 

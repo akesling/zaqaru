@@ -7,9 +7,11 @@
 //! clock switched as soon as switched, the flash wait states read back. Then
 //! the peripherals a task drives: GPIO ports A to K (with the pins a board
 //! drives from outside, such as the Nucleo's user button on PC13), EXTI and
-//! SYSCFG's line routing for their interrupts, the USARTs, the RNG, DBGMCU,
-//! and the flash interface ([`crate::flash_h7`]). RCC's reset bits reset
-//! the GPIO ports.
+//! SYSCFG's line routing for their interrupts, the USARTs, I2C1 to 4
+//! ([`crate::i2c`]), SPI1 to 6 ([`crate::spi_h7`]), the general-purpose
+//! timers as time bases ([`crate::timer`]), the RNG, DBGMCU, and the flash
+//! interface ([`crate::flash_h7`]). RCC's reset bits reset the peripherals
+//! they name.
 //!
 //! Everything else in the peripheral windows is a plain register file
 //! that remembers what was written, and remembers that it was touched, as
@@ -19,6 +21,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::flash_h7;
 use crate::gpio::{Edge, Gpio};
+use crate::i2c::I2c;
+use crate::spi_h7::Spi;
+use crate::timer::Timer;
 use crate::usart::{self, Usart};
 
 const RCC: u32 = 0x5802_4400;
@@ -45,6 +50,30 @@ pub const USARTS: [(u32, u32); 8] = [
     (0x4000_7800, 82),
     (0x4000_7C00, 83),
 ];
+
+/// I2C1 to 4: their bases, and their event and error interrupts.
+pub const I2CS: [(u32, u32, u32); 4] =
+    [(0x4000_5400, 31, 32), (0x4000_5800, 33, 34), (0x4000_5C00, 72, 73), (0x5800_1C00, 95, 96)];
+/// SPI1 to 6: their bases and interrupts.
+pub const SPIS: [(u32, u32); 6] =
+    [(0x4001_3000, 35), (0x4000_3800, 36), (0x4000_3C00, 51), (0x4001_3400, 84), (0x4001_5000, 85), (0x5800_1400, 86)];
+/// The general-purpose and basic timers: base, interrupt, and whether the
+/// counter is 32 bits.
+const TIMERS: [(u32, u32, bool); 9] = [
+    (0x4000_0000, 28, true),
+    (0x4000_0400, 29, false),
+    (0x4000_0800, 30, false),
+    (0x4000_0C00, 50, true),
+    (0x4000_1000, 54, false),
+    (0x4000_1400, 55, false),
+    (0x4001_4000, 116, false),
+    (0x4001_4400, 117, false),
+    (0x4001_4800, 118, false),
+];
+/// Core cycles per tick of the timers' kernel clock: Hubris runs APB1 and
+/// APB2 at a quarter of the core, and their timers at twice that.
+const TIMER_DIVIDER: u64 = 2;
+const PERIPHERAL: u32 = 0x400;
 
 const FLASH_IRQ: u32 = 4;
 /// EXTI lines 0 to 15 and the interrupts they raise: lines 0 to 4 one
@@ -95,6 +124,9 @@ pub struct Stm32h7 {
     pub usarts: [Usart; 8],
     /// Bytes the USARTs transmitted since the machine last drained them.
     pub serial: Vec<usart::Byte>,
+    pub i2cs: [I2c; 4],
+    pub spis: [Spi; 6],
+    timers: Vec<Timer>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -122,6 +154,9 @@ impl Default for Stm32h7 {
             edges: Vec::new(),
             usarts: Default::default(),
             serial: Vec::new(),
+            i2cs: Default::default(),
+            spis: Default::default(),
+            timers: TIMERS.iter().map(|&(_, _, wide)| Timer::new(wide, TIMER_DIVIDER)).collect(),
         };
         soc.rcc[0xD0 / 4] = RSR_POR | RSR_PIN | RSR_BOR | RSR_D2 | RSR_D1 | RSR_CPU;
         soc.rng.state = 0x2545_F491;
@@ -168,6 +203,45 @@ impl Stm32h7 {
         for usart in &mut self.usarts {
             usart.reset();
         }
+        for i2c in &mut self.i2cs {
+            i2c.reset();
+        }
+        for spi in &mut self.spis {
+            spi.reset();
+        }
+        for timer in &mut self.timers {
+            timer.reset();
+        }
+    }
+
+    /// Which of a kind of peripheral an address is in, and the offset into
+    /// it, from their bases.
+    fn instance(bases: impl Iterator<Item = u32>, addr: u32) -> Option<(usize, u32)> {
+        bases.enumerate().find(|&(_, base)| (base..base + PERIPHERAL).contains(&addr)).map(|(n, base)| (n, addr - base))
+    }
+
+    fn i2c(addr: u32) -> Option<(usize, u32)> {
+        Self::instance(I2CS.iter().map(|i| i.0), addr)
+    }
+
+    fn spi(addr: u32) -> Option<(usize, u32)> {
+        Self::instance(SPIS.iter().map(|s| s.0), addr)
+    }
+
+    fn timer(addr: u32) -> Option<(usize, u32)> {
+        Self::instance(TIMERS.iter().map(|t| t.0), addr)
+    }
+
+    /// The cycle the next timed event is due at: a timer's update.
+    pub fn due(&self) -> Option<u64> {
+        self.timers.iter().filter_map(Timer::due).min()
+    }
+
+    /// Brings the timers up to cycle `now`.
+    pub fn advance(&mut self, now: u64) {
+        for timer in &mut self.timers {
+            timer.advance(now);
+        }
     }
 
     /// Whether `addr` is in the H7's peripheral windows: APB1 and 2, AHB1
@@ -213,6 +287,9 @@ impl Stm32h7 {
             || (DBGMCU_DEBUG..DBGMCU_DEBUG + 0x80).contains(&addr)
             || flash_h7::Interface::contains(addr)
             || Self::usart(addr).is_some()
+            || Self::i2c(addr).is_some()
+            || Self::spi(addr).is_some()
+            || Self::timer(addr).is_some()
     }
 
     /// The interrupt lines the peripherals assert, as a mask by IRQ number.
@@ -232,6 +309,25 @@ impl Stm32h7 {
         }
         if self.flash_interface.interrupt() {
             raise(FLASH_IRQ);
+        }
+        for (n, i2c) in self.i2cs.iter().enumerate() {
+            let (event, error) = i2c.interrupts();
+            if event {
+                raise(I2CS[n].1);
+            }
+            if error {
+                raise(I2CS[n].2);
+            }
+        }
+        for (n, spi) in self.spis.iter().enumerate() {
+            if spi.interrupt() {
+                raise(SPIS[n].1);
+            }
+        }
+        for (n, timer) in self.timers.iter().enumerate() {
+            if timer.interrupt() {
+                raise(TIMERS[n].1);
+            }
         }
         lines
     }
@@ -270,7 +366,8 @@ impl Stm32h7 {
         }
     }
 
-    pub fn read(&mut self, addr: u32) -> Option<u32> {
+    /// A read of `size` bytes at the word `addr`, at cycle `now`.
+    pub fn read(&mut self, addr: u32, size: u32, now: u64) -> Option<u32> {
         if !Self::contains(addr) {
             return None;
         }
@@ -280,13 +377,34 @@ impl Stm32h7 {
         if let Some((n, offset)) = Self::usart(addr) {
             return Some(self.usarts[n].read(offset, true));
         }
+        if let Some((n, offset)) = Self::i2c(addr) {
+            return Some(self.i2cs[n].read(offset, true));
+        }
+        if let Some((n, offset)) = Self::spi(addr) {
+            return Some(self.spis[n].read(offset, true, size));
+        }
+        if let Some((n, offset)) = Self::timer(addr) {
+            self.timers[n].advance(now);
+            return Some(self.timers[n].read(offset, now));
+        }
         if addr == RNG + 0x08 {
             return Some(self.rng.next());
         }
-        Some(self.peek(addr))
+        Some(self.peek(addr, now))
     }
 
-    pub fn peek(&self, addr: u32) -> u32 {
+    pub fn peek(&self, addr: u32, now: u64) -> u32 {
+        if let Some((n, offset)) = Self::i2c(addr) {
+            return self.i2cs[n].clone().read(offset, false);
+        }
+        if let Some((n, offset)) = Self::spi(addr) {
+            return self.spis[n].clone().read(offset, false, 4);
+        }
+        if let Some((n, offset)) = Self::timer(addr) {
+            let mut timer = self.timers[n].clone();
+            timer.advance(now);
+            return timer.read(offset, now);
+        }
         if (RCC..RCC + 0x400).contains(&addr) {
             return self.rcc_read(addr - RCC);
         }
@@ -337,13 +455,19 @@ impl Stm32h7 {
         [DBGMCU, DBGMCU_DEBUG].iter().find(|&&base| (base..base + 0x80).contains(&addr)).map(|base| addr - base)
     }
 
-    /// A register write; `flash` is main flash, which the flash interface
-    /// erases.
-    pub fn write(&mut self, addr: u32, value: u32, flash: &mut [u8]) -> Option<()> {
+    /// A register write of `size` bytes at the word `addr`, at cycle
+    /// `now`; `flash` is main flash, which the flash interface erases.
+    pub fn write(&mut self, addr: u32, value: u32, size: u32, now: u64, flash: &mut [u8]) -> Option<()> {
         if !Self::contains(addr) {
             return None;
         }
-        if (RCC..RCC + 0x400).contains(&addr) {
+        if let Some((n, offset)) = Self::i2c(addr) {
+            self.i2cs[n].write(offset, value);
+        } else if let Some((n, offset)) = Self::spi(addr) {
+            self.spis[n].write(offset, value, size);
+        } else if let Some((n, offset)) = Self::timer(addr) {
+            self.timers[n].write(offset, value, now);
+        } else if (RCC..RCC + 0x400).contains(&addr) {
             self.rcc_write(addr - RCC, value);
         } else if (PWR..PWR + 0x80).contains(&addr) {
             self.pwr[((addr - PWR) / 4) as usize] = value;
@@ -429,16 +553,70 @@ impl Stm32h7 {
                     self.rcc[at] = 0;
                 }
             }
-            // AHB4RSTR: a GPIO port held in reset is at its reset values.
+            // A peripheral held in reset is at its reset values: the GPIO
+            // ports in AHB4RSTR, the I2Cs, SPIs, timers and USARTs in the
+            // APB registers.
             0x88 => {
                 self.rcc[at] = value;
                 for port in (0..PORTS).filter(|port| value >> port & 1 != 0) {
                     self.gpio[port].reset_to(&port_reset(port));
                 }
             }
+            0x8C..=0x9C => {
+                self.rcc[at] = value;
+                for peripheral in (0..32).filter(|bit| value >> bit & 1 != 0).filter_map(|bit| apb_reset(offset, bit)) {
+                    match peripheral {
+                        Reset::I2c(n) => self.i2cs[n].reset(),
+                        Reset::Spi(n) => self.spis[n].reset(),
+                        Reset::Timer(n) => self.timers[n].reset(),
+                        Reset::Usart(n) => self.usarts[n].reset(),
+                    }
+                }
+            }
             _ => self.rcc[at] = value,
         }
     }
+}
+
+/// A peripheral an APB reset bit names.
+enum Reset {
+    I2c(usize),
+    Spi(usize),
+    Timer(usize),
+    Usart(usize),
+}
+
+/// What bit `bit` of the APB reset register at `offset` resets (RM0433
+/// 8.7.31–35), of the peripherals modelled.
+fn apb_reset(offset: u32, bit: u32) -> Option<Reset> {
+    Some(match (offset, bit) {
+        // APB1LRSTR.
+        (0x90, 0..=5) => Reset::Timer(bit as usize),
+        (0x90, 14) => Reset::Spi(1),
+        (0x90, 15) => Reset::Spi(2),
+        (0x90, 17) => Reset::Usart(1),
+        (0x90, 18) => Reset::Usart(2),
+        (0x90, 19) => Reset::Usart(3),
+        (0x90, 20) => Reset::Usart(4),
+        (0x90, 21) => Reset::I2c(0),
+        (0x90, 22) => Reset::I2c(1),
+        (0x90, 23) => Reset::I2c(2),
+        (0x90, 30) => Reset::Usart(6),
+        (0x90, 31) => Reset::Usart(7),
+        // APB2RSTR.
+        (0x98, 4) => Reset::Usart(0),
+        (0x98, 5) => Reset::Usart(5),
+        (0x98, 12) => Reset::Spi(0),
+        (0x98, 13) => Reset::Spi(3),
+        (0x98, 16) => Reset::Timer(6),
+        (0x98, 17) => Reset::Timer(7),
+        (0x98, 18) => Reset::Timer(8),
+        (0x98, 20) => Reset::Spi(4),
+        // APB4RSTR.
+        (0x9C, 5) => Reset::Spi(5),
+        (0x9C, 7) => Reset::I2c(3),
+        _ => return None,
+    })
 }
 
 impl Rng {
@@ -456,10 +634,36 @@ impl Rng {
 mod tests {
     use super::*;
 
+    /// Word accesses at cycle zero.
+    struct Harness<'a>(&'a mut Stm32h7);
+
+    impl Harness<'_> {
+        fn read(&mut self, addr: u32) -> Option<u32> {
+            self.0.read(addr, 4, 0)
+        }
+
+        fn write(&mut self, addr: u32, value: u32, flash: &mut [u8]) -> Option<()> {
+            self.0.write(addr, value, 4, 0, flash)
+        }
+
+        fn reset(&mut self, flash: &mut [u8]) {
+            self.0.reset(flash)
+        }
+
+        fn drive(&mut self, port: usize, pin: u8, level: Option<bool>) {
+            self.0.drive(port, pin, level)
+        }
+
+        fn interrupts(&self) -> [u32; 8] {
+            self.0.interrupts()
+        }
+    }
+
     #[test]
     fn startup_finds_what_it_waits_for() {
         let mut soc = Stm32h7::default();
         let mut flash = vec![0xFF; 2 * flash_h7::BANK];
+        let mut soc = Harness(&mut soc);
         assert_ne!(soc.read(PWR + 0x04).unwrap() & 1 << 13, 0, "ACTVOSRDY");
         soc.write(PWR + 0x18, 0b11 << 14, &mut flash);
         assert_ne!(soc.read(PWR + 0x18).unwrap() & 1 << 13, 0, "VOSRDY");
@@ -479,6 +683,7 @@ mod tests {
     fn a_button_on_pc13_raises_exti15_10() {
         let mut soc = Stm32h7::default();
         let mut flash = vec![];
+        let mut soc = Harness(&mut soc);
         // PC13 an input with a pull-down; EXTI13 from port C, rising.
         soc.write(GPIO + 2 * 0x400, 0xF3FF_FFFF, &mut flash);
         soc.write(GPIO + 2 * 0x400 + 0x0C, 0b10 << 26, &mut flash);

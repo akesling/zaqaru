@@ -40,12 +40,15 @@ pub mod flash_h7;
 pub mod fpu;
 pub mod gdb;
 pub mod gpio;
+pub mod i2c;
 pub mod part;
 pub mod scs;
+pub mod spi_h7;
 pub mod state;
 pub mod stm32g0;
 pub mod stm32h7;
 pub mod thumb2;
+pub mod timer;
 pub mod usart;
 
 use std::collections::BTreeSet;
@@ -391,7 +394,8 @@ impl Machine {
         self.run(1)
     }
 
-    /// Brings SysTick up to the present, and works out when it next fires.
+    /// Brings SysTick and the peripherals' timers up to the present, and
+    /// works out when the next of them fires.
     pub(crate) fn sync_systick(&mut self) {
         let elapsed = self.cycles - self.ticked_at;
         if elapsed > 0 {
@@ -399,6 +403,13 @@ impl Machine {
         }
         self.ticked_at = self.cycles;
         self.tick_due = self.bus.scs.systick.cycles_to_fire().map_or(u64::MAX, |n| self.cycles + n);
+        if let Some(due) = self.bus.soc.due() {
+            if due <= self.cycles {
+                self.bus.soc.advance(self.cycles);
+                self.sample_interrupts();
+            }
+            self.tick_due = self.tick_due.min(self.bus.soc.due().unwrap_or(u64::MAX));
+        }
     }
 
     /// Whether an access at `addr` reaches SysTick, and so must find it
@@ -410,6 +421,7 @@ impl Machine {
     /// Reads memory as a debugger does: no permission check, no side
     /// effects. `None` if any of it is unmapped.
     pub fn debug_read(&mut self, addr: u32, len: usize) -> Option<Vec<u8>> {
+        self.bus.now = self.cycles;
         if Self::touches_systick(addr, len as u32) {
             self.sync_systick();
         }
@@ -429,6 +441,7 @@ impl Machine {
     /// the whole word at once — and bytes elsewhere. False if any of it
     /// was refused.
     pub fn debug_write(&mut self, addr: u32, bytes: &[u8]) -> bool {
+        self.bus.now = self.cycles;
         let mut at = 0;
         while at < bytes.len() {
             let a = addr.wrapping_add(at as u32);
@@ -445,7 +458,7 @@ impl Machine {
             }
         }
         self.drain_edges();
-        if Self::touches_systick(addr, bytes.len() as u32) {
+        if Self::touches_systick(addr, bytes.len() as u32) || (0x4000_0000..0xE000_0000).contains(&addr) {
             self.sync_systick();
         }
         true

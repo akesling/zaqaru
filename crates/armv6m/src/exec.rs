@@ -139,6 +139,7 @@ impl Machine {
         if Self::touches_systick(addr, size) {
             self.sync_systick();
         }
+        self.bus.now = self.cycles;
         self.bus.read(addr, size).map_err(|_| Fault::Bus { addr })
     }
 
@@ -151,9 +152,11 @@ impl Machine {
         if systick {
             self.sync_systick();
         }
+        self.bus.now = self.cycles;
         self.bus.write(addr, size, value).map_err(|_| Fault::Bus { addr })?;
-        if systick {
-            // The write may have started, stopped or reloaded it.
+        // The write may have started, stopped or reloaded SysTick or a
+        // peripheral's timer.
+        if systick || addr >= 0x4000_0000 && addr < 0xE000_0000 {
             self.sync_systick();
         }
         if self.bus.soc.has_outputs() {
