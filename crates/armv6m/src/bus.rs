@@ -260,8 +260,95 @@ impl Bus {
             }
             Target::Soc => {
                 let word = if size != 4 { self.soc.peek(addr & !3, self.now) & !mask | placed } else { placed };
-                self.soc.write(addr & !3, word, size, self.now, &mut self.flash).ok_or(Unmapped)
+                self.soc.write(addr & !3, word, size, self.now, &mut self.flash).ok_or(Unmapped)?;
+                self.run_dma();
+                Ok(())
             }
+        }
+    }
+
+    /// `len` bytes of RAM at `addr`, if they are all in one RAM: what a DMA
+    /// reaches.
+    fn dma_slice(rams: &mut [Ram], addr: u32, len: usize) -> Option<&mut [u8]> {
+        let ram = rams.iter_mut().find(|ram| addr >= ram.base && (addr - ram.base) as usize + len <= ram.bytes.len())?;
+        let at = (addr - ram.base) as usize;
+        Some(&mut ram.bytes[at..at + len])
+    }
+
+    fn dma_words(rams: &mut [Ram], addr: u32) -> Option<[u32; 4]> {
+        let bytes = Self::dma_slice(rams, addr, 16)?;
+        Some(std::array::from_fn(|i| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())))
+    }
+
+    /// The Ethernet DMA's work, as far as it can go: frames out of the
+    /// transmit ring onto the wire, and frames from the wire into the
+    /// receive ring. Run whenever software may have given it some — any
+    /// store to a peripheral — and when a frame arrives.
+    pub fn run_dma(&mut self) {
+        use crate::eth_h7::{BUF1V, FD, LD, OWN};
+        let Soc::H7(soc) = &mut self.soc else { return };
+        let (rams, eth) = (&mut self.rams, &mut soc.eth);
+        if eth.tx_kicked && eth.tx_running() {
+            eth.tx_kicked = false;
+            let mut frame = Vec::new();
+            // At most the ring, once round.
+            for _ in 0..1024 {
+                let at = eth.tx_current;
+                let Some([buf1, buf2, tdes2, tdes3]) = Self::dma_words(rams, at) else { break };
+                if tdes3 & OWN == 0 {
+                    eth.tx_unavailable();
+                    break;
+                }
+                // A context descriptor (CTXT, bit 30) carries a VLAN tag for
+                // the next; this model does not tag.
+                if tdes3 & 1 << 30 == 0 {
+                    if tdes3 & FD != 0 {
+                        frame.clear();
+                    }
+                    for (buffer, len) in [(buf1, tdes2 & 0x3FFF), (buf2, tdes2 >> 16 & 0x3FFF)] {
+                        if let Some(bytes) = Self::dma_slice(rams, buffer, len as usize) {
+                            frame.extend_from_slice(bytes);
+                        }
+                    }
+                }
+                let written = (tdes3 & !OWN).to_le_bytes();
+                if let Some(slot) = Self::dma_slice(rams, at + 12, 4) {
+                    slot.copy_from_slice(&written);
+                }
+                eth.tx_advance();
+                if tdes3 & 1 << 30 == 0 && tdes3 & LD != 0 {
+                    eth.transmitted(std::mem::take(&mut frame), tdes2);
+                }
+            }
+        }
+        while eth.rx_running() && !eth.incoming.is_empty() {
+            let at = eth.rx_current;
+            let Some([buffer, _, _, rdes3]) = Self::dma_words(rams, at) else { break };
+            if rdes3 & OWN == 0 || rdes3 & BUF1V == 0 {
+                eth.rx_unavailable();
+                eth.incoming.pop_front();
+                break;
+            }
+            let mut frame = eth.incoming.pop_front().unwrap();
+            frame.extend_from_slice(&crate::eth_h7::fcs(&frame).to_le_bytes());
+            // A frame longer than a buffer would go on into the next
+            // descriptor; Hubris's buffers hold the longest there is.
+            let len = frame.len().min(eth.rx_buffer_size());
+            if let Some(bytes) = Self::dma_slice(rams, buffer, len) {
+                bytes.copy_from_slice(&frame[..len]);
+            }
+            // Written back: FD and LD, the length with its FCS, and RDES1's
+            // IPv6-header-present bit set for what is IPv6.
+            let ipv6 = frame.get(12..14) == Some(&[0x86, 0xDD]);
+            let rdes1: u32 = if ipv6 { 1 << 5 } else { 0 };
+            let words = [0, rdes1, 0, FD | LD | 1 << 25 | len as u32 & 0x7FFF];
+            if let Some(slot) = Self::dma_slice(rams, at, 16) {
+                for (i, word) in words.iter().enumerate() {
+                    slot[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            eth.rx_advance();
+            eth.received(rdes3);
         }
     }
 
@@ -365,7 +452,15 @@ impl Soc {
     pub fn has_outputs(&self) -> bool {
         match self {
             Soc::G0(soc) => !soc.edges.is_empty() || !soc.serial.is_empty(),
-            Soc::H7(soc) => !soc.edges.is_empty() || !soc.serial.is_empty(),
+            Soc::H7(soc) => !soc.edges.is_empty() || !soc.serial.is_empty() || !soc.eth.outgoing.is_empty(),
+        }
+    }
+
+    /// The frames the Ethernet controller put on the wire, if there is one.
+    pub fn frames(&mut self) -> Option<&mut Vec<Vec<u8>>> {
+        match self {
+            Soc::G0(_) => None,
+            Soc::H7(soc) => Some(&mut soc.eth.outgoing),
         }
     }
 

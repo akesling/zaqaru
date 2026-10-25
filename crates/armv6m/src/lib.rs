@@ -34,6 +34,7 @@ pub mod cmsis_dap;
 pub mod dap;
 pub mod debug;
 pub mod exception;
+pub mod eth_h7;
 pub mod exec;
 pub mod flash;
 pub mod flash_h7;
@@ -41,6 +42,7 @@ pub mod fpu;
 pub mod gdb;
 pub mod gpio;
 pub mod i2c;
+pub mod net;
 pub mod part;
 pub mod scs;
 pub mod spi_h7;
@@ -137,6 +139,9 @@ pub enum Event {
     Pin { cycle: u64, edge: gpio::Edge },
     /// A USART transmitted a byte.
     Serial { cycle: u64, byte: usart::Byte },
+    /// The Ethernet controller put a frame on the wire: destination MAC
+    /// first, no FCS.
+    Frame { cycle: u64, frame: Vec<u8> },
     /// A HardFault was taken. `pc` is the instruction it was taken at;
     /// `mode` and `privileged` say what was running.
     Fault { cycle: u64, pc: u32, fault: Fault, mode: Mode, privileged: bool },
@@ -547,6 +552,9 @@ impl Machine {
         let (edges, serial) = self.bus.soc.outputs();
         self.events.extend(edges.drain(..).map(|edge| Event::Pin { cycle, edge }));
         self.events.extend(serial.drain(..).map(|byte| Event::Serial { cycle, byte }));
+        if let Some(frames) = self.bus.soc.frames() {
+            self.events.extend(frames.drain(..).map(|frame| Event::Frame { cycle, frame }));
+        }
     }
 
     /// Pends every external interrupt whose line a peripheral asserts. A
@@ -560,6 +568,17 @@ impl Machine {
                 self.bus.scs.nvic.pending.set_irq_word(32 * word as u32, lines, true);
             }
         }
+    }
+
+    /// A frame arriving on the Ethernet cable, destination MAC first and no
+    /// FCS: into the receive ring, if the DMA is running and has a
+    /// descriptor for it. False if the part has no Ethernet.
+    pub fn deliver(&mut self, frame: Vec<u8>) -> bool {
+        let crate::bus::Soc::H7(soc) = &mut self.bus.soc else { return false };
+        soc.eth.incoming.push_back(frame);
+        self.bus.run_dma();
+        self.sample_interrupts();
+        true
     }
 
     /// Something outside the chip drives a pin to a level — a button

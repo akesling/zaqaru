@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::eth_h7::{self, Ethernet};
 use crate::flash_h7;
 use crate::gpio::{Edge, Gpio};
 use crate::i2c::I2c;
@@ -127,6 +128,7 @@ pub struct Stm32h7 {
     pub i2cs: [I2c; 4],
     pub spis: [Spi; 6],
     timers: Vec<Timer>,
+    pub eth: Ethernet,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -157,6 +159,7 @@ impl Default for Stm32h7 {
             i2cs: Default::default(),
             spis: Default::default(),
             timers: TIMERS.iter().map(|&(_, _, wide)| Timer::new(wide, TIMER_DIVIDER)).collect(),
+            eth: Ethernet::default(),
         };
         soc.rcc[0xD0 / 4] = RSR_POR | RSR_PIN | RSR_BOR | RSR_D2 | RSR_D1 | RSR_CPU;
         soc.rng.state = 0x2545_F491;
@@ -212,6 +215,7 @@ impl Stm32h7 {
         for timer in &mut self.timers {
             timer.reset();
         }
+        self.eth.reset();
     }
 
     /// Which of a kind of peripheral an address is in, and the offset into
@@ -290,6 +294,7 @@ impl Stm32h7 {
             || Self::i2c(addr).is_some()
             || Self::spi(addr).is_some()
             || Self::timer(addr).is_some()
+            || Ethernet::contains(addr)
     }
 
     /// The interrupt lines the peripherals assert, as a mask by IRQ number.
@@ -328,6 +333,9 @@ impl Stm32h7 {
             if timer.interrupt() {
                 raise(TIMERS[n].1);
             }
+        }
+        if self.eth.interrupt() {
+            raise(eth_h7::IRQ);
         }
         lines
     }
@@ -394,6 +402,9 @@ impl Stm32h7 {
     }
 
     pub fn peek(&self, addr: u32, now: u64) -> u32 {
+        if Ethernet::contains(addr) {
+            return self.eth.read(addr);
+        }
         if let Some((n, offset)) = Self::i2c(addr) {
             return self.i2cs[n].clone().read(offset, false);
         }
@@ -461,7 +472,9 @@ impl Stm32h7 {
         if !Self::contains(addr) {
             return None;
         }
-        if let Some((n, offset)) = Self::i2c(addr) {
+        if Ethernet::contains(addr) {
+            self.eth.write(addr, value);
+        } else if let Some((n, offset)) = Self::i2c(addr) {
             self.i2cs[n].write(offset, value);
         } else if let Some((n, offset)) = Self::spi(addr) {
             self.spis[n].write(offset, value, size);
@@ -553,9 +566,15 @@ impl Stm32h7 {
                     self.rcc[at] = 0;
                 }
             }
-            // A peripheral held in reset is at its reset values: the GPIO
-            // ports in AHB4RSTR, the I2Cs, SPIs, timers and USARTs in the
-            // APB registers.
+            // A peripheral held in reset is at its reset values: Ethernet in
+            // AHB1RSTR, the GPIO ports in AHB4RSTR, the I2Cs, SPIs, timers
+            // and USARTs in the APB registers.
+            0x80 => {
+                self.rcc[at] = value;
+                if value & 1 << 15 != 0 {
+                    self.eth.reset();
+                }
+            }
             0x88 => {
                 self.rcc[at] = value;
                 for port in (0..PORTS).filter(|port| value >> port & 1 != 0) {
