@@ -14,7 +14,6 @@
 //! write protection, PCROP and fast programming are registers that read
 //! back and do nothing.
 
-use crate::bus::FLASH_SIZE;
 
 pub const BASE: u32 = 0x4002_2000;
 pub const END: u32 = BASE + 0x400;
@@ -198,7 +197,7 @@ impl Interface {
     /// programs both — if both are erased, or the double word written is
     /// all zeros, which the part allows over anything.
     pub fn program(&mut self, flash: &mut [u8], offset: usize, size: u32, value: u32) {
-        let offset = offset % FLASH_SIZE;
+        let offset = offset % flash.len();
         if self.cr & PG == 0 || self.cr & LOCK != 0 {
             self.sr |= PGSERR;
             return;
@@ -237,7 +236,7 @@ mod tests {
 
     fn unlocked() -> (Interface, Vec<u8>) {
         let mut flash_if = Interface::default();
-        let mut flash = vec![0xFF; FLASH_SIZE];
+        let mut flash = vec![0xFF; crate::bus::FLASH_SIZE];
         flash_if.write(BASE + 0x08, KEY1, &mut flash);
         flash_if.write(BASE + 0x08, KEY2, &mut flash);
         assert_eq!(flash_if.read(BASE + 0x14) & LOCK, 0);
@@ -278,7 +277,7 @@ mod tests {
     #[test]
     fn a_wrong_key_locks_until_reset() {
         let mut f = Interface::default();
-        let mut flash = vec![0xFF; FLASH_SIZE];
+        let mut flash = vec![0xFF; crate::bus::FLASH_SIZE];
         f.write(BASE + 0x08, KEY2, &mut flash);
         f.write(BASE + 0x08, KEY1, &mut flash);
         f.write(BASE + 0x08, KEY2, &mut flash);

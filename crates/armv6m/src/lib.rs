@@ -36,10 +36,12 @@ pub mod debug;
 pub mod exception;
 pub mod exec;
 pub mod flash;
+pub mod part;
 pub mod gdb;
 pub mod scs;
 pub mod state;
 pub mod stm32g0;
+pub mod usart;
 
 use std::collections::BTreeSet;
 
@@ -116,12 +118,16 @@ pub enum Outcome {
 pub enum Event {
     /// A GPIO port's output changed.
     Pin { cycle: u64, edge: stm32g0::Edge },
+    /// A USART transmitted a byte.
+    Serial { cycle: u64, byte: usart::Byte },
     /// A HardFault was taken. `pc` is the instruction it was taken at;
     /// `mode` and `privileged` say what was running.
     Fault { cycle: u64, pc: u32, fault: Fault, mode: Mode, privileged: bool },
 }
 
 pub struct Machine {
+    /// Which G0 this is.
+    pub part: part::Part,
     pub cpu: Cpu,
     pub bus: Bus,
     /// Cycles elapsed since power-on: retired instructions, plus whatever
@@ -179,9 +185,15 @@ impl Grant {
 impl Machine {
     /// A G031 with `image` in flash, out of reset.
     pub fn stm32g031(image: &[u8]) -> Result<Machine, String> {
+        Machine::stm32g0(part::STM32G031, image)
+    }
+
+    /// A G0 of the given part with `image` in flash, out of reset.
+    pub fn stm32g0(part: part::Part, image: &[u8]) -> Result<Machine, String> {
         let mut machine = Machine {
+            part,
             cpu: Cpu::default(),
-            bus: Bus::new(image)?,
+            bus: Bus::new(part, image)?,
             cycles: 0,
             retired: 0,
             events: Vec::new(),
@@ -428,9 +440,31 @@ impl Machine {
         Ok(())
     }
 
-    /// Moves the GPIO edges a store produced into the event log.
+    /// Moves the GPIO edges and the serial bytes a store produced into the
+    /// event log.
     pub(crate) fn drain_edges(&mut self) {
         let cycle = self.cycles;
         self.events.extend(self.bus.soc.edges.drain(..).map(|edge| Event::Pin { cycle, edge }));
+        self.events.extend(self.bus.soc.serial.drain(..).map(|byte| Event::Serial { cycle, byte }));
+    }
+
+    /// Pends every external interrupt whose line a peripheral asserts. A
+    /// level, sampled wherever it can have changed — a store to a peripheral
+    /// or the NVIC, an exception return, a byte arriving — so an interrupt
+    /// still asserted when its handler returns, or when it is unmasked, is
+    /// pending again, as the NVIC makes a level-triggered line.
+    pub(crate) fn sample_interrupts(&mut self) {
+        let lines = self.bus.soc.interrupts();
+        if lines != 0 {
+            self.bus.scs.nvic.pending |= u64::from(lines) << scs::exception::IRQ0;
+        }
+    }
+
+    /// A byte arriving on USART `port`'s line (0 for USART1): taken if the
+    /// receiver is on, and its interrupt raised if enabled.
+    pub fn receive(&mut self, port: usize, byte: u8) -> bool {
+        let taken = self.bus.soc.receive(port, byte);
+        self.sample_interrupts();
+        taken
     }
 }

@@ -150,8 +150,13 @@ impl Machine {
             // The write may have started, stopped or reloaded it.
             self.sync_systick();
         }
-        if !self.bus.soc.edges.is_empty() {
+        if !self.bus.soc.edges.is_empty() || !self.bus.soc.serial.is_empty() {
             self.drain_edges();
+        }
+        // A store to a peripheral or to the NVIC can raise or unmask an
+        // interrupt line; nothing below the peripherals can.
+        if addr >= 0x4000_0000 {
+            self.sample_interrupts();
         }
         Ok(())
     }

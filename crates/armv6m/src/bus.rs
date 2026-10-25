@@ -4,7 +4,8 @@
 //! MPU's question, and the machine asks it before it gets this far; the
 //! bus answers only whether anything is there, and what it says.
 //!
-//! The G031's map, as much of it as the model has:
+//! The G0's map, as much of it as the model has — sized here for the
+//! G031; how much flash and RAM a board has is its [`Part`]'s:
 //!
 //! | range                       | what                                  |
 //! |-----------------------------|---------------------------------------|
@@ -17,10 +18,13 @@
 //! | `0xE000_0000..0xE010_0000`  | the PPB; see [`crate::scs`]           |
 
 use crate::flash;
+use crate::part::Part;
 use crate::scs::Scs;
 use crate::stm32g0::Stm32g0;
 
 pub const FLASH_BASE: u32 = 0x0800_0000;
+/// The G031's, which the tests are written against; a board's own are
+/// its [`Part`]'s.
 pub const FLASH_SIZE: usize = 64 * 1024;
 pub const SYSTEM_BASE: u32 = 0x1FFF_0000;
 pub const SYSTEM_SIZE: usize = 64 * 1024;
@@ -62,35 +66,38 @@ enum Region {
 }
 
 impl Bus {
-    pub fn new(image: &[u8]) -> Result<Bus, String> {
-        if image.len() > FLASH_SIZE {
-            return Err(format!("image is {} bytes; flash is {FLASH_SIZE}", image.len()));
+    pub fn new(part: Part, image: &[u8]) -> Result<Bus, String> {
+        if image.len() > part.flash {
+            return Err(format!("image is {} bytes; the {}'s flash is {}", image.len(), part.name, part.flash));
         }
-        let mut flash = vec![0xFF; FLASH_SIZE];
+        let mut flash = vec![0xFF; part.flash];
         flash[..image.len()].copy_from_slice(image);
         let mut system = vec![0xFF; SYSTEM_SIZE];
-        system[FLASHSIZE..FLASHSIZE + 2].copy_from_slice(&((FLASH_SIZE / 1024) as u16).to_le_bytes());
+        system[FLASHSIZE..FLASHSIZE + 2].copy_from_slice(&((part.flash / 1024) as u16).to_le_bytes());
+        let mut soc = Stm32g0::default();
+        soc.dev_id = part.dev_id;
         Ok(Bus {
             flash,
             system,
-            sram: vec![0; SRAM_SIZE],
+            sram: vec![0; part.sram],
             scs: Scs::default(),
             flash_interface: flash::Interface::default(),
-            soc: Stm32g0::default(),
+            soc,
         })
     }
 
-    fn decode(addr: u32) -> Option<Target> {
+    fn decode(&self, addr: u32) -> Option<Target> {
         let within = |base: u32, size: usize| {
             addr.checked_sub(base).filter(|&o| (o as usize) < size).map(|o| o as usize)
         };
-        if let Some(offset) = within(0, FLASH_SIZE).or_else(|| within(FLASH_BASE, FLASH_SIZE)) {
+        let flash = self.flash.len();
+        if let Some(offset) = within(0, flash).or_else(|| within(FLASH_BASE, flash)) {
             return Some(Target::Memory { region: Region::Flash, offset });
         }
         if let Some(offset) = within(SYSTEM_BASE, SYSTEM_SIZE) {
             return Some(Target::Memory { region: Region::System, offset });
         }
-        if let Some(offset) = within(SRAM_BASE, SRAM_SIZE) {
+        if let Some(offset) = within(SRAM_BASE, self.sram.len()) {
             return Some(Target::Memory { region: Region::Sram, offset });
         }
         if (0xE000_0000..0xE010_0000).contains(&addr) {
@@ -116,7 +123,7 @@ impl Bus {
     /// Reads `size` bytes (1, 2 or 4) at `addr`, which the caller has
     /// already checked is aligned.
     pub fn read(&mut self, addr: u32, size: u32) -> Result<u32, Unmapped> {
-        match Self::decode(addr).ok_or(Unmapped)? {
+        match self.decode(addr).ok_or(Unmapped)? {
             Target::Memory { region, offset } => Ok(little_endian(self.memory(region), offset, size)),
             Target::Scs => Ok(subword(self.scs.read(addr & !3).ok_or(Unmapped)?, addr, size)),
             Target::FlashInterface => Ok(subword(self.flash_interface.read(addr & !3), addr, size)),
@@ -128,7 +135,7 @@ impl Bus {
     /// in flash at its own address — taken before the general decode.
     pub fn fetch(&mut self, addr: u32) -> Option<u32> {
         let offset = addr.wrapping_sub(FLASH_BASE) as usize;
-        if offset < FLASH_SIZE - 1 {
+        if offset < self.flash.len() - 1 {
             return Some(u16::from_le_bytes([self.flash[offset], self.flash[offset + 1]]) as u32);
         }
         self.read(addr, 2).ok()
@@ -138,7 +145,7 @@ impl Bus {
     /// without the one side effect a read can have here (SysTick's
     /// COUNTFLAG), and without counting as software touching a peripheral.
     pub fn peek(&self, addr: u32, size: u32) -> Result<u32, Unmapped> {
-        match Self::decode(addr).ok_or(Unmapped)? {
+        match self.decode(addr).ok_or(Unmapped)? {
             Target::Memory { region, offset } => Ok(little_endian(self.memory(region), offset, size)),
             Target::Scs => Ok(subword(self.scs.peek(addr & !3).ok_or(Unmapped)?, addr, size)),
             Target::FlashInterface => Ok(subword(self.flash_interface.read(addr & !3), addr, size)),
@@ -150,7 +157,7 @@ impl Bus {
         let shift = 8 * (addr & 3);
         let mask = if size == 4 { u32::MAX } else { ((1 << (8 * size)) - 1) << shift };
         let placed = value << shift & mask;
-        match Self::decode(addr).ok_or(Unmapped)? {
+        match self.decode(addr).ok_or(Unmapped)? {
             // A store to main flash is programming it, which the flash
             // interface decides; it answers in its status register, not
             // with a bus error.

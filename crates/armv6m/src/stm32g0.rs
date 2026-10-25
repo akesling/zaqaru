@@ -1,24 +1,28 @@
-//! Just enough of an STM32G031 around the core for Hubris's G031 demo to
-//! boot unmodified.
+//! Enough of an STM32G0 around the core for Hubris's G0 demos to boot
+//! unmodified.
 //!
-//! That demo touches two peripherals: RCC, to clock and un-reset the GPIO
-//! ports, and GPIO, to drive the Nucleo's one user LED (PC6, active low).
-//! Those two are modelled as registers with their documented reset values
-//! and the few read-back behaviours software waits on — a clock's ready bit
-//! following its enable, BSRR setting and clearing ODR. Everything else in
+//! The G031 demo touches two peripherals: RCC, to clock and un-reset the
+//! GPIO ports, and GPIO, to drive the Nucleo's one user LED (PC6, active
+//! low). The G070 demo adds USART1, for `ping`'s serial output (see
+//! [`crate::usart`]). RCC and GPIO are modelled as registers with their
+//! documented reset values and the few read-back behaviours software waits
+//! on — a clock's ready bit following its enable, BSRR setting and clearing
+//! ODR. Everything else in
 //! the peripheral windows is a plain register file that remembers what was
 //! written, and remembers that it was touched, so a run can say which
 //! peripherals it would need next rather than guessing.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::usart::{self, Usart};
+
 const RCC: u32 = 0x4002_1000;
 const DBGMCU_IDCODE: u32 = 0x4001_5800;
 const IOPORT: u32 = 0x5000_0000;
 const PORTS: usize = 6;
 
-/// DEV_ID 0x466 (STM32G03x/G04x), REV_ID 0x1000.
-const IDCODE_G031: u32 = 0x1000_6466;
+/// REV_ID 0x1000, above the part's DEV_ID.
+const REV_ID: u32 = 0x1000;
 
 /// A change in a port's output data register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +87,11 @@ pub struct Stm32g0 {
     pub unmodelled: BTreeSet<u32>,
     /// Output changes since the machine last drained them.
     pub edges: Vec<Edge>,
+    pub usarts: [Usart; 2],
+    /// Bytes the USARTs transmitted since the machine last drained them.
+    pub serial: Vec<usart::Byte>,
+    /// The part's DEV_ID, which DBGMCU_IDCODE reports.
+    pub dev_id: u16,
 }
 
 impl Default for Stm32g0 {
@@ -93,6 +102,9 @@ impl Default for Stm32g0 {
             other: BTreeMap::new(),
             unmodelled: BTreeSet::new(),
             edges: Vec::new(),
+            usarts: Default::default(),
+            serial: Vec::new(),
+            dev_id: crate::part::STM32G031.dev_id,
         };
         soc.reset();
         soc
@@ -106,6 +118,33 @@ impl Stm32g0 {
         self.rcc[0] = 1 << 8;
         self.gpio = (0..PORTS).map(Gpio::reset).collect();
         self.other.clear();
+        for usart in &mut self.usarts {
+            usart.reset();
+        }
+    }
+
+    /// Which USART, and the offset into it, an address names.
+    fn usart(addr: u32) -> Option<(usize, u32)> {
+        usart::USARTS
+            .iter()
+            .position(|&(base, _)| (base..base + usart::SIZE).contains(&addr))
+            .map(|n| (n, addr - usart::USARTS[n].0))
+    }
+
+    /// The interrupt lines the peripherals assert, as a mask by IRQ number.
+    pub fn interrupts(&self) -> u32 {
+        let mut lines = 0;
+        for (n, usart) in self.usarts.iter().enumerate() {
+            if usart.interrupt() {
+                lines |= 1 << usart::USARTS[n].1;
+            }
+        }
+        lines
+    }
+
+    /// A byte arriving on USART `port`'s line; false if it was not taken.
+    pub fn receive(&mut self, port: usize, byte: u8) -> bool {
+        self.usarts.get_mut(port).is_some_and(|usart| usart.receive(byte))
     }
 
     /// Whether `addr` is in the G0's peripheral windows: APB, AHB, and the
@@ -120,6 +159,9 @@ impl Stm32g0 {
         }
         if !self.modelled(addr) {
             self.unmodelled.insert(addr);
+        }
+        if let Some((n, offset)) = Self::usart(addr) {
+            return Some(self.usarts[n].read(offset, true));
         }
         Some(self.peek(addr))
     }
@@ -144,7 +186,12 @@ impl Stm32g0 {
             };
         }
         if addr == DBGMCU_IDCODE {
-            return IDCODE_G031;
+            return REV_ID << 16 | u32::from(self.dev_id);
+        }
+        if let Some((n, offset)) = Self::usart(addr) {
+            // A peek is a read without effects, and only RDR has any; the
+            // `Usart` is cloned rather than mutated to say so.
+            return self.usarts[n].clone().read(offset, false);
         }
         self.other.get(&addr).copied().unwrap_or(0)
     }
@@ -155,6 +202,12 @@ impl Stm32g0 {
         }
         if (RCC..RCC + 0x400).contains(&addr) {
             self.rcc[((addr - RCC) / 4) as usize] = value;
+            return Some(());
+        }
+        if let Some((n, offset)) = Self::usart(addr) {
+            if let Some(byte) = self.usarts[n].write(offset, value) {
+                self.serial.push(usart::Byte { port: n as u8, byte });
+            }
             return Some(());
         }
         if addr >= IOPORT {
@@ -186,7 +239,7 @@ impl Stm32g0 {
     }
 
     fn modelled(&self, addr: u32) -> bool {
-        (RCC..RCC + 0x400).contains(&addr) || addr >= IOPORT || addr == DBGMCU_IDCODE
+        (RCC..RCC + 0x400).contains(&addr) || addr >= IOPORT || addr == DBGMCU_IDCODE || Self::usart(addr).is_some()
     }
 
     fn port(&self, addr: u32) -> Option<(&Gpio, u32)> {

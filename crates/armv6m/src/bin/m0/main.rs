@@ -29,7 +29,7 @@ use armv6m::{Event, Machine, Outcome};
 pub(crate) const CYCLES_PER_MS: u64 = 16_000;
 
 pub(crate) fn usage() -> ExitCode {
-    eprintln!("usage: zaqaru-m0 <final.bin> [--ms N] [--quiet]");
+    eprintln!("usage: zaqaru-m0 <final.bin> [--part stm32g031|stm32g070|…] [--ms N] [--quiet]");
     eprintln!("       zaqaru-m0 serve <final.bin> [--gdb ADDR] [--listen ADDR] [--archive ZIP] [--board FILE]");
     eprintln!("       zaqaru-m0 door [--listen ADDR] [--probe ADDR] [--archive ZIP] [--humility PATH]");
     ExitCode::from(2)
@@ -46,8 +46,13 @@ fn main() -> ExitCode {
     let mut image = None;
     let mut ms: u64 = 2000;
     let mut quiet = false;
+    let mut part = armv6m::part::STM32G031;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--part" => match args.next().and_then(|v| armv6m::part::Part::named(&v)) {
+                Some(named) => part = named,
+                None => return usage(),
+            },
             "--ms" => match args.next().and_then(|v| v.parse().ok()) {
                 Some(v) => ms = v,
                 None => return usage(),
@@ -65,7 +70,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut machine = match Machine::stm32g031(&bytes) {
+    let mut machine = match Machine::stm32g0(part, &bytes) {
         Ok(machine) => machine,
         Err(e) => {
             eprintln!("zaqaru-m0: {e}");
@@ -165,6 +170,9 @@ pub(crate) fn describe(event: &Event) -> String {
                 line += if after & 1 << 6 == 0 { "  LED on" } else { "  LED off" };
             }
             line
+        }
+        Event::Serial { cycle, byte } => {
+            format!("{:>10.3} ms  USART{} {:?}", ms_at(cycle), byte.port + 1, byte.byte as char)
         }
         Event::Fault { cycle, pc, fault, mode, privileged } => format!(
             "{:>10.3} ms  HardFault at pc=0x{pc:08x} ({mode:?}, {}): {fault:?}",

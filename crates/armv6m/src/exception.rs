@@ -174,6 +174,8 @@ impl Machine {
             self.cpu.msp = popped;
         }
         self.bus.scs.vectactive = self.cpu.ipsr;
+        // A line its handler left asserted is pending again.
+        self.sample_interrupts();
         Ok(())
     }
 }

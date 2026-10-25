@@ -345,6 +345,7 @@ impl Machine {
         }
         let ok = self.bus.write(addr, size, value).is_ok();
         self.drain_edges();
+        self.sample_interrupts();
         if Self::touches_systick(addr, size) {
             self.sync_systick();
         }
