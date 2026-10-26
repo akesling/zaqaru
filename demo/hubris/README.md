@@ -137,7 +137,7 @@ but whether a browser lets it be claimed is untested.
 | `udp 998 TEXT` | the same to any port |
 | `ping` | an ICMPv6 echo request to the board, and its reply |
 | `button` | presses and releases B1, PC13: the user_button task toggles the red LED |
-| `archives` | the Hubris builds there are to flash |
+| `archives` | the Hubris builds there are to flash: each one's app and board, from its `app.toml`. The terminal's *example* picker lists them, and choosing one runs `flash` with it |
 | `flash gimletlet` | Oxide's Gimletlet 2, with its NIC's KSZ8463 switch and its RoT wired: its network comes up through the switch's VLANs, and `udp hello` and `ping` reach it |
 | `flash psc` | Oxide's PSC rev C, with its revision straps driven and its KSZ8463, FRAM, RoT and temperature sensor wired; the framulator's FRAM test passes. Its management network waits for power and PHYs (VSC85x2) the bench does not have |
 | `flash g031` | makes the board the part the archive was built for, erased, and flashes it — `g031`, `g070`, `h753`, or one uploaded |

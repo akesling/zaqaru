@@ -293,6 +293,14 @@ worker.onmessage = (event) => {
     return;
   }
   if (message.type === "stream") {
+    if (message.id === examplesId) {
+      if (message.data) examplesText += message.data;
+      if (message.ended || /^on the board: .*\n/m.test(examplesText)) {
+        examplesId = null;
+        examplesListed(examplesText);
+      }
+      return;
+    }
     if (message.id !== terminalId) return;
     if (message.data) terminalWrite(message.data);
     if (message.ended) terminalWrite(`\n[the session ended${message.error ? `: ${message.error}` : ""}]\n`);
@@ -668,7 +676,7 @@ function makeTerminalPanel() {
   element.id = "terminal";
   // Titled by what is at the other end, once it says (see `terminalWrite`);
   // until then, all the page knows is the port.
-  element.innerHTML = `<h2><span class="path" id="term-title">port ${terminalPort}</span><span id="term-sub"> — a session in the container</span><span class="tools"><button id="term-machine" type="button" title="the processes, files and timeline behind this session">show the machine</button></span></h2>
+  element.innerHTML = `<h2><span class="path" id="term-title">port ${terminalPort}</span><span id="term-sub"> — a session in the container</span><span class="tools"><select id="term-example" title="the Hubris example on the board: choosing another flashes it, with \`flash\` in this session"><option value="">example…</option></select><button id="term-machine" type="button" title="the processes, files and timeline behind this session">show the machine</button></span></h2>
     <pre id="term-out"></pre>
     <form id="term-form"><span class="prompt">›</span><input id="term-in" type="text" autocomplete="off" spellcheck="false" placeholder="humility tasks"></form>`;
   $("panels").appendChild(element);
@@ -678,6 +686,7 @@ function makeTerminalPanel() {
     const line = $("term-in").value;
     $("term-in").value = "";
     if (line.trim() && terminalHistory[terminalHistory.length - 1] !== line) terminalHistory.push(line);
+    if (/^\s*(flash|upload)\b/.test(line)) examplesStale = true;
     terminalRecall = terminalHistory.length;
     // The session does not echo, as a terminal's line discipline would.
     terminalWrite(line + "\n");
@@ -691,6 +700,12 @@ function makeTerminalPanel() {
     $("term-in").value = terminalHistory[terminalRecall] ?? "";
   };
   $("term-machine").onclick = () => leaveOpening();
+  $("term-example").onchange = () => {
+    const name = $("term-example").value;
+    if (!name) return;
+    $("term-in").value = `flash ${name}`;
+    $("term-form").requestSubmit();
+  };
   $("term-out").onclick = () => {
     if (!window.getSelection().toString()) $("term-in").focus();
   };
@@ -718,6 +733,7 @@ async function uploadToTerminal(file) {
   message.set(head);
   message.set(bytes, head.length);
   terminalWrite(`upload ${name}  (${bytes.length.toLocaleString()} bytes, dropped)\n`);
+  examplesStale = true;
   worker.postMessage({ type: "write", id: terminalId, data: message }, [message.buffer]);
   if (!playing && finished === null) $("play").click();
 }
@@ -739,6 +755,46 @@ function openTerminal() {
   terminalId = nextRequest++;
   worker.postMessage({ type: "open", id: terminalId, port: terminalPort });
   $("term-in").focus();
+  listExamples();
+}
+
+/// The Hubris examples the bench has to flash — its `archives`, asked for
+/// on a session of their own — for the terminal's picker; asked again once
+/// a `flash` or an `upload` in the terminal has finished (its prompt is back).
+let examplesId = null;
+let examplesText = "";
+let examplesStale = false;
+let examples = [];
+let examplesOn = null;
+function listExamples() {
+  if (examplesId !== null || !terminalPort) return;
+  examplesId = nextRequest++;
+  examplesText = "";
+  worker.postMessage({ type: "open", id: examplesId, port: terminalPort });
+  worker.postMessage({ type: "write", id: examplesId, data: "archives\nexit\n" });
+}
+
+function examplesListed(text) {
+  examples = [...text.matchAll(/^(?:\$ )? {4}(\S+) +(\S+) +(\S+) +(\/\S+)$/gm)].map((m) => ({ name: m[1], app: m[2], board: m[3], path: m[4] }));
+  examplesOn = text.match(/^(?:\$ )?on the board: (.*)$/m)?.[1] ?? null;
+  const select = $("term-example");
+  if (!select) return;
+  select.innerHTML =
+    `<option value="">${examples.length ? "example…" : "no examples"}</option>` +
+    examples
+      .map((e) => `<option value="${escape(e.name)}">${escape(e.app === "-" ? e.name : e.app)} — ${escape(bench.BOARDS[e.board]?.title ?? (e.board === "-" ? "a board it doesn't name" : e.board))}</option>`)
+      .join("");
+  markExample();
+}
+
+/// The picker shows what is on the board: the archive last flashed, else —
+/// at the start, when it is the image's own — the one built for this board.
+function markExample() {
+  const select = $("term-example");
+  if (!select || !examples.length) return;
+  const named = examples.filter((e) => e.board === boardValue?.name);
+  const on = examples.find((e) => e.path === examplesOn) ?? (named.length === 1 ? named[0] : null);
+  if (select.value !== (on?.name ?? "")) select.value = on?.name ?? "";
 }
 
 /// What arrives may hold a title for the session — OSC 0 or 2, the escape a
@@ -761,6 +817,10 @@ function terminalWrite(text) {
   });
   const out = $("term-out");
   out.textContent += text;
+  if (examplesStale && /(^|\n)\$ /.test(text)) {
+    examplesStale = false;
+    listExamples();
+  }
   out.scrollTop = out.scrollHeight;
 }
 
@@ -1034,17 +1094,14 @@ const renderers = {
           <button type="button" data-clock="advance 100ms">+100 ms</button>
           <button type="button" data-clock="advance next" title="to whatever is due next: SysTick, a timer, a transfer">next event</button></span>`
       : "";
-    const clock = value.speed
-      ? `<div class="clock">${value.paused ? "<b>paused</b> · " : ""}speed ${escape(value.speed)} · managing ${(value.ratio ?? 0).toFixed(3)}× real time ${controls}</div>
-      <div class="dim">${clocks}</div>`
-      : "";
+    const clockText = value.speed ? `${value.paused ? "<b>paused</b> · " : ""}speed ${escape(value.speed)} · managing ${(value.ratio ?? 0).toFixed(3)}× real time` : "";
     // What the USARTs sent, the tail of it, as a serial console shows it.
     const serial = value.serial ? `<div class="key">serial</div><pre class="serial">${escape(value.serial.slice(-2000))}</pre>` : "";
     panel.element.classList.add("bench-panel");
     // A skeleton made once, and each part of it replaced only when what it
     // shows changes: the board isn't redrawn under the pointer on every read.
     if (!panel.body.querySelector(".board > .drawing")) {
-      panel.body.innerHTML = `<div class="board"><div class="drawing"></div><div class="status"></div><div class="clocking"></div>
+      panel.body.innerHTML = `<div class="board"><div class="drawing"></div><div class="status"></div><div class="clock"><span class="clock-text"></span> <span class="clock-controls"></span></div><div class="dim clock-tree"></div>
         <div class="probes"></div>
         <details class="more"><summary>LEDs, faults, the network, the core's registers</summary><div class="more-body"></div></details></div>`;
       const more = panel.body.querySelector("details.more");
@@ -1053,16 +1110,17 @@ const renderers = {
     }
     const fill = (selector, html) => {
       const element = panel.body.querySelector(selector);
-      if (element.shown !== html) {
-        element.innerHTML = html;
-        element.shown = html;
-      }
+      update(element, html);
       return element;
     };
     fill(".drawing", value.gpio ? bench.drawBoard(value, new Set(probes)) : `<div class="leds">${lamps}</div>`);
     fill(".status", `<b>${escape(value.chip)}</b>${value.core ? ` (${escape(value.core)})` : ""} · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated`);
-    fill(".clocking", clock);
-    fill(".probes", probesHtml(value));
+    // The clock's figures change on every read; its buttons only when the
+    // speed or the pause does, so a press on one isn't lost to a redraw.
+    fill(".clock-text", clockText);
+    fill(".clock-controls", value.speed ? controls : "");
+    fill(".clock-tree", value.speed ? clocks : "");
+    showProbes(panel.body.querySelector(".probes"), value);
     const transcript = fill(".more-body", `<div>LED${leds.length > 1 ? "s" : ""} ${lit || "none"} · ${value.faults} faults · debug probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
       ${wired}
       ${heard}
@@ -1082,6 +1140,7 @@ const renderers = {
     };
     boardValue = value;
     boardPanel = panel;
+    markExample();
     followTrace();
   },
 
@@ -1262,24 +1321,71 @@ function probeChannels() {
   return [...new Set(probes.map(bench.channelOf).filter(Boolean))];
 }
 
-function probesHtml(value) {
+/// Shows `html` in `element`, changing only what differs from what it
+/// shows now: an element whose tag is the same stays, its attributes and
+/// text brought up to date, so what the pointer is on isn't swapped for a
+/// copy between a press and its release — which would lose the click.
+function update(element, html) {
+  if (element.shown === html) return;
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  morph(element, template.content);
+  element.shown = html;
+}
+
+function morph(into, from) {
+  const had = [...into.childNodes];
+  const wanted = [...from.childNodes];
+  wanted.forEach((node, n) => {
+    const old = had[n];
+    if (!old) return into.appendChild(node);
+    if (old.nodeType !== node.nodeType || old.nodeName !== node.nodeName) return into.replaceChild(node, old);
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      if (old.nodeValue !== node.nodeValue) old.nodeValue = node.nodeValue;
+      return;
+    }
+    for (const { name } of [...old.attributes]) if (!node.hasAttribute(name)) old.removeAttribute(name);
+    for (const { name, value } of node.attributes) if (old.getAttribute(name) !== value) old.setAttribute(name, value);
+    morph(old, node);
+  });
+  for (const old of had.slice(wanted.length)) old.remove();
+}
+
+/// The probes' cards, one for each probe, kept from read to read: a card's
+/// head is redrawn only when it changes, its body as its records come — so
+/// a press on its × or its zoom isn't lost to a redraw.
+function showProbes(box, value) {
+  const show = update;
   if (!probes.length) {
-    return `<div class="dim">Probe something: click a pin, a bus, a part, the Ethernet jack or the serial port on the board above.</div>`;
+    show(box, `<div class="dim">Probe something: click a pin, a bus, a part, the Ethernet jack or the serial port on the board above.</div>`);
+    return;
   }
+  if (box.shown !== undefined) {
+    box.innerHTML = "";
+    box.shown = undefined;
+  }
+  const cards = new Map([...box.children].map((card) => [card.dataset.name, card]));
+  for (const [name, card] of cards) if (!probes.includes(name)) card.remove();
   const windows = [1e6, 1e7, 1e8, 1e9, 1e10]
     .map((w) => `<button type="button" data-window="${w}"${w === probeWindow ? ' class="on"' : ""}>${bench.fmtSpan(w)}</button>`)
     .join("");
-  return probes
-    .map((name) => {
-      const kind = bench.probeKind(name);
-      const records = probeRecords.get(bench.channelOf(name) ?? "") ?? [];
-      const label = { pin: "pin", i2c: "I2C bus", spi: "SPI bus", usart: "serial line", eth: "Ethernet cable", part: "part" }[kind];
-      return `<div class="probe"><div class="probe-head"><b>${escape(name)}</b> <span class="dim">${label}</span>
+  probes.forEach((name, n) => {
+    let card = cards.get(name);
+    if (!card) {
+      card = document.createElement("div");
+      card.className = "probe";
+      card.dataset.name = name;
+      card.innerHTML = `<div class="probe-head"></div><div class="probe-body"></div>`;
+    }
+    if (box.children[n] !== card) box.insertBefore(card, box.children[n] ?? null);
+    const kind = bench.probeKind(name);
+    const records = probeRecords.get(bench.channelOf(name) ?? "") ?? [];
+    const label = { pin: "pin", i2c: "I2C bus", spi: "SPI bus", usart: "serial line", eth: "Ethernet cable", part: "part" }[kind];
+    show(card.firstChild, `<b>${escape(name)}</b> <span class="dim">${label}</span>
         ${kind === "pin" ? `<span class="controls">${windows}</span>` : ""}
-        <button type="button" class="unprobe" data-unprobe="${escape(name)}" title="take the probe off">×</button></div>
-        <div class="probe-body">${bench.probeBody(name, records, value, probeWindow)}</div></div>`;
-    })
-    .join("");
+        <button type="button" class="unprobe" data-unprobe="${escape(name)}" title="take the probe off">×</button>`);
+    show(card.lastChild, bench.probeBody(name, records, value, probeWindow));
+  });
 }
 
 /// Reads what the probes' channels have carried since the last read, and
@@ -1307,7 +1413,7 @@ async function followTrace() {
     traceCursor = answer.next;
     if (answer.records.length && boardPanel && boardValue) {
       const box = boardPanel.body.querySelector(".probes");
-      if (box) box.innerHTML = box.shown = probesHtml(boardValue);
+      if (box) showProbes(box, boardValue);
     }
   } catch {
     // Nothing to read at this instant: the board is not there yet.
