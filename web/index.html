@@ -80,9 +80,9 @@
   body.opening #timeline { visibility: hidden; }
   /* A bench: the terminal and the board, side by side, until the machine is asked for. */
   body.bench #edge { display: none; }
-  body.opening.bench #panels { display: flex; flex-wrap: wrap; max-width: 84em; margin: 5vh auto 0; align-items: flex-start; }
-  body.opening.bench #terminal { flex: 2 1 36em; }
-  body.opening.bench #panels > .panel[data-pattern="board"] { flex: 1 1 18em; }
+  body.opening.bench #panels { display: flex; flex-wrap: wrap; max-width: 120em; margin: 5vh auto 0; align-items: flex-start; }
+  body.opening.bench #terminal { flex: 1 1 34em; }
+  body.opening.bench #panels > .panel[data-pattern="board"] { flex: 1 1 34em; max-height: none; }
   body.opening.bench #panels > .panel[data-pattern="usb"] { flex: 1 1 100%; }
   body.opening.bench #panels > #terminal:not(#edge), body.opening.bench #panels > .panel[data-pattern="board"]:not(#edge), body.opening.bench #panels > .panel[data-pattern="usb"]:not(#edge) { display: block; }
   .panel.terminal { max-height: none; }

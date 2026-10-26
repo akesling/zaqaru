@@ -1041,25 +1041,35 @@ const renderers = {
     // What the USARTs sent, the tail of it, as a serial console shows it.
     const serial = value.serial ? `<div class="key">serial</div><pre class="serial">${escape(value.serial.slice(-2000))}</pre>` : "";
     panel.element.classList.add("bench-panel");
-    panel.body.innerHTML = `<div class="board">
-      ${value.gpio ? bench.drawBoard(value, new Set(probes)) : `<div class="leds">${lamps}</div>`}
-      <div><b>${escape(value.chip)}</b>${value.core ? ` (${escape(value.core)})` : ""} · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated</div>
-      ${clock}
-      <div class="probes">${probesHtml(value)}</div>
-      <details class="more"><summary>LEDs, faults, the network, the core's registers</summary>
-      <div>LED${leds.length > 1 ? "s" : ""} ${lit || "none"} · ${value.faults} faults · debug probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
+    // A skeleton made once, and each part of it replaced only when what it
+    // shows changes: the board isn't redrawn under the pointer on every read.
+    if (!panel.body.querySelector(".board > .drawing")) {
+      panel.body.innerHTML = `<div class="board"><div class="drawing"></div><div class="status"></div><div class="clocking"></div>
+        <div class="probes"></div>
+        <details class="more"><summary>LEDs, faults, the network, the core's registers</summary><div class="more-body"></div></details></div>`;
+      const more = panel.body.querySelector("details.more");
+      more.open = moreOpen;
+      more.ontoggle = () => (moreOpen = more.open);
+    }
+    const fill = (selector, html) => {
+      const element = panel.body.querySelector(selector);
+      if (element.shown !== html) {
+        element.innerHTML = html;
+        element.shown = html;
+      }
+      return element;
+    };
+    fill(".drawing", value.gpio ? bench.drawBoard(value, new Set(probes)) : `<div class="leds">${lamps}</div>`);
+    fill(".status", `<b>${escape(value.chip)}</b>${value.core ? ` (${escape(value.core)})` : ""} · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated`);
+    fill(".clocking", clock);
+    fill(".probes", probesHtml(value));
+    const transcript = fill(".more-body", `<div>LED${leds.length > 1 ? "s" : ""} ${lit || "none"} · ${value.faults} faults · debug probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
       ${wired}
       ${heard}
       <div class="dim">${escape(value.image)} · ${value.instructions.toLocaleString()} instructions · ${escape(value.mode)} mode, ${value.privileged ? "privileged" : "unprivileged"}</div>
       <div class="dim">${exceptions}</div>
       ${serial}
-      <div class="registers">${registers}</div>
-      </details>
-    </div>`;
-    const more = panel.body.querySelector("details.more");
-    more.open = moreOpen;
-    more.ontoggle = () => (moreOpen = more.open);
-    const transcript = panel.body.querySelector(".serial");
+      <div class="registers">${registers}</div>`).querySelector(".serial");
     if (transcript) transcript.scrollTop = transcript.scrollHeight;
     panel.body.onclick = (event) => {
       const button = event.target.closest("[data-clock]");
@@ -1297,7 +1307,7 @@ async function followTrace() {
     traceCursor = answer.next;
     if (answer.records.length && boardPanel && boardValue) {
       const box = boardPanel.body.querySelector(".probes");
-      if (box) box.innerHTML = probesHtml(boardValue);
+      if (box) box.innerHTML = box.shown = probesHtml(boardValue);
     }
   } catch {
     // Nothing to read at this instant: the board is not there yet.
