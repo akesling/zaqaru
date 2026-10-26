@@ -145,11 +145,15 @@ fn main() -> ExitCode {
         if sends.next_if(|&at| machine.cycles >= at).is_some() {
             for (port, text) in &datagrams {
                 println!("{:>10.3} ms  the host sends {text:?} to [{}]:{port}", ms_at(machine.cycles), peer_target(&peer));
-                machine.deliver(peer.udp(*port, text.as_bytes()));
+                for frame in peer.udp(*port, text.as_bytes()) {
+                    machine.deliver(frame);
+                }
             }
             if ping {
                 println!("{:>10.3} ms  the host pings [{}]", ms_at(machine.cycles), peer_target(&peer));
-                machine.deliver(peer.ping(1));
+                for frame in peer.ping(1) {
+                    machine.deliver(frame);
+                }
             }
         }
         match outcome {

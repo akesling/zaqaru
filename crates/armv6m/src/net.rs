@@ -9,6 +9,12 @@
 //! addresses from what the board sends; until it has, it sends to all
 //! nodes, ff02::1, which the board's stack accepts.
 //!
+//! The first time it sends to the board it introduces itself, as a host
+//! does: a neighbour solicitation for the board's address carrying its own
+//! MAC. Without that the board's first answer is lost, since the board
+//! learns neighbours only from neighbour discovery, and its stack drops the
+//! packet it was sending while it asks.
+//!
 //! It is frames in and frames out; whoever owns the board moves them
 //! between it and the board's Ethernet.
 
@@ -65,11 +71,13 @@ pub struct Peer {
     pub ip: [u8; 16],
     /// The board's MAC and address, once it has said something.
     pub board: Option<([u8; 6], [u8; 16])>,
+    /// Whether this host has introduced itself to that board.
+    introduced: bool,
 }
 
 impl Default for Peer {
     fn default() -> Self {
-        Peer { mac: MAC, ip: link_local(MAC), board: None }
+        Peer { mac: MAC, ip: link_local(MAC), board: None, introduced: false }
     }
 }
 
@@ -78,8 +86,24 @@ impl Peer {
         self.board.unwrap_or((ALL_NODES_MAC, ALL_NODES))
     }
 
-    /// A UDP datagram to the board's `port`.
-    pub fn udp(&self, port: u16, payload: &[u8]) -> Vec<u8> {
+    /// The frames that send `frame` to the board: the introduction first,
+    /// if the board has not had it.
+    fn sending(&mut self, frame: Vec<u8>) -> Vec<Vec<u8>> {
+        let mut frames = Vec::with_capacity(2);
+        if let (Some((mac, ip)), false) = (self.board, self.introduced) {
+            let mut ns = vec![135, 0, 0, 0, 0, 0, 0, 0];
+            ns.extend_from_slice(&ip);
+            ns.extend_from_slice(&[1, 1]);
+            ns.extend_from_slice(&self.mac);
+            frames.push(self.ipv6(mac, ip, ICMPV6, ns));
+            self.introduced = true;
+        }
+        frames.push(frame);
+        frames
+    }
+
+    /// A UDP datagram to the board's `port`, as the frames that carry it.
+    pub fn udp(&mut self, port: u16, payload: &[u8]) -> Vec<Vec<u8>> {
         let mut udp = Vec::with_capacity(8 + payload.len());
         udp.extend_from_slice(&PORT.to_be_bytes());
         udp.extend_from_slice(&port.to_be_bytes());
@@ -87,16 +111,18 @@ impl Peer {
         udp.extend_from_slice(&[0, 0]);
         udp.extend_from_slice(payload);
         let (mac, ip) = self.destination();
-        self.ipv6(mac, ip, UDP, udp)
+        let frame = self.ipv6(mac, ip, UDP, udp);
+        self.sending(frame)
     }
 
-    /// An echo request to the board.
-    pub fn ping(&self, sequence: u16) -> Vec<u8> {
+    /// An echo request to the board, as the frames that carry it.
+    pub fn ping(&mut self, sequence: u16) -> Vec<Vec<u8>> {
         let mut icmp = vec![128, 0, 0, 0, 0x5A, 0x51];
         icmp.extend_from_slice(&sequence.to_be_bytes());
         icmp.extend_from_slice(b"zaqaru");
         let (mac, ip) = self.destination();
-        self.ipv6(mac, ip, ICMPV6, icmp)
+        let frame = self.ipv6(mac, ip, ICMPV6, icmp);
+        self.sending(frame)
     }
 
     /// A frame from the board: what to send back, and what was heard.
@@ -106,8 +132,9 @@ impl Peer {
         if packet.source_mac == self.mac {
             return (replies, heard);
         }
-        if packet.source[0..2] == [0xFE, 0x80] {
+        if packet.source[0..2] == [0xFE, 0x80] && self.board != Some((packet.source_mac, packet.source)) {
             self.board = Some((packet.source_mac, packet.source));
+            self.introduced = false;
         }
         let to_us = packet.destination == self.ip || packet.destination[0] == 0xFF;
         match packet.next {
@@ -241,7 +268,7 @@ mod tests {
 
     #[test]
     fn a_neighbour_solicitation_for_the_host_is_answered() {
-        let board = Peer { mac: [0x0E, 1, 2, 3, 4, 5], ip: link_local([0x0E, 1, 2, 3, 4, 5]), board: None };
+        let board = Peer { mac: [0x0E, 1, 2, 3, 4, 5], ip: link_local([0x0E, 1, 2, 3, 4, 5]), ..Peer::default() };
         let mut host = Peer::default();
         // The board asks, from its own address, who has the host's.
         let mut ns = vec![135, 0, 0, 0, 0, 0, 0, 0];
@@ -259,9 +286,24 @@ mod tests {
     #[test]
     fn a_datagram_is_heard_with_its_ports() {
         let mut host = Peer::default();
-        let mut board = Peer { mac: [0x0E, 1, 2, 3, 4, 5], ip: link_local([0x0E, 1, 2, 3, 4, 5]), board: None };
+        let mut board = Peer { mac: [0x0E, 1, 2, 3, 4, 5], ip: link_local([0x0E, 1, 2, 3, 4, 5]), ..Peer::default() };
         board.board = Some((host.mac, host.ip));
-        let (_, heard) = host.receive(&board.udp(7, b"hello"));
+        board.introduced = true;
+        let (_, heard) = host.receive(&board.udp(7, b"hello")[0]);
         assert_eq!(heard, [Heard::Udp { from: board.ip, source: PORT, port: 7, payload: b"hello".to_vec(), multicast: false }]);
+    }
+
+    #[test]
+    fn the_host_introduces_itself_before_it_first_sends_to_the_board() {
+        let mut host = Peer::default();
+        let board = ([0x0E, 1, 2, 3, 4, 5], link_local([0x0E, 1, 2, 3, 4, 5]));
+        assert_eq!(host.ping(1).len(), 1, "to all nodes, before the board is known");
+        host.board = Some(board);
+        let frames = host.ping(2);
+        let ns = Packet::parse(&frames[0]).unwrap();
+        assert_eq!((ns.body[0], &ns.body[8..24], &frames[0][0..6]), (135, &board.1[..], &board.0[..]));
+        assert_eq!(&ns.body[24..32], &[1, 1, 0x02, 0x00, 0x5A, 0x51, 0x00, 0x01], "carrying the host's MAC");
+        assert_eq!(checksum(&ns.source, &ns.destination, ICMPV6, ns.body), 0xFFFF);
+        assert_eq!(host.ping(3).len(), 1, "once");
     }
 }

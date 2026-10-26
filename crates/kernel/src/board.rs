@@ -336,13 +336,13 @@ impl Board {
             "udp" => {
                 let (port, text) = rest.trim().split_once(char::is_whitespace).unwrap_or((rest.trim(), ""));
                 let port = port.parse().map_err(|_| format!("udp `{port}`: expected a port, then the text"))?;
-                let frame = self.host.udp(port, text.as_bytes());
-                self.send_frame(frame)
+                let frames = self.host.udp(port, text.as_bytes());
+                self.send_frames(frames)
             }
             "ping" => {
                 self.pings = self.pings.wrapping_add(1);
-                let frame = self.host.ping(self.pings);
-                self.send_frame(frame)
+                let frames = self.host.ping(self.pings);
+                self.send_frames(frames)
             }
             "pin" => {
                 let (pin, level) = rest.trim().split_once(char::is_whitespace).unwrap_or((rest.trim(), ""));
@@ -361,9 +361,14 @@ impl Board {
         }
     }
 
-    /// A frame onto the board's Ethernet, from the host.
-    fn send_frame(&mut self, frame: Vec<u8>) -> Result<(), String> {
-        if self.machine.deliver(frame) { Ok(()) } else { Err(format!("the {} has no Ethernet", self.chip)) }
+    /// Frames onto the board's Ethernet, from the host.
+    fn send_frames(&mut self, frames: Vec<Vec<u8>>) -> Result<(), String> {
+        for frame in frames {
+            if !self.machine.deliver(frame) {
+                return Err(format!("the {} has no Ethernet", self.chip));
+            }
+        }
+        Ok(())
     }
 
     /// The instant, in monotonic nanoseconds, by which an idle container
