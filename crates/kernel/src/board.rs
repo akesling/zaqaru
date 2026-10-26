@@ -1101,6 +1101,10 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             }
             listener
         };
+        // Announced as a guest's listener is, so that the host can reach the
+        // probe through the edge too, as a debugger on the far side of a
+        // published port would.
+        self.register_listener(port);
         self.board_says(&format!(
             "board: {} running {}, probe on {}.{}.{}.{}:{port}",
             configuration.chip,

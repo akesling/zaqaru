@@ -7,9 +7,11 @@
 // The lines default to `board` and `humility tasks`, typed one after another
 // into one session, as the page's terminal does; `wait:N` runs N seconds
 // without typing, and `upload:PATH` sends a file of this host's as the page
-// does one dropped on its terminal. Prints what each line answered and how long it took, in
-// wall time and in instructions, and exits 0 when `humility tasks` showed
-// a task RUNNING.
+// does one dropped on its terminal; `gdb:COMMAND` sends `monitor COMMAND`
+// to the board's GDB server, as GDB would — a `qRcmd` packet on the
+// probe's port — and shows what it printed. Prints what each line answered
+// and how long it took, in wall time and in instructions, and exits 0 when
+// `humility tasks` showed a task RUNNING.
 
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
@@ -22,12 +24,13 @@ if (!modulePath) {
 }
 const lines = asked.length ? asked : ["board", "humility tasks"];
 const PORT = 80;
+const GDB = 3333;
 const PROMPT = "\n$ ";
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const started = performance.now();
 const module = await WebAssembly.compile(readFileSync(modulePath));
-const edge = new Edge([PORT]);
+const edge = new Edge([PORT, GDB]);
 const console_ = [];
 const mounts = standardMounts({ seed: null, edge, echo: (path, data) => console_.push(text(data)) });
 const container = await Container.instantiate(module, mounts);
@@ -39,6 +42,16 @@ const session = edge.open(PORT, {
   received: (data) => (screen += text(data)),
   ended: () => (ended = true),
 });
+
+// The board's GDB server, opened at the first `gdb:` line.
+let gdb = null;
+let gdbScreen = "";
+const packet = (payload) => {
+  const sum = [...payload].reduce((a, c) => (a + c.charCodeAt(0)) & 0xff, 0);
+  return `$${payload}#${sum.toString(16).padStart(2, "0")}`;
+};
+const hex = (s) => [...new TextEncoder().encode(s)].map((b) => b.toString(16).padStart(2, "0")).join("");
+const unhex = (h) => new TextDecoder().decode(new Uint8Array((h.match(/../g) ?? []).map((b) => parseInt(b, 16))));
 
 let retired = 0;
 // Runs the container until `done()` or `limit` ms pass; when it is idle, it
@@ -72,6 +85,21 @@ for (const line of lines) {
     const seconds = Number(waiting[1]);
     await runUntil(() => false, seconds * 1000);
     console.error(`check: waited ${seconds} s, ${((retired - fromRetired) / 1e6).toFixed(0)} M instructions`);
+    continue;
+  }
+  const monitor = /^gdb:(.+)$/.exec(line);
+  if (monitor) {
+    gdb ??= edge.open(GDB, { received: (data) => (gdbScreen += text(data)), ended: () => {} });
+    const from = gdbScreen.length;
+    gdb.send(new TextEncoder().encode(packet(`qRcmd,${hex(monitor[1])}`)));
+    // Console output comes as `O` packets, then `OK` ends the command; an
+    // empty reply is a command the board does not know.
+    const done = () => /\$(OK|E\d\d|)#/.test(gdbScreen.slice(from));
+    const answered = await runUntil(done, 60000);
+    const said = [...gdbScreen.slice(from).matchAll(/\$O([0-9a-f]+)#/g)].map((m) => unhex(m[1])).join("");
+    console.log(`(gdb) monitor ${monitor[1]}\n${said}`);
+    const unknown = /\$#00/.test(gdbScreen.slice(from)) ? " (not a command the board knows)" : "";
+    console.error(`check: ${line}${unknown}${answered ? "" : ` (no answer: ${JSON.stringify(gdbScreen.slice(from))})`}`);
     continue;
   }
   const mark = screen.length;

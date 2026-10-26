@@ -1701,7 +1701,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// nothing arrive on it. A guest that could tell the difference would be
     /// a guest that can see its own port mapping, which `docker` does not
     /// give it either.
-    fn register_listener(&mut self, port: u16) {
+    pub(crate) fn register_listener(&mut self, port: u16) {
         let _ = self
             .store
             .write(crate::paths::NET_LISTEN, port.to_string().as_bytes());
