@@ -258,6 +258,12 @@ pub struct Socket {
     /// reaches the store. This is what tells the pump which sockets have a
     /// far side it has to move bytes to.
     pub edge: Option<u32>,
+    /// Whether the host may have more for this edge connection than was
+    /// last taken: the take filled the ring. The host announces data once,
+    /// when it arrives, so the rest is asked for as the ring empties (see
+    /// `Kernel::flush_edges`) rather than waiting for an announcement that
+    /// will not come.
+    pub edge_more: bool,
     /// How many descriptors name it, across every process.
     pub references: u32,
     pub state: State,
@@ -278,6 +284,7 @@ impl Sockets {
             family,
             kind,
             edge: None,
+            edge_more: false,
             references: 1,
             state: State::Idle,
             options: Options::default(),
@@ -1759,6 +1766,12 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             return false;
         }
         let mut moved = false;
+        for &(id, conn) in &edges {
+            let more = self.sockets.borrow().get(id).is_some_and(|socket| socket.edge_more);
+            if more && self.drain_edge(conn) {
+                moved = true;
+            }
+        }
         for (id, conn) in edges {
             let Some(ring) = self
                 .sockets
@@ -1914,6 +1927,10 @@ attach_endpoint(&mut self.rings.borrow_mut(), down, up);
         };
         let room = self.rings.borrow().room(receive);
         if room == 0 {
+            // Announced with nowhere to put it: asked for again later.
+            if let Some(socket) = self.sockets.borrow_mut().get_mut(id) {
+                socket.edge_more = true;
+            }
             return false;
         }
         let path: Vec<Vec<u8>> = vec![
@@ -1926,9 +1943,11 @@ attach_endpoint(&mut self.rings.borrow_mut(), down, up);
         ];
         let borrowed: Vec<&[u8]> = path.iter().map(|held| held.as_slice()).collect();
         let mut bytes = Vec::new();
-        if self.store.read(&borrowed, &mut bytes) != crate::abi::StoreOutcome::Present
-            || bytes.is_empty()
-        {
+        let present = self.store.read(&borrowed, &mut bytes) == crate::abi::StoreOutcome::Present;
+        if let Some(socket) = self.sockets.borrow_mut().get_mut(id) {
+            socket.edge_more = present && bytes.len() >= room;
+        }
+        if !present || bytes.is_empty() {
             return false;
         }
         self.rings.borrow_mut().give(receive, &bytes);
