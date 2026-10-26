@@ -3,10 +3,11 @@
 //! event and its interrupt. Capture, compare, PWM and the slave modes are
 //! registers that read back and do nothing.
 //!
-//! The counter is not clocked. It is worked out from the machine's cycle
-//! count when read, from where it was when it last started or was written,
-//! and the timer says when its next update is due (see [`Timer::due`]) so
-//! that the machine's run loop — and a `wfi` it skips over — stops there.
+//! The counter is not clocked. It is worked out from the machine's time
+//! (in picoseconds) when read, from where it was when it last started or
+//! was written, at its kernel clock's period, and the timer says when its
+//! next update is due (see [`Timer::due`]) so that the machine's run loop —
+//! and a `wfi` it skips over — stops there.
 
 // CR1.
 const CEN: u32 = 1 << 0;
@@ -25,13 +26,13 @@ pub struct Timer {
     sr: u32,
     psc: u32,
     arr: u32,
-    /// The counter's value at `since`, the cycle it last started counting
+    /// The counter's value at `since`, the time it last started counting
     /// from or was set at.
     cnt: u32,
     since: u64,
     /// Whether the counter is 32 bits wide (TIM2 and TIM5) or 16.
     wide: bool,
-    /// Core cycles per tick of the timer's kernel clock.
+    /// Picoseconds per tick of the timer's kernel clock.
     divider: u64,
     other: [u32; 0x20],
 }
@@ -56,12 +57,21 @@ impl Timer {
         *self = Timer::new(self.wide, self.divider);
     }
 
-    /// Core cycles per count.
+    /// Picoseconds per count.
     fn period(&self) -> u64 {
         self.divider * (u64::from(self.psc) + 1)
     }
 
-    /// The counter, at cycle `now`.
+    /// A new kernel clock, from `now`: the counter settled where the old
+    /// one left it.
+    pub fn set_period(&mut self, divider: u64, now: u64) {
+        self.advance(now);
+        self.cnt = self.count(now);
+        self.since = now;
+        self.divider = divider;
+    }
+
+    /// The counter, at time `now`.
     fn count(&self, now: u64) -> u32 {
         if self.cr1 & CEN == 0 {
             return self.cnt;
@@ -71,8 +81,8 @@ impl Timer {
         ((u64::from(self.cnt) + counts) % modulus) as u32
     }
 
-    /// The cycle the next update event happens at, if the timer is
-    /// counting toward one.
+    /// The time the next update event happens at, if the timer is counting
+    /// toward one.
     pub fn due(&self) -> Option<u64> {
         if self.cr1 & CEN == 0 || self.arr == 0 {
             return None;
@@ -81,8 +91,8 @@ impl Timer {
         Some(self.since + to_go * self.period())
     }
 
-    /// Brings the timer up to cycle `now`: the updates since, UIF for
-    /// them, and in one-pulse mode the counter stopped at the first.
+    /// Brings the timer up to time `now`: the updates since, UIF for them,
+    /// and in one-pulse mode the counter stopped at the first.
     pub fn advance(&mut self, now: u64) {
         let Some(due) = self.due().filter(|&due| due <= now) else { return };
         if self.cr1 & UDIS == 0 {

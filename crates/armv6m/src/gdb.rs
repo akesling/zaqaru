@@ -210,6 +210,18 @@ impl Debugger {
     }
 }
 
+/// The command in a `monitor` packet (`qRcmd`), if that is what this is.
+pub fn monitor(packet: &str) -> Option<String> {
+    let hex = packet.strip_prefix("qRcmd,")?;
+    unhex(hex).map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+/// Text for the debugger's console, as an `O` packet carries it.
+pub fn output(text: &str) -> String {
+    let hex: String = text.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("O{hex}")
+}
+
 /// A packet as it goes on the wire.
 pub fn frame(payload: &str) -> String {
     let sum = payload.bytes().fold(0u8, |a, b| a.wrapping_add(b));

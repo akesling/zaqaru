@@ -85,8 +85,9 @@ pub struct Bus {
     pub rams: Vec<Ram>,
     pub scs: Scs,
     pub soc: Soc,
-    /// The cycle it is, for the peripherals whose state is a function of
-    /// time; the machine sets it before an access reaches them.
+    /// The time it is, in picoseconds, for the peripherals whose state is
+    /// a function of time; the machine sets it before an access reaches
+    /// them.
     pub now: u64,
 }
 
@@ -356,7 +357,7 @@ impl Bus {
     pub fn reset_soc(&mut self) {
         match &mut self.soc {
             Soc::G0(soc) => soc.reset(),
-            Soc::H7(soc) => soc.reset(&mut self.flash),
+            Soc::H7(soc) => soc.reset(&mut self.flash, self.now),
         }
     }
 }
@@ -369,7 +370,15 @@ impl Soc {
         }
     }
 
-    /// A read of `size` bytes at the word `addr`, at cycle `now`.
+    /// The clocks RCC is giving out.
+    pub fn clocks(&self) -> crate::clock::Clocks {
+        match self {
+            Soc::G0(soc) => soc.clocks(),
+            Soc::H7(soc) => soc.clocks,
+        }
+    }
+
+    /// A read of `size` bytes at the word `addr`, at time `now`.
     pub fn read(&mut self, addr: u32, size: u32, now: u64) -> Option<u32> {
         match self {
             Soc::G0(soc) => soc.read(addr),
@@ -391,7 +400,7 @@ impl Soc {
         }
     }
 
-    /// The cycle the next timed event in the peripherals is due at.
+    /// The time the next timed event in the peripherals is due at.
     pub fn due(&self) -> Option<u64> {
         match self {
             Soc::G0(_) => None,
@@ -399,7 +408,7 @@ impl Soc {
         }
     }
 
-    /// Brings the peripherals' timed state up to cycle `now`.
+    /// Brings the peripherals' timed state up to time `now`.
     pub fn advance(&mut self, now: u64) {
         if let Soc::H7(soc) = self {
             soc.advance(now);

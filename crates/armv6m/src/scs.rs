@@ -254,7 +254,14 @@ pub struct SysTick {
     pub csr: u32,
     pub rvr: u32,
     pub cvr: u32,
+    /// With CLKSOURCE clear it counts the external reference, which on
+    /// the STM32s is the core's clock divided by eight: the core cycles
+    /// toward the next of its clocks.
+    phase: u64,
 }
+
+/// Core cycles per clock of the external reference.
+const REFERENCE_DIVIDER: u64 = 8;
 
 const CSR_ENABLE: u32 = 1 << 0;
 const CSR_TICKINT: u32 = 1 << 1;
@@ -266,9 +273,28 @@ impl SysTick {
         self.csr & CSR_ENABLE != 0
     }
 
-    /// How many clocks until the counter next reaches zero, or `None` if it
-    /// never will.
+    fn divider(&self) -> u64 {
+        if self.csr & CSR_CLKSOURCE != 0 { 1 } else { REFERENCE_DIVIDER }
+    }
+
+    /// How many core cycles until the counter next reaches zero, or `None`
+    /// if it never will.
     pub fn cycles_to_fire(&self) -> Option<u64> {
+        let divider = self.divider();
+        self.clocks_to_fire().map(|n| n * divider - self.phase)
+    }
+
+    /// Runs the counter for `n` core cycles; true if it reached zero on
+    /// the way with the interrupt enabled.
+    pub fn run(&mut self, n: u64) -> bool {
+        let divider = self.divider();
+        let cycles = self.phase + n;
+        self.phase = cycles % divider;
+        self.advance(cycles / divider)
+    }
+
+    /// How many of its clocks until the counter next reaches zero.
+    fn clocks_to_fire(&self) -> Option<u64> {
         if !self.enabled() {
             None
         } else if self.cvr != 0 {
@@ -543,7 +569,7 @@ impl Scs {
 
     /// Runs the clock for `n` cycles.
     pub fn tick(&mut self, n: u64) {
-        if self.systick.advance(n) {
+        if self.systick.run(n) {
             self.nvic.pend(SYSTICK);
         }
     }
@@ -579,11 +605,12 @@ impl Scs {
         Some(match addr {
             // ICTR: lines in blocks of 32, less one.
             0xE000_E004 if v7 => self.irq_lines / 32 - 1,
-            0xE000_E010 => self.systick.csr | CSR_CLKSOURCE,
+            0xE000_E010 => self.systick.csr,
             0xE000_E014 => self.systick.rvr,
             0xE000_E018 => self.systick.cvr,
-            // CALIB: NOREF, and no calibration value.
-            0xE000_E01C => 1 << 31,
+            // CALIB: a reference clock (NOREF clear) that does not divide
+            // a 10 ms period exactly (SKEW), and no calibration value.
+            0xE000_E01C => 1 << 30,
             0xE000_E100..=0xE000_E33F => {
                 let word = (addr & 0x7F) / 4;
                 if word >= self.irq_lines / 32 || !v7 && word > 0 {
@@ -689,7 +716,13 @@ impl Scs {
         let irq_lines = self.irq_lines;
         let nvic = &mut self.nvic;
         match addr {
-            0xE000_E010 => self.systick.csr = value & (CSR_ENABLE | CSR_TICKINT) | self.systick.csr & CSR_COUNTFLAG,
+            0xE000_E010 => {
+                let csr = value & (CSR_ENABLE | CSR_TICKINT | CSR_CLKSOURCE) | self.systick.csr & CSR_COUNTFLAG;
+                if (csr ^ self.systick.csr) & CSR_CLKSOURCE != 0 {
+                    self.systick.phase = 0;
+                }
+                self.systick.csr = csr;
+            }
             0xE000_E014 => self.systick.rvr = value & 0x00FF_FFFF,
             // Any write clears the counter and COUNTFLAG.
             0xE000_E018 => {

@@ -35,7 +35,7 @@ use armv6m::scs::exception;
 use armv6m::{Event, Machine, Outcome};
 
 use crate::door::{FrontDoor, accept_requests};
-use crate::{cycles_per_ms, describe, ms_at, usage};
+use crate::{PS_PER_MS, describe, ms_at, usage};
 
 /// How long the board sleeps between catching up with the wall clock when
 /// nothing asks anything of it. A message wakes it at once, so this is not
@@ -101,7 +101,6 @@ pub fn main(args: Vec<String>) -> ExitCode {
     }
 
     let Some(part) = armv6m::part::Part::named(&options.part) else { return usage() };
-    crate::set_part_clock(&part);
     let machine = match std::fs::read(&options.image).map_err(|e| e.to_string()).and_then(|b| Machine::new(part, &b)) {
         Ok(machine) => machine,
         Err(e) => {
@@ -207,29 +206,29 @@ impl Board {
 
     /// Restarts the clock from where the board is now.
     fn rebase(&mut self) {
-        let ran = Duration::from_micros(self.machine.cycles * 1000 / cycles_per_ms());
+        let ran = Duration::from_nanos(self.machine.time / 1000);
         self.origin = Instant::now().checked_sub(ran).unwrap_or_else(Instant::now);
     }
 
     fn advance(&mut self) {
-        let due = self.origin.elapsed().as_micros() as u64 * cycles_per_ms() / 1000;
-        let behind = due.saturating_sub(self.machine.cycles);
-        let budget = behind.min(MAX_BEHIND_MS * cycles_per_ms());
-        let outcome = self.machine.run(budget);
-        if behind > MAX_BEHIND_MS * cycles_per_ms() {
+        let due = self.origin.elapsed().as_nanos() as u64 * 1000;
+        let behind = due.saturating_sub(self.machine.time);
+        let budget = behind.min(MAX_BEHIND_MS * PS_PER_MS);
+        let outcome = self.machine.run_until(self.machine.time + budget, u64::MAX);
+        if behind > MAX_BEHIND_MS * PS_PER_MS {
             self.rebase();
         }
         self.report();
         match outcome {
             Outcome::Budget | Outcome::Asleep | Outcome::Halted => {}
             Outcome::SystemReset => {
-                println!("{:>10.3} ms  system reset", ms_at(self.machine.cycles));
+                println!("{:>10.3} ms  system reset", ms_at(self.machine.time));
                 if let Err(e) = self.machine.reset() {
                     println!("zaqaru-m0: reset failed: {e}");
                 }
             }
             outcome => {
-                println!("{:>10.3} ms  halted: {outcome:?}", ms_at(self.machine.cycles));
+                println!("{:>10.3} ms  halted: {outcome:?}", ms_at(self.machine.time));
                 if let Some(stop) = self.debugger.stopped(outcome) {
                     self.send(&stop);
                 }
@@ -360,7 +359,7 @@ impl Board {
              faults      {}\n\
              exceptions  {}\n",
             self.image,
-            ms_at(m.cycles) / 1000.0,
+            ms_at(m.time) / 1000.0,
             self.powered.elapsed().as_secs_f64(),
             m.retired,
             self.faults,

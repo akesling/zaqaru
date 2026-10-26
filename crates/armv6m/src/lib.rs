@@ -36,6 +36,7 @@
 //! to the next event, which is also what makes an idle system cheap to run.
 
 pub mod bus;
+pub mod clock;
 pub mod cmsis_dap;
 pub mod dap;
 pub mod debug;
@@ -115,7 +116,7 @@ pub enum Fault {
 /// Why [`Machine::run`] returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The cycle budget ran out.
+    /// The time or the instructions it was given ran out.
     Budget,
     /// A fault with nowhere to go — inside HardFault itself, or on a bad
     /// vector. A real core stops fetching and waits for a debugger.
@@ -139,19 +140,19 @@ pub enum Outcome {
 }
 
 /// Something a run did that is worth seeing afterwards, stamped with the
-/// cycle it happened on.
+/// simulated time it happened at, in picoseconds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// A GPIO port's output changed.
-    Pin { cycle: u64, edge: gpio::Edge },
+    Pin { time: u64, edge: gpio::Edge },
     /// A USART transmitted a byte.
-    Serial { cycle: u64, byte: usart::Byte },
+    Serial { time: u64, byte: usart::Byte },
     /// The Ethernet controller put a frame on the wire: destination MAC
     /// first, no FCS.
-    Frame { cycle: u64, frame: Vec<u8> },
+    Frame { time: u64, frame: Vec<u8> },
     /// A HardFault was taken. `pc` is the instruction it was taken at;
     /// `mode` and `privileged` say what was running.
-    Fault { cycle: u64, pc: u32, fault: Fault, mode: Mode, privileged: bool },
+    Fault { time: u64, pc: u32, fault: Fault, mode: Mode, privileged: bool },
 }
 
 pub struct Machine {
@@ -169,9 +170,17 @@ pub struct Machine {
     pub(crate) branch_to: Option<u32>,
     pub cpu: Cpu,
     pub bus: Bus,
-    /// Cycles elapsed since power-on: retired instructions, plus whatever
-    /// `wfi` skipped.
+    /// Cycles of the core's clock since power-on: what each instruction
+    /// cost, plus whatever `wfi` slept through.
     pub cycles: u64,
+    /// Simulated time since power-on, in picoseconds: each cycle at the
+    /// core's clock as RCC had it then (see [`clock`]).
+    pub time: u64,
+    /// The core clock's period, in picoseconds.
+    pub period: u64,
+    /// Cycles the instruction executing costs beyond its first: its bus
+    /// accesses' wait states, a taken branch's refill, a divide's.
+    pub(crate) stall: u64,
     pub retired: u64,
     pub events: Vec<Event>,
     /// How many times each exception has been entered.
@@ -193,7 +202,8 @@ pub struct Machine {
     /// SysTick is brought up to date in arrears rather than clocked every
     /// cycle: at the cycle it fires, and whenever anything reads or writes
     /// its registers. These are the cycle it was last brought up to, and
-    /// the cycle it next reaches zero at.
+    /// the time the next timed event is due at — its reaching zero, or a
+    /// peripheral's.
     ticked_at: u64,
     tick_due: u64,
     /// The 32-byte granules each kind of access was recently allowed in,
@@ -244,6 +254,9 @@ impl Machine {
             cpu: Cpu::default(),
             bus: Bus::new(part, image)?,
             cycles: 0,
+            time: 0,
+            period: 1,
+            stall: 0,
             retired: 0,
             events: Vec::new(),
             taken: Box::new([0; scs::exception::COUNT]),
@@ -262,6 +275,7 @@ impl Machine {
             // 150 lines, as ICTR counts them.
             part::Family::H7 => 160,
         };
+        machine.period = clock::Clocks::period(machine.bus.soc.clocks().core);
         machine.reset_core()?;
         Ok(machine)
     }
@@ -275,7 +289,9 @@ impl Machine {
     /// A system reset: the processor and peripherals back to their reset
     /// state, memory left as it was, and the boot vector taken (B1.5.5).
     pub fn reset(&mut self) -> Result<(), String> {
+        self.bus.now = self.time;
         self.bus.reset_soc();
+        self.period = clock::Clocks::period(self.bus.soc.clocks().core);
         self.reset_core()
     }
 
@@ -303,10 +319,19 @@ impl Machine {
         Ok(())
     }
 
-    /// Runs for `budget` cycles, or until something stops it. A halted core
-    /// runs nothing, though a reset asked for still answers; a core told to
-    /// step runs one instruction, even on a budget of none, and halts again.
+    /// Runs for `budget` cycles of the core's clock as it is now, or until
+    /// something stops it: see [`Machine::run_until`].
     pub fn run(&mut self, budget: u64) -> Outcome {
+        let until = self.time.saturating_add(budget.saturating_mul(self.period));
+        self.run_until(until, u64::MAX)
+    }
+
+    /// Runs until simulated time `until`, in picoseconds, or for
+    /// `instructions`, whichever comes first, or until something stops it.
+    /// A halted core runs nothing, though a reset asked for still answers;
+    /// a core told to step runs one instruction, even with no time to run
+    /// it in, and halts again.
+    pub fn run_until(&mut self, until: u64, instructions: u64) -> Outcome {
         if self.bus.scs.reset_requested {
             return Outcome::SystemReset;
         }
@@ -317,7 +342,7 @@ impl Machine {
         // asked for one is owed it, even by a caller with no time to give.
         if self.debug.stepping {
             self.debug.stepping = false;
-            let outcome = self.execute_for(1);
+            let outcome = self.execute_for(u64::MAX, 1);
             if self.debug.halted {
                 return self.settle(outcome);
             }
@@ -325,13 +350,23 @@ impl Machine {
             self.debug.halt(debug::DFSR_HALTED);
             return Outcome::Halted;
         }
-        let outcome = self.execute_for(budget);
+        let outcome = self.execute_for(until, instructions);
         self.settle(outcome)
     }
 
-    fn execute_for(&mut self, budget: u64) -> Outcome {
-        let end = self.cycles.saturating_add(budget);
-        while self.cycles < end {
+    /// Charges `cycles` of the core's clock: the time they take, and
+    /// whatever falls due in it.
+    fn charge(&mut self, cycles: u64) {
+        self.cycles += cycles;
+        self.time += cycles * self.period;
+        if self.time >= self.tick_due {
+            self.sync_systick();
+        }
+    }
+
+    fn execute_for(&mut self, until: u64, instructions: u64) -> Outcome {
+        let last = self.retired.saturating_add(instructions);
+        while self.time < until && self.retired < last {
             if self.bus.scs.reset_requested {
                 return Outcome::SystemReset;
             }
@@ -341,7 +376,10 @@ impl Machine {
             // "asynchronous" on a core this simple.
             if let Some((n, p)) = self.bus.scs.nvic.highest_pending().filter(|_| !self.debug.maskints) {
                 if p < self.priority {
-                    if let Err(outcome) = self.enter(n) {
+                    let entered = self.enter(n);
+                    let stall = std::mem::take(&mut self.stall);
+                    self.charge(stall);
+                    if let Err(outcome) = entered {
                         return outcome;
                     }
                     continue;
@@ -357,8 +395,11 @@ impl Machine {
                 if self.tick_due == u64::MAX {
                     return Outcome::Asleep;
                 }
-                self.cycles = self.tick_due.min(end);
-                self.sync_systick();
+                // Asleep, the clock runs on to whatever is due next: whole
+                // cycles of it, the first that reaches that time.
+                let to = self.tick_due.min(until);
+                let cycles = (to.saturating_sub(self.time)).div_ceil(self.period).max(1);
+                self.charge(cycles);
                 continue;
             }
 
@@ -380,11 +421,9 @@ impl Machine {
                     }
                 }
             }
-            self.cycles += 1;
             self.retired += 1;
-            if self.cycles >= self.tick_due {
-                self.sync_systick();
-            }
+            let stall = std::mem::take(&mut self.stall);
+            self.charge(1 + stall);
         }
         Outcome::Budget
     }
@@ -414,14 +453,31 @@ impl Machine {
             self.bus.scs.tick(elapsed);
         }
         self.ticked_at = self.cycles;
-        self.tick_due = self.bus.scs.systick.cycles_to_fire().map_or(u64::MAX, |n| self.cycles + n);
+        // A store to RCC may have changed the core's clock: from here on a
+        // cycle is the new clock's.
+        self.period = clock::Clocks::period(self.bus.soc.clocks().core);
+        self.tick_due = self
+            .bus
+            .scs
+            .systick
+            .cycles_to_fire()
+            .map_or(u64::MAX, |n| self.time.saturating_add(n.saturating_mul(self.period)));
         if let Some(due) = self.bus.soc.due() {
-            if due <= self.cycles {
-                self.bus.soc.advance(self.cycles);
+            if due <= self.time {
+                self.bus.soc.advance(self.time);
+                self.drain_edges();
                 self.sample_interrupts();
             }
             self.tick_due = self.tick_due.min(self.bus.soc.due().unwrap_or(u64::MAX));
         }
+    }
+
+    /// When the next timed event is due, in picoseconds: SysTick reaching
+    /// zero, or a peripheral's timer or transfer.
+    pub fn next_due(&mut self) -> Option<u64> {
+        self.bus.now = self.time;
+        self.sync_systick();
+        (self.tick_due != u64::MAX).then_some(self.tick_due)
     }
 
     /// Whether an access at `addr` reaches SysTick, and so must find it
@@ -433,7 +489,7 @@ impl Machine {
     /// Reads memory as a debugger does: no permission check, no side
     /// effects. `None` if any of it is unmapped.
     pub fn debug_read(&mut self, addr: u32, len: usize) -> Option<Vec<u8>> {
-        self.bus.now = self.cycles;
+        self.bus.now = self.time;
         if Self::touches_systick(addr, len as u32) {
             self.sync_systick();
         }
@@ -453,7 +509,7 @@ impl Machine {
     /// the whole word at once — and bytes elsewhere. False if any of it
     /// was refused.
     pub fn debug_write(&mut self, addr: u32, bytes: &[u8]) -> bool {
-        self.bus.now = self.cycles;
+        self.bus.now = self.time;
         let mut at = 0;
         while at < bytes.len() {
             let a = addr.wrapping_add(at as u32);
@@ -504,7 +560,7 @@ impl Machine {
     /// above — is a lockup.
     pub(crate) fn fault(&mut self, fault: Fault) -> Result<(), Outcome> {
         self.events.push(Event::Fault {
-            cycle: self.cycles,
+            time: self.time,
             pc: self.cpu.pc,
             fault,
             mode: self.cpu.mode,
@@ -555,12 +611,12 @@ impl Machine {
     /// Moves the GPIO edges and the serial bytes a store produced into the
     /// event log.
     pub(crate) fn drain_edges(&mut self) {
-        let cycle = self.cycles;
+        let time = self.time;
         let (edges, serial) = self.bus.soc.outputs();
-        self.events.extend(edges.drain(..).map(|edge| Event::Pin { cycle, edge }));
-        self.events.extend(serial.drain(..).map(|byte| Event::Serial { cycle, byte }));
+        self.events.extend(edges.drain(..).map(|edge| Event::Pin { time, edge }));
+        self.events.extend(serial.drain(..).map(|byte| Event::Serial { time, byte }));
         if let Some(frames) = self.bus.soc.frames() {
-            self.events.extend(frames.drain(..).map(|frame| Event::Frame { cycle, frame }));
+            self.events.extend(frames.drain(..).map(|frame| Event::Frame { time, frame }));
         }
     }
 

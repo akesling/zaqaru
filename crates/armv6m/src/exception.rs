@@ -108,7 +108,7 @@ impl Machine {
             Some(why) => {
                 let fault = Fault::Stacking { exception: n };
                 self.events.push(crate::Event::Fault {
-                    cycle: self.cycles,
+                    time: self.time,
                     pc: self.cpu.pc,
                     fault,
                     mode: self.cpu.mode,
@@ -326,7 +326,7 @@ impl Machine {
         };
         let exception = self.cpu.ipsr;
         self.events.push(crate::Event::Fault {
-            cycle: self.cycles,
+            time: self.time,
             pc: self.cpu.pc,
             fault: Fault::Unstacking { exception },
             mode,

@@ -25,15 +25,22 @@
 //!
 //! # Time
 //!
-//! The board runs at its part's clock — 16 MHz for a G0, 400 MHz for an
-//! H7 — of *simulated* time per second of the container's monotonic clock, advanced at the points the scheduler
-//! already crosses to the host — a process finishing its slice, and the
-//! container going idle — and so at points that are a pure function of
-//! execution, against clock readings that are store answers and so on the
-//! tape. A recorded run replays the board too. A halted board's time
-//! stands still, as SysTick's does under a debugger, and a board that
-//! falls more than [`MAX_BEHIND_NS`] behind gives the time up rather than
-//! racing to make it up.
+//! The board keeps simulated time (`armv6m::Machine::time`, in
+//! picoseconds), each instruction costing cycles of the core's clock as
+//! RCC sets it. By default a second of it passes per second of the
+//! container's monotonic clock; [`Speed`] scales that, or lets the board
+//! run as fast as it can with its idle time skipped, and it can be paused
+//! and moved on by a given time or to its next event — from `/dev/board`
+//! (`speed`, `pause`, `resume`, `advance`) and from a debugger's `monitor`
+//! commands, which are the same words.
+//!
+//! It is advanced at the points the scheduler already crosses to the host
+//! — a process finishing its slice, and the container going idle — and so
+//! at points that are a pure function of execution, against clock readings
+//! that are store answers and so on the tape. A recorded run replays the
+//! board too. A halted board's time stands still, as SysTick's does under
+//! a debugger, and a board that falls more than [`MAX_BEHIND_NS`] behind
+//! gives the time up rather than racing to make it up.
 //!
 //! # The probe
 //!
@@ -75,6 +82,71 @@ pub const MAX_BEHIND_NS: u64 = 250_000_000;
 /// when nobody is looking, and how bunched its events are.
 pub const TICK_NS: u64 = 20_000_000;
 
+/// How fast the board's simulated time runs against the container's clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Speed {
+    /// Simulated time at this many thousandths of the container's: 1000 is
+    /// real time.
+    Scaled(u64),
+    /// As much as the container can run: instructions in proportion to
+    /// the container's time, and the board's idle time skipped.
+    Max,
+}
+
+impl Speed {
+    /// `1`, `0.25`, `10`, `max`.
+    fn parse(text: &str) -> Option<Speed> {
+        if text == "max" {
+            return Some(Speed::Max);
+        }
+        let factor: f64 = text.trim_end_matches(['x', '×']).parse().ok()?;
+        let permille = (factor * 1000.0).round();
+        (1.0..=1_000_000.0).contains(&permille).then_some(Speed::Scaled(permille as u64))
+    }
+
+    fn show(&self) -> String {
+        match self {
+            Speed::Scaled(permille) => format!("{}×", *permille as f64 / 1000.0),
+            Speed::Max => "max".to_string(),
+        }
+    }
+}
+
+/// At [`Speed::Max`], instructions the board runs per microsecond of the
+/// container's time, and the most and least it runs at a time.
+const MAX_RATE: u64 = 50;
+const MAX_INSTRUCTIONS: u64 = 5_000_000;
+const MIN_INSTRUCTIONS: u64 = 10_000;
+
+/// `10ms`, `250us`, `2s`, `1000cycles`, in picoseconds at a clock whose
+/// cycle is `period` of them.
+fn parse_duration(text: &str, period: u64) -> Option<u64> {
+    let split = text.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let scale = match unit.trim() {
+        "ps" => 1.0,
+        "ns" => 1e3,
+        "us" | "µs" => 1e6,
+        "ms" | "" => 1e9,
+        "s" => 1e12,
+        "cycle" | "cycles" => period as f64,
+        _ => return None,
+    };
+    let ps = number * scale;
+    (ps >= 0.0 && ps < 1e18).then_some(ps as u64)
+}
+
+/// A frequency as a person reads it: `400 MHz`, `32.768 kHz`.
+fn hz(hz: u64) -> String {
+    match hz {
+        0 => "off".to_string(),
+        hz if hz % 1_000_000 == 0 => format!("{} MHz", hz / 1_000_000),
+        hz if hz >= 1_000_000 => format!("{:.3} MHz", hz as f64 / 1e6),
+        hz => format!("{} kHz", hz as f64 / 1e3),
+    }
+}
+
 /// The board, as the kernel holds it: absent until the first look, then
 /// either nothing (no configuration) or a board.
 #[derive(Default)]
@@ -96,9 +168,17 @@ pub struct Board {
     listener: u32,
     pub probe: Address,
     client: Option<Client>,
-    /// The monotonic instant simulated time zero corresponds to; `None`
-    /// until the first reading.
+    /// The monotonic instant simulated time zero corresponds to, at the
+    /// speed it runs at; `None` until the first reading.
     origin: Option<u64>,
+    pub speed: Speed,
+    /// Whether simulated time stands still, a debugger or not.
+    pub paused: bool,
+    /// How fast simulated time has actually been going against the
+    /// container's: measured over a second or so, from the reading and the
+    /// simulated time at its start.
+    rate: (u64, u64),
+    ratio: f64,
     /// The last monotonic reading the board was moved on at.
     pub now: u64,
     /// The board's LEDs, and whether each is lit, if it has been driven.
@@ -316,7 +396,9 @@ impl Board {
     ///   at the other end of its Ethernet cable, and `ping` an echo
     ///   request; what comes back is in the board's state;
     /// - `temperature 31.5` is what the temperature sensors on its buses
-    ///   read, in degrees Celsius.
+    ///   read, in degrees Celsius;
+    /// - `speed`, `pause`, `resume` and `advance`: see
+    ///   [`Board::clock_command`].
     pub fn command(&mut self, line: &str) -> Result<(), String> {
         let (verb, rest) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
         match verb {
@@ -346,6 +428,7 @@ impl Board {
                 self.usb_probe = Probe::default();
                 self.usb_responses.clear();
                 self.rebase(self.now);
+                self.rate = (self.now, 0);
                 self.console.push(format!(
                     "board: now an {} with {} KiB of flash, erased and halted",
                     part.name.to_ascii_uppercase(),
@@ -368,6 +451,7 @@ impl Board {
                 let frames = self.host.ping(self.pings);
                 self.send_frames(frames)
             }
+            "speed" | "pause" | "resume" | "advance" => self.clock_command(verb, rest.trim()).map(|_| ()),
             "temperature" => {
                 let celsius: f64 =
                     rest.trim().parse().map_err(|_| format!("temperature `{}`: expected degrees Celsius", rest.trim()))?;
@@ -396,7 +480,7 @@ impl Board {
                 Ok(())
             }
             "" => Ok(()),
-            other => Err(format!("`{other}`: the board takes `part NAME`, `image TEXT`, `pin PIN LEVEL`, `udp PORT TEXT`, `ping` and `temperature C`")),
+            other => Err(format!("`{other}`: the board takes `part NAME`, `image TEXT`, `pin PIN LEVEL`, `udp PORT TEXT`, `ping`, `temperature C`, `speed X`, `pause`, `resume` and `advance D`")),
         }
     }
 
@@ -410,32 +494,129 @@ impl Board {
         Ok(())
     }
 
+    /// The board's clock, from a command's verb and what follows it:
+    ///
+    /// - `speed X` runs simulated time at X times the container's (`1`,
+    ///   `0.25`, `10`), or `speed max` as fast as the container can;
+    /// - `pause` stops it, a debugger or not, and `resume` lets it go;
+    /// - `advance D` moves it on by D — `10ms`, `250us`, `2s`, `1000cycles`
+    ///   — or `advance next` to whatever is next due: SysTick, a timer, a
+    ///   transfer finishing;
+    /// - `time` says where it is.
+    ///
+    /// What it says back is a line for whoever asked.
+    pub fn clock_command(&mut self, verb: &str, rest: &str) -> Result<String, String> {
+        match verb {
+            "speed" if rest.is_empty() => {}
+            "speed" => {
+                self.speed = Speed::parse(rest).ok_or_else(|| format!("speed `{rest}`: a factor, `1` or `0.25`, or `max`"))?;
+                self.rebase(self.now);
+                self.rate = (self.now, self.machine.time);
+            }
+            "pause" => self.paused = true,
+            "resume" => {
+                self.paused = false;
+                self.rebase(self.now);
+            }
+            "advance" => {
+                if self.machine.halted() {
+                    return Err("the core is halted: its debugger moves it".into());
+                }
+                let to = if rest == "next" {
+                    self.machine.next_due().ok_or("nothing is due: no timer is running")?
+                } else {
+                    let by = parse_duration(rest, self.machine.period)
+                        .ok_or_else(|| format!("advance `{rest}`: a time, `10ms`, `250us`, `1000cycles`, or `next`"))?;
+                    self.machine.time.saturating_add(by)
+                };
+                let outcome = self.machine.run_until(to, u64::MAX);
+                self.collect();
+                self.after(outcome);
+                self.rebase(self.now);
+            }
+            "time" => {}
+            other => return Err(format!("`{other}`: the clock takes `speed X`, `pause`, `resume`, `advance D` and `time`")),
+        }
+        Ok(self.clock_line())
+    }
+
+    /// Where the board's clock is: simulated time, the speed asked for and
+    /// the speed it is managing, and the clocks RCC gives out.
+    pub fn clock_line(&self) -> String {
+        let state = if self.paused { ", paused" } else if self.machine.halted() { ", halted" } else { "" };
+        format!(
+            "time {:.6} s simulated, speed {}{state}, managing {:.3}× the container's; {}\n",
+            self.machine.time as f64 / 1e12,
+            self.speed.show(),
+            self.ratio,
+            self.clocks_text(),
+        )
+    }
+
+    fn clocks_text(&self) -> String {
+        let c = self.machine.bus.soc.clocks();
+        let pclk: Vec<String> = match self.machine.bus.soc {
+            armv6m::bus::Soc::H7(_) => c.pclk.iter().map(|&f| hz(f)).collect(),
+            armv6m::bus::Soc::G0(_) => vec![hz(c.pclk[0])],
+        };
+        format!("core {}, AHB {}, APB {}", hz(c.core), hz(c.hclk), pclk.join(" / "))
+    }
+
     /// The instant, in monotonic nanoseconds, by which an idle container
     /// should wake to move the board on — `None` when it is halted, since
-    /// then only a debugger moves it.
+    /// then only a debugger moves it, or paused; at once when it runs as
+    /// fast as it can.
     pub fn wake(&self) -> Option<u64> {
-        (!self.machine.halted()).then_some(self.now + TICK_NS)
+        if self.machine.halted() || self.paused {
+            return None;
+        }
+        Some(match self.speed {
+            Speed::Max => self.now,
+            Speed::Scaled(_) => self.now + TICK_NS,
+        })
     }
 
     /// Brings simulated time up to `now`.
     fn advance(&mut self, now: u64) {
         let origin = *self.origin.get_or_insert(now);
-        self.now = now;
-        // A halted board's time stands still; a reset asked for while
-        // halted is still taken.
-        if self.machine.halted() && !self.machine.bus.scs.reset_requested {
+        let last = std::mem::replace(&mut self.now, now);
+        // A halted or paused board's time stands still; a reset asked for
+        // while halted is still taken.
+        if self.paused || self.machine.halted() && !self.machine.bus.scs.reset_requested {
             self.rebase(now);
+            self.rate = (now, self.machine.time);
             return;
         }
-        let mhz = self.mhz();
-        let due = now.saturating_sub(origin) / 1000 * mhz;
-        let behind = due.saturating_sub(self.machine.cycles);
-        let budget = behind.min(MAX_BEHIND_NS / 1000 * mhz);
-        let outcome = self.machine.run(budget);
-        if behind > budget {
-            self.rebase(now);
+        let outcome = match self.speed {
+            // Elapsed nanoseconds at so many thousandths are picoseconds.
+            Speed::Scaled(permille) => {
+                let due = now.saturating_sub(origin) * permille;
+                let behind = due.saturating_sub(self.machine.time);
+                let limit = MAX_BEHIND_NS * permille;
+                let outcome = self.machine.run_until(self.machine.time + behind.min(limit), u64::MAX);
+                if behind > limit {
+                    self.rebase(now);
+                }
+                outcome
+            }
+            Speed::Max => {
+                let instructions = (now.saturating_sub(last) / 1000 * MAX_RATE).clamp(MIN_INSTRUCTIONS, MAX_INSTRUCTIONS);
+                let outcome = self.machine.run_until(u64::MAX, instructions);
+                self.rebase(now);
+                outcome
+            }
+        };
+        if now.saturating_sub(self.rate.0) >= 1_000_000_000 {
+            let simulated = self.machine.time.saturating_sub(self.rate.1) as f64 / 1000.0;
+            self.ratio = simulated / now.saturating_sub(self.rate.0) as f64;
+            self.rate = (now, self.machine.time);
         }
         self.collect();
+        self.after(outcome);
+    }
+
+    /// What a run's ending means: a reset taken, or a halt reported.
+    fn after(&mut self, outcome: Outcome) {
         match outcome {
             Outcome::Budget | Outcome::Asleep | Outcome::Halted => {}
             Outcome::SystemReset => self.take_reset(),
@@ -463,24 +644,22 @@ impl Board {
     }
 
     /// Restarts the clock from where the board is: simulated time now
-    /// corresponds to `now`.
+    /// corresponds to `now`, at the speed it runs at.
     fn rebase(&mut self, now: u64) {
-        let ran = self.machine.cycles / self.mhz() * 1000;
-        self.origin = Some(now.saturating_sub(ran));
+        let permille = match self.speed {
+            Speed::Scaled(permille) => permille,
+            Speed::Max => 1000,
+        };
+        self.origin = Some(now.saturating_sub(self.machine.time / permille));
     }
 
-    /// The board's clock, in cycles per microsecond: its part's.
-    fn mhz(&self) -> u64 {
-        self.machine.part.mhz()
-    }
-
-    /// Simulated milliseconds at `cycle`.
-    fn ms(&self, cycle: u64) -> f64 {
-        cycle as f64 / (self.mhz() * 1000) as f64
+    /// Simulated milliseconds at `time`, in picoseconds.
+    fn ms(&self, time: u64) -> f64 {
+        time as f64 / 1e9
     }
 
     fn stamp(&self) -> String {
-        format!("[board {:>10.3} ms]", self.ms(self.machine.cycles))
+        format!("[board {:>10.3} ms]", self.ms(self.machine.time))
     }
 
     /// Turns the machine's events into console lines and board state.
@@ -490,8 +669,8 @@ impl Board {
             match event {
                 // Only an LED's edges reach the console: an H7 Hubris toggles
                 // its profiling pins at every system call.
-                Event::Pin { cycle, edge: Edge { port, before, after } } => {
-                    let at = self.ms(cycle);
+                Event::Pin { time, edge: Edge { port, before, after } } => {
+                    let at = self.ms(time);
                     let several = self.leds.len() > 1;
                     for (led, lit) in &mut self.leds {
                         if port != led.port || (before ^ after) & 1 << led.pin == 0 {
@@ -516,7 +695,7 @@ impl Board {
                     }
                 }
                 // What the board sends reaches the host, which may answer.
-                Event::Frame { cycle, frame } => {
+                Event::Frame { time, frame } => {
                     let (replies, heard) = self.host.receive(&frame);
                     for reply in replies {
                         self.machine.deliver(reply);
@@ -529,16 +708,16 @@ impl Board {
                         }
                         self.heard_count += 1;
                         let line = heard_line(&heard);
-                        self.console.push(format!("[board {:>10.3} ms] the host heard {line}", self.ms(cycle)));
+                        self.console.push(format!("[board {:>10.3} ms] the host heard {line}", self.ms(time)));
                         self.heard.push_back((self.heard_count, line));
                         if self.heard.len() > HEARD_KEPT {
                             self.heard.pop_front();
                         }
                     }
                 }
-                Event::Fault { cycle, pc, fault, mode, privileged } => {
+                Event::Fault { time, pc, fault, mode, privileged } => {
                     self.faults += 1;
-                    let at = self.ms(cycle);
+                    let at = self.ms(time);
                     self.console.push(format!(
                         "[board {at:>10.3} ms] fault at pc=0x{pc:08x} ({mode:?}, {}): {fault:?}",
                         if privileged { "privileged" } else { "unprivileged" }
@@ -578,6 +757,17 @@ impl Board {
                     }
                     let payload = String::from_utf8_lossy(&buffer[at + 1..at + hash]).into_owned();
                     at += hash + 3;
+                    // The board's clock answers its own `monitor` commands,
+                    // which a probe would not know.
+                    if let Some(command) = gdb::monitor(&payload) {
+                        let (verb, rest) = command.split_once(' ').unwrap_or((&command, ""));
+                        if matches!(verb, "speed" | "pause" | "resume" | "advance" | "time") {
+                            let said = self.clock_command(verb, rest.trim()).unwrap_or_else(|why| format!("{why}\n"));
+                            self.reply(&format!("+{}{}", gdb::frame(&gdb::output(&said)), gdb::frame("OK")));
+                            self.collect();
+                            continue;
+                        }
+                    }
                     let was_halted = self.machine.halted();
                     match self.debugger.packet(&mut self.machine, &payload) {
                         Response::Reply(reply) => self.reply(&format!("+{}", gdb::frame(&reply))),
@@ -701,14 +891,22 @@ impl Board {
             _ => String::new(),
         };
         format!(
-            r#"{{"chip":{},"core":{},"image":{},"state":{},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"wired":[{}],"exceptions":{{{}}},"registers":{{{}}}}}"#,
+            r#"{{"chip":{},"core":{},"image":{},"state":{},"speed":{},"paused":{},"ratio":{:.4},"clocks":{{{}}},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"wired":[{}],"exceptions":{{{}}},"registers":{{{}}}}}"#,
             quoted(&self.chip),
             quoted(core_name(m.core)),
             quoted(&self.image),
             quoted(if self.machine.halted() { "halted" } else { "running" }),
+            quoted(&self.speed.show()),
+            self.paused,
+            self.ratio,
+            {
+                let c = m.bus.soc.clocks();
+                let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+                format!(r#""core":{},"hclk":{},"pclk":[{}],"timers":[{}]"#, c.core, c.hclk, list(&c.pclk), list(&c.timers))
+            },
             quoted(&format!("{:?}", cpu.mode)),
             cpu.privileged(),
-            self.ms(m.cycles),
+            self.ms(m.time),
             m.retired,
             lit_json(self.leds.first().and_then(|&(_, lit)| lit)),
             self.leds.first().map_or("null".into(), |(led, _)| quoted(&led.name())),
@@ -736,9 +934,10 @@ impl Board {
     /// show it.
     pub fn status(&self) -> String {
         let m = &self.machine;
-        let state = match self.machine.halted() {
-            true => format!("halted at pc=0x{:08x}", m.cpu.pc),
-            false => "running".to_string(),
+        let state = match (self.machine.halted(), self.paused) {
+            (true, _) => format!("halted at pc=0x{:08x}", m.cpu.pc),
+            (false, true) => "paused".to_string(),
+            (false, false) => "running".to_string(),
         };
         let leds: Vec<String> = self
             .leds
@@ -773,12 +972,15 @@ impl Board {
             .collect();
         let wired: String = m.wired().iter().map(|line| format!("wired       {line}\n")).collect();
         format!(
-            "board       {} (emulated {}), in the kernel\nimage       {}\nstate       {state}\ntime        {:.3} s simulated, {} instructions\n{leds}\nfaults      {}\nexceptions  {}\n{wired}{network}",
+            "board       {} (emulated {}), in the kernel\nimage       {}\nstate       {state}\ntime        {:.6} s simulated, {} instructions\nspeed       {}, managing {:.3}× the container's clock\nclocks      {}\n{leds}\nfaults      {}\nexceptions  {}\n{wired}{network}",
             self.chip,
             core_name(m.core),
             self.image,
-            self.ms(m.cycles) / 1000.0,
+            self.ms(m.time) / 1000.0,
             m.retired,
+            self.speed.show(),
+            self.ratio,
+            self.clocks_text(),
             self.faults,
             taken.join(", "),
         )
@@ -915,6 +1117,10 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             probe,
             client: None,
             origin: None,
+            speed: Speed::Scaled(1000),
+            paused: false,
+            rate: (0, 0),
+            ratio: 0.0,
             now: 0,
             leds: configuration.leds.into_iter().map(|led| (led, None)).collect(),
             serial: Vec::new(),
@@ -1028,6 +1234,20 @@ mod tests {
         let wired = parse("chip stm32h753\nimage /f.bin\ni2c I2C2 0x48 tmp117\nspi SPI3 PA15 rot PD0\n").unwrap();
         assert_eq!(wired.wiring, ["i2c I2C2 0x48 tmp117", "spi SPI3 PA15 rot PD0"]);
         assert!(parse("image /f.bin\ni2c I2C2 0x48 lm75").is_err());
+    }
+
+    #[test]
+    fn speeds_and_durations_read_as_written() {
+        assert_eq!(Speed::parse("1"), Some(Speed::Scaled(1000)));
+        assert_eq!(Speed::parse("0.25×"), Some(Speed::Scaled(250)));
+        assert_eq!(Speed::parse("max"), Some(Speed::Max));
+        assert_eq!(Speed::parse("0"), None);
+        assert_eq!(parse_duration("10ms", 2500), Some(10_000_000_000));
+        assert_eq!(parse_duration("250us", 2500), Some(250_000_000));
+        assert_eq!(parse_duration("1000cycles", 2500), Some(2_500_000));
+        assert_eq!(parse_duration("2 fortnights", 2500), None);
+        assert_eq!(hz(400_000_000), "400 MHz");
+        assert_eq!(hz(32_768), "32.768 kHz");
     }
 
     #[test]

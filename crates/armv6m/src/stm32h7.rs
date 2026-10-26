@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::clock::Clocks;
 use crate::devices::{SpiPart, Wiring};
 use crate::eth_h7::{self, Ethernet};
 use crate::flash_h7;
@@ -78,9 +79,10 @@ const TIMERS: [(u32, u32, bool); 9] = [
     (0x4001_4400, 117, false),
     (0x4001_4800, 118, false),
 ];
-/// Core cycles per tick of the timers' kernel clock: Hubris runs APB1 and
-/// APB2 at a quarter of the core, and their timers at twice that.
-const TIMER_DIVIDER: u64 = 2;
+/// HSI's frequency, which the H7 runs on out of reset.
+const HSI: u64 = 64_000_000;
+/// How many of [`TIMERS`] are on APB1; the rest are on APB2.
+const APB1_TIMERS: usize = 6;
 const PERIPHERAL: u32 = 0x400;
 
 const FLASH_IRQ: u32 = 4;
@@ -138,6 +140,9 @@ pub struct Stm32h7 {
     pub spi_parts: Vec<SpiWired>,
     timers: Vec<Timer>,
     pub eth: Ethernet,
+    /// What RCC's registers make of the oscillators, worked out again
+    /// whenever they are written.
+    pub clocks: Clocks,
 }
 
 /// A part on a SPI bus: its controller, its chip-select, and whether that
@@ -178,8 +183,9 @@ impl Default for Stm32h7 {
             i2cs: Default::default(),
             spis: Default::default(),
             spi_parts: Vec::new(),
-            timers: TIMERS.iter().map(|&(_, _, wide)| Timer::new(wide, TIMER_DIVIDER)).collect(),
+            timers: TIMERS.iter().map(|&(_, _, wide)| Timer::new(wide, Clocks::period(HSI))).collect(),
             eth: Ethernet::default(),
+            clocks: Clocks::reset(HSI),
         };
         soc.rcc[0xD0 / 4] = RSR_POR | RSR_PIN | RSR_BOR | RSR_D2 | RSR_D1 | RSR_CPU;
         soc.rng.state = 0x2545_F491;
@@ -190,10 +196,25 @@ impl Default for Stm32h7 {
 
 impl Stm32h7 {
     /// A system reset: what software reset, and RSR saying so.
-    pub fn reset(&mut self, flash: &mut [u8]) {
+    pub fn reset(&mut self, flash: &mut [u8], now: u64) {
         self.rcc[0xD0 / 4] |= RSR_SFT | RSR_PIN | RSR_CPU;
         self.reset_registers();
         self.flash_interface.reset(flash);
+        self.reclock(now);
+    }
+
+    /// Works the clocks out again from RCC, and gives the timers their new
+    /// kernel clocks from `now`.
+    fn reclock(&mut self, now: u64) {
+        let clocks = Clocks::h7(&self.rcc);
+        if clocks == self.clocks {
+            return;
+        }
+        self.clocks = clocks;
+        for (n, timer) in self.timers.iter_mut().enumerate() {
+            let bus = usize::from(n >= APB1_TIMERS);
+            timer.set_period(Clocks::period(clocks.timers[bus]), now);
+        }
     }
 
     fn reset_registers(&mut self) {
@@ -564,6 +585,7 @@ impl Stm32h7 {
             self.timers[n].write(offset, value, now);
         } else if (RCC..RCC + 0x400).contains(&addr) {
             self.rcc_write(addr - RCC, value);
+            self.reclock(now);
         } else if (PWR..PWR + 0x80).contains(&addr) {
             self.pwr[((addr - PWR) / 4) as usize] = value;
         } else if let Some((port, offset)) = Self::port(addr) {
@@ -748,7 +770,7 @@ mod tests {
         }
 
         fn reset(&mut self, flash: &mut [u8]) {
-            self.0.reset(flash)
+            self.0.reset(flash, 0)
         }
 
         fn drive(&mut self, port: usize, pin: u8, level: Option<bool>) {

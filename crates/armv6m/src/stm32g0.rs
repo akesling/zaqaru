@@ -220,6 +220,11 @@ impl Stm32g0 {
     /// enable bit, and the system-clock switch status as the switch. A real
     /// part takes microseconds to get there; software polls until it has,
     /// and here the first poll succeeds.
+    /// The clocks RCC gives out: see [`crate::clock`].
+    pub fn clocks(&self) -> crate::clock::Clocks {
+        crate::clock::Clocks::g0(&self.rcc)
+    }
+
     fn rcc_read(&self, offset: u32) -> u32 {
         let v = self.rcc[(offset / 4) as usize];
         let follow = |v: u32, enable: u32, ready: u32| v & !(1 << ready) | (v >> enable & 1) << ready;

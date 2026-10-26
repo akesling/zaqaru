@@ -124,6 +124,15 @@ const HELP: &str = "\
     humility -p VID:PID …   the same against a probe connected from the
                             page — its USB panel, 'connect a USB
                             device…' — on real hardware
+    clock                   the board's simulated time, its speed, and the
+                            clocks RCC gives out
+    speed X                 run simulated time at X times real time — 0.1,
+                            1, 10 — or `speed max`: as fast as it can,
+                            idle time skipped
+    pause, resume           stop the board's time, and let it go
+    advance D               move a paused board on by D — 10ms, 250us,
+                            1000cycles — or `advance next`, to whatever
+                            is due next
     board                   the board itself: state, time, LED, faults
     exit                    end the session
 ";
@@ -191,6 +200,14 @@ fn session(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
                 door.network(&format!("udp {port} {text}\n"), &out)?
             }
             Some("ping") => door.network("ping\n", &out)?,
+            Some(verb @ ("speed" | "pause" | "resume" | "advance")) => {
+                let line = format!("{verb} {}\n", words[1..].join(" "));
+                if std::fs::write("/dev/board", line).is_err() {
+                    out.write_all(b"the board would not; `help` says what it takes\n")?;
+                }
+                out.write_all(door.clock().as_bytes())?;
+            }
+            Some("clock") => out.write_all(door.clock().as_bytes())?,
             Some("temperature") => {
                 let line = format!("temperature {}\n", words.get(1).map_or("", String::as_str));
                 match std::fs::write("/dev/board", line) {
@@ -202,7 +219,7 @@ fn session(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
                 Some(name) => door.flash(name, &out)?,
                 None => out.write_all(b"flash NAME: an archive `archives` lists, or one uploaded\n")?,
             },
-            Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, button, udp, ping, temperature, flash, help and exit\n").as_bytes())?,
+            Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, clock, speed, pause, resume, advance, button, udp, ping, temperature, flash, help and exit\n").as_bytes())?,
         }
         out.write_all(PROMPT)?;
     }
@@ -333,6 +350,17 @@ impl FrontDoor {
             out.write_all(b"nothing came back\n")?;
         }
         Ok(())
+    }
+
+    /// The board's clock: the lines of its state about time.
+    fn clock(&self) -> String {
+        let status = (self.status)().unwrap_or_default();
+        let lines: String = status
+            .lines()
+            .filter(|line| ["state", "time", "speed", "clocks"].iter().any(|key| line.starts_with(key)))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        if lines.is_empty() { "no board answered\n".to_string() } else { lines }
     }
 
     /// `flash NAME`: the board becomes the part the archive was built for,

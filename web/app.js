@@ -720,6 +720,19 @@ async function uploadToTerminal(file) {
   if (!playing && finished === null) $("play").click();
 }
 
+/// A command for the board's clock, through the bench's front door as a
+/// typed one would go — so a recording has it — on a session of its own,
+/// whose answers nobody reads.
+let controlId = null;
+function boardControl(line) {
+  if (controlId === null) {
+    controlId = nextRequest++;
+    worker.postMessage({ type: "open", id: controlId, port: terminalPort });
+  }
+  worker.postMessage({ type: "write", id: controlId, data: line + "\n" });
+  if (!playing && finished === null) $("play").click();
+}
+
 function openTerminal() {
   terminalId = nextRequest++;
   worker.postMessage({ type: "open", id: terminalId, port: terminalPort });
@@ -1003,11 +1016,32 @@ const renderers = {
     const lit = leds.map((led) => `${escape(led.pin)} ${escape(led.state ?? "never driven")}`).join(", ");
     const heard = (value.heard ?? []).slice(-4).map((line) => `<div class="dim">heard ${escape(line)}</div>`).join("");
     const wired = (value.wired ?? []).map((line) => `<div class="dim">wired ${escape(line)}</div>`).join("");
+    // The board's clock, and — on a bench with a front door to send them
+    // through — the controls for it.
+    const hz = (f) => (!f ? "off" : f % 1e6 === 0 ? `${f / 1e6} MHz` : f >= 1e6 ? `${(f / 1e6).toFixed(3)} MHz` : `${f / 1e3} kHz`);
+    const clocks = value.clocks
+      ? `core ${hz(value.clocks.core)} · AHB ${hz(value.clocks.hclk)} · APB ${[...new Set(value.clocks.pclk)].map(hz).join(" / ")}`
+      : "";
+    const speeds = ["0.1×", "1×", "10×", "max"]
+      .map((s) => `<button type="button" data-clock="speed ${s.replace("×", "")}"${value.speed === s ? ' class="on"' : ""}>${s}</button>`)
+      .join("");
+    const controls = terminalPort
+      ? `<span class="controls">${speeds}
+          <button type="button" data-clock="${value.paused ? "resume" : "pause"}">${value.paused ? "resume" : "pause"}</button>
+          <button type="button" data-clock="advance 1ms" title="move the board on by a millisecond">+1 ms</button>
+          <button type="button" data-clock="advance 100ms">+100 ms</button>
+          <button type="button" data-clock="advance next" title="to whatever is due next: SysTick, a timer, a transfer">next event</button></span>`
+      : "";
+    const clock = value.speed
+      ? `<div class="clock">${value.paused ? "<b>paused</b> · " : ""}speed ${escape(value.speed)} · managing ${(value.ratio ?? 0).toFixed(3)}× real time ${controls}</div>
+      <div class="dim">${clocks}</div>`
+      : "";
     // What the USARTs sent, the tail of it, as a serial console shows it.
     const serial = value.serial ? `<div class="key">serial</div><pre class="serial">${escape(value.serial.slice(-2000))}</pre>` : "";
     panel.body.innerHTML = `<div class="board">
       <div class="leds">${lamps}</div>
       <div><b>${escape(value.chip)}</b>${value.core ? ` (${escape(value.core)})` : ""} · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated</div>
+      ${clock}
       <div>LED${leds.length > 1 ? "s" : ""} ${lit || "none"} · ${value.faults} faults · probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
       ${wired}
       ${heard}
@@ -1018,6 +1052,10 @@ const renderers = {
     </div>`;
     const transcript = panel.body.querySelector(".serial");
     if (transcript) transcript.scrollTop = transcript.scrollHeight;
+    panel.body.onclick = (event) => {
+      const button = event.target.closest("[data-clock]");
+      if (button) boardControl(button.dataset.clock);
+    };
   },
 
   processes(value, panel, state) {

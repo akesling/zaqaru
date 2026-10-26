@@ -20,24 +20,14 @@ mod zip;
 mod serve;
 
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use armv6m::scs::exception;
 use armv6m::stm32g0::Edge;
 use armv6m::{Event, Machine, Outcome};
 
-/// Hubris's G0 demo runs SysTick off the 16 MHz HSI.
-/// The board's clock, in cycles per millisecond: its part's.
-static CYCLES_PER_MS: AtomicU64 = AtomicU64::new(16_000);
-
-pub(crate) fn cycles_per_ms() -> u64 {
-    CYCLES_PER_MS.load(Ordering::Relaxed)
-}
-
-pub(crate) fn set_part_clock(part: &armv6m::part::Part) {
-    CYCLES_PER_MS.store(part.mhz() * 1000, Ordering::Relaxed);
-}
+/// Picoseconds in a millisecond, the unit simulated time is shown in.
+pub(crate) const PS_PER_MS: u64 = 1_000_000_000;
 
 pub(crate) fn usage() -> ExitCode {
     eprintln!("usage: zaqaru-m0 <final.bin> [--part stm32g031|stm32g070|stm32h753|…] [--core m0+|m7] [--ms N] [--quiet] [--udp PORT:TEXT] [--ping]");
@@ -98,7 +88,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    set_part_clock(&part);
     let machine = Machine::new(part, &bytes).and_then(|mut m| match core {
         Some(core) if core != m.core => m.set_core(core).map(|()| m),
         _ => Ok(m),
@@ -111,17 +100,16 @@ fn main() -> ExitCode {
         }
     };
 
-    let end = ms * cycles_per_ms();
+    let end = ms * PS_PER_MS;
     let started = Instant::now();
     let mut peer = armv6m::net::Peer::default();
-    let mut sends = [1000, 2000].map(|ms| ms * cycles_per_ms()).into_iter().peekable();
+    let mut sends = [1000, 2000].map(|ms| ms * PS_PER_MS).into_iter().peekable();
     let mut shown = 0;
     let mut faults = 0;
     let mut resets = 0;
     let outcome = loop {
         // In slices, so events print as they happen rather than at the end.
-        let slice = (end - machine.cycles).min(10 * cycles_per_ms());
-        let outcome = machine.run(slice);
+        let outcome = machine.run_until(end.min(machine.time + 10 * PS_PER_MS), u64::MAX);
         let mut replies = Vec::new();
         for event in &machine.events[shown..] {
             if let Event::Fault { .. } = event {
@@ -134,7 +122,7 @@ fn main() -> ExitCode {
                 let (answers, heard) = peer.receive(frame);
                 replies.extend(answers);
                 for heard in heard {
-                    println!("{:>10.3} ms  the host heard {}", ms_at(machine.cycles), heard_line(&heard));
+                    println!("{:>10.3} ms  the host heard {}", ms_at(machine.time), heard_line(&heard));
                 }
             }
         }
@@ -142,25 +130,25 @@ fn main() -> ExitCode {
         for reply in replies {
             machine.deliver(reply);
         }
-        if sends.next_if(|&at| machine.cycles >= at).is_some() {
+        if sends.next_if(|&at| machine.time >= at).is_some() {
             for (port, text) in &datagrams {
-                println!("{:>10.3} ms  the host sends {text:?} to [{}]:{port}", ms_at(machine.cycles), peer_target(&peer));
+                println!("{:>10.3} ms  the host sends {text:?} to [{}]:{port}", ms_at(machine.time), peer_target(&peer));
                 for frame in peer.udp(*port, text.as_bytes()) {
                     machine.deliver(frame);
                 }
             }
             if ping {
-                println!("{:>10.3} ms  the host pings [{}]", ms_at(machine.cycles), peer_target(&peer));
+                println!("{:>10.3} ms  the host pings [{}]", ms_at(machine.time), peer_target(&peer));
                 for frame in peer.ping(1) {
                     machine.deliver(frame);
                 }
             }
         }
         match outcome {
-            Outcome::Budget if machine.cycles < end => continue,
+            Outcome::Budget if machine.time < end => continue,
             Outcome::SystemReset => {
                 resets += 1;
-                println!("{:>10.3} ms  system reset requested", ms_at(machine.cycles));
+                println!("{:>10.3} ms  system reset requested", ms_at(machine.time));
                 if let Err(e) = machine.reset() {
                     eprintln!("zaqaru-m0: {e}");
                     return ExitCode::FAILURE;
@@ -184,10 +172,10 @@ fn main() -> ExitCode {
     println!(
         "{} instructions, {:.3} ms simulated, in {:.3} s ({:.1} MIPS, {:.1}x real time)",
         machine.retired,
-        ms_at(machine.cycles),
+        ms_at(machine.time),
         secs,
         machine.retired as f64 / secs / 1e6,
-        ms_at(machine.cycles) / 1000.0 / secs,
+        ms_at(machine.time) / 1000.0 / secs,
     );
     let taken: Vec<String> = machine
         .taken
@@ -215,8 +203,9 @@ fn main() -> ExitCode {
     }
 }
 
-pub(crate) fn ms_at(cycles: u64) -> f64 {
-    cycles as f64 / cycles_per_ms() as f64
+/// Simulated milliseconds at `time`, in picoseconds.
+pub(crate) fn ms_at(time: u64) -> f64 {
+    time as f64 / PS_PER_MS as f64
 }
 
 fn peer_target(peer: &armv6m::net::Peer) -> String {
@@ -237,7 +226,7 @@ pub(crate) fn heard_line(heard: &armv6m::net::Heard) -> String {
 
 pub(crate) fn describe(event: &Event) -> String {
     match *event {
-        Event::Frame { cycle, ref frame } => {
+        Event::Frame { time, ref frame } => {
             let kind = match frame.get(12..14) {
                 Some([0x86, 0xDD]) => match frame.get(20) {
                     Some(58) => format!("IPv6 ICMPv6 type {}", frame.get(54).copied().unwrap_or(0)),
@@ -249,24 +238,24 @@ pub(crate) fn describe(event: &Event) -> String {
                 _ => "runt".to_string(),
             };
             let to: Vec<String> = frame.iter().take(6).map(|b| format!("{b:02x}")).collect();
-            format!("{:>10.3} ms  ETH frame of {} bytes to {}: {kind}", ms_at(cycle), frame.len(), to.join(":"))
+            format!("{:>10.3} ms  ETH frame of {} bytes to {}: {kind}", ms_at(time), frame.len(), to.join(":"))
         }
-        Event::Pin { cycle, edge } => {
+        Event::Pin { time, edge } => {
             let Edge { port, before, after } = edge;
             let port = (b'A' + port) as char;
-            let mut line = format!("{:>10.3} ms  GPIO{port} ODR 0x{before:04x} -> 0x{after:04x}", ms_at(cycle));
+            let mut line = format!("{:>10.3} ms  GPIO{port} ODR 0x{before:04x} -> 0x{after:04x}", ms_at(time));
             // The Nucleo-G031's LD4 is PC6, wired active-low.
             if port == 'C' && (before ^ after) & 1 << 6 != 0 {
                 line += if after & 1 << 6 == 0 { "  LED on" } else { "  LED off" };
             }
             line
         }
-        Event::Serial { cycle, byte } => {
-            format!("{:>10.3} ms  USART{} {:?}", ms_at(cycle), byte.port + 1, byte.byte as char)
+        Event::Serial { time, byte } => {
+            format!("{:>10.3} ms  USART{} {:?}", ms_at(time), byte.port + 1, byte.byte as char)
         }
-        Event::Fault { cycle, pc, fault, mode, privileged } => format!(
+        Event::Fault { time, pc, fault, mode, privileged } => format!(
             "{:>10.3} ms  HardFault at pc=0x{pc:08x} ({mode:?}, {}): {fault:?}",
-            ms_at(cycle),
+            ms_at(time),
             if privileged { "privileged" } else { "unprivileged" },
         ),
     }
