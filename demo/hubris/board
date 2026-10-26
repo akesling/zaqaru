@@ -5,3 +5,12 @@
 chip   stm32h753
 image  /hubris/final.bin
 probe  127.0.0.1:3333
+
+# What is wired to the Nucleo's headers, where the app's configuration has
+# them: a TMP117 temperature sensor and an AT24C02 EEPROM on I2C2 (port F,
+# PF0 and PF1), a W25Q80 flash on SPI1 selected by PD14, and a root of
+# trust on SPI3 selected by PA15, its ROT_IRQ on PD0, for sprot.
+i2c    I2C2 0x48 tmp117
+i2c    I2C2 0x50 at24c02
+spi    SPI1 PD14 w25q80
+spi    SPI3 PA15 rot PD0

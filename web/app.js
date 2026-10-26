@@ -1002,12 +1002,14 @@ const renderers = {
       .join("");
     const lit = leds.map((led) => `${escape(led.pin)} ${escape(led.state ?? "never driven")}`).join(", ");
     const heard = (value.heard ?? []).slice(-4).map((line) => `<div class="dim">heard ${escape(line)}</div>`).join("");
+    const wired = (value.wired ?? []).map((line) => `<div class="dim">wired ${escape(line)}</div>`).join("");
     // What the USARTs sent, the tail of it, as a serial console shows it.
     const serial = value.serial ? `<div class="key">serial</div><pre class="serial">${escape(value.serial.slice(-2000))}</pre>` : "";
     panel.body.innerHTML = `<div class="board">
       <div class="leds">${lamps}</div>
       <div><b>${escape(value.chip)}</b>${value.core ? ` (${escape(value.core)})` : ""} · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated</div>
       <div>LED${leds.length > 1 ? "s" : ""} ${lit || "none"} · ${value.faults} faults · probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
+      ${wired}
       ${heard}
       <div class="dim">${escape(value.image)} · ${value.instructions.toLocaleString()} instructions · ${escape(value.mode)} mode, ${value.privileged ? "privileged" : "unprivileged"}</div>
       <div class="dim">${exceptions}</div>

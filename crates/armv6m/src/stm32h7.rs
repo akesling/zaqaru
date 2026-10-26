@@ -13,12 +13,19 @@
 //! interface ([`crate::flash_h7`]). RCC's reset bits reset the peripherals
 //! they name.
 //!
+//! The parts wired to the board's buses ([`crate::devices`]) are attached
+//! with [`Stm32h7::attach`]: an I2C part answers its address on its
+//! controller; a SPI part is selected while its chip-select pin is an
+//! output driven low, and a line it drives back (the RoT's ROT_IRQ) drives
+//! that GPIO pin from outside.
+//!
 //! Everything else in the peripheral windows is a plain register file
 //! that remembers what was written, and remembers that it was touched, as
 //! the G0's is.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::devices::{SpiPart, Wiring};
 use crate::eth_h7::{self, Ethernet};
 use crate::flash_h7;
 use crate::gpio::{Edge, Gpio};
@@ -127,8 +134,20 @@ pub struct Stm32h7 {
     pub serial: Vec<usart::Byte>,
     pub i2cs: [I2c; 4],
     pub spis: [Spi; 6],
+    /// The parts on the SPI buses.
+    pub spi_parts: Vec<SpiWired>,
     timers: Vec<Timer>,
     pub eth: Ethernet,
+}
+
+/// A part on a SPI bus: its controller, its chip-select, and whether that
+/// is selecting it now.
+#[derive(Clone, Debug)]
+pub struct SpiWired {
+    pub controller: usize,
+    pub cs: (usize, u8),
+    pub part: SpiPart,
+    selected: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -158,6 +177,7 @@ impl Default for Stm32h7 {
             serial: Vec::new(),
             i2cs: Default::default(),
             spis: Default::default(),
+            spi_parts: Vec::new(),
             timers: TIMERS.iter().map(|&(_, _, wide)| Timer::new(wide, TIMER_DIVIDER)).collect(),
             eth: Ethernet::default(),
         };
@@ -216,6 +236,64 @@ impl Stm32h7 {
             timer.reset();
         }
         self.eth.reset();
+        self.chip_selects();
+    }
+
+    /// Wires a part to the board's buses.
+    pub fn attach(&mut self, wiring: Wiring) -> Result<(), String> {
+        match wiring {
+            Wiring::I2c { controller, part } => {
+                let i2c = self.i2cs.get_mut(controller).ok_or_else(|| format!("the H7 has no I2C{}", controller + 1))?;
+                if i2c.targets.iter().any(|t| t.address() == part.address()) {
+                    return Err(format!("I2C{} already has a part at 0x{:02x}", controller + 1, part.address()));
+                }
+                i2c.targets.push(part);
+            }
+            Wiring::Spi { controller, cs, part } => {
+                if controller >= self.spis.len() {
+                    return Err(format!("the H7 has no SPI{}", controller + 1));
+                }
+                self.spi_parts.push(SpiWired { controller, cs, part, selected: false });
+                self.chip_selects();
+            }
+        }
+        Ok(())
+    }
+
+    /// What is wired to the buses, as the lines that would wire it.
+    pub fn wired(&self) -> Vec<String> {
+        let i2c = self.i2cs.iter().enumerate().flat_map(|(n, i2c)| {
+            i2c.targets.iter().map(move |part| Wiring::I2c { controller: n, part: part.clone() }.describe())
+        });
+        let spi = self
+            .spi_parts
+            .iter()
+            .map(|w| Wiring::Spi { controller: w.controller, cs: w.cs, part: w.part.clone() }.describe());
+        i2c.chain(spi).collect()
+    }
+
+    /// The SPI parts' chip-selects, after any change to the pins: a part
+    /// is selected while its pin is an output driven low (a board pulls an
+    /// undriven one high), and the lines the parts drive back follow.
+    fn chip_selects(&mut self) {
+        for wired in &mut self.spi_parts {
+            let (port, pin) = wired.cs;
+            let gpio = &self.gpio[port];
+            let output = gpio.moder >> (2 * pin) & 3 == 0b01;
+            let low = output && gpio.odr >> pin & 1 == 0;
+            if low != wired.selected {
+                wired.selected = low;
+                if low {
+                    wired.part.select();
+                } else {
+                    wired.part.deselect();
+                }
+            }
+            if let Some(((port, pin), level)) = wired.part.line() {
+                self.gpio[port].drive(pin, Some(level));
+            }
+        }
+        self.sense();
     }
 
     /// Which of a kind of peripheral an address is in, and the offset into
@@ -477,7 +555,11 @@ impl Stm32h7 {
         } else if let Some((n, offset)) = Self::i2c(addr) {
             self.i2cs[n].write(offset, value);
         } else if let Some((n, offset)) = Self::spi(addr) {
-            self.spis[n].write(offset, value, size);
+            let parts = &mut self.spi_parts;
+            let mut bus = |mosi: u8| {
+                parts.iter_mut().find(|w| w.controller == n && w.selected).map_or(0xFF, |w| w.part.exchange(mosi))
+            };
+            self.spis[n].write(offset, value, size, &mut bus);
         } else if let Some((n, offset)) = Self::timer(addr) {
             self.timers[n].write(offset, value, now);
         } else if (RCC..RCC + 0x400).contains(&addr) {
@@ -491,7 +573,7 @@ impl Stm32h7 {
             if gpio.odr != before {
                 self.edges.push(Edge { port: port as u8, before: before as u16, after: gpio.odr as u16 });
             }
-            self.sense();
+            self.chip_selects();
         } else if (EXTI..EXTI + 0x100).contains(&addr) {
             match addr - EXTI {
                 // SWIER1: a one pends its line.

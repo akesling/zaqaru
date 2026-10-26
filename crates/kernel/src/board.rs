@@ -10,6 +10,8 @@
 //! led    PC6 low          # optional: the part's Nucleo's, by default
 //! image  /hubris/final.bin
 //! probe  127.0.0.1:3333
+//! i2c    I2C2 0x48 tmp117     # optional, on an H7: the parts wired to its
+//! spi    SPI1 PD14 w25q80     # buses (see `armv6m::devices`)
 //! ```
 //!
 //! The board is kernel state, like the socket arena: one per container,
@@ -115,6 +117,9 @@ pub struct Board {
     pub heard: VecDeque<(u64, String)>,
     heard_count: u64,
     pings: u16,
+    /// The parts wired to the buses, as the configuration's lines, for a
+    /// part put on the bench to be wired the same.
+    pub wiring: Vec<String>,
     /// Datagrams the board sent to a group rather than to the host —
     /// udpbroadcast's, every second — counted, and the latest, apart from
     /// what was sent to the host.
@@ -145,6 +150,8 @@ pub struct Configuration {
     pub image: String,
     pub probe: (u32, u16),
     pub leds: Vec<Led>,
+    /// The parts wired to the buses, a line each: `i2c I2C2 0x48 tmp117`.
+    pub wiring: Vec<String>,
 }
 
 /// A user LED on the board: which pin, and which level lights it.
@@ -217,6 +224,7 @@ const SERIAL_KEPT: usize = 16 * 1024;
 /// Parses `/etc/zaqaru/board`: one `key value` per line, `#` comments.
 pub fn parse(text: &str) -> Result<Configuration, String> {
     let (mut chip, mut image, mut probe, mut led) = (None, None, None, None);
+    let mut wiring = Vec::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -231,6 +239,11 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
             "image" => image = Some(value.to_string()),
             "probe" => probe = Some(parse_address(value).ok_or_else(|| format!("probe `{value}`: expected a.b.c.d:port"))?),
             "led" => led = Some(Led::parse(value).ok_or_else(|| format!("led `{value}`: expected a pin and a level, `PC6 low`"))?),
+            "i2c" | "spi" => {
+                let line = format!("{key} {value}");
+                armv6m::devices::Wiring::parse(&line)?;
+                wiring.push(line);
+            }
             _ => return Err(format!("unknown key `{key}`")),
         }
     }
@@ -242,6 +255,7 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
         image: image.ok_or("no `image`")?,
         probe: probe.unwrap_or((crate::socket::INADDR_LOOPBACK, 3333)),
         leds: led.map_or_else(|| Led::of(part.name), |led| vec![led]),
+        wiring,
     })
 }
 
@@ -300,7 +314,9 @@ impl Board {
     ///   chip, or lets it go: a button pressed and released;
     /// - `udp PORT TEXT` sends a datagram to the board's port from the host
     ///   at the other end of its Ethernet cable, and `ping` an echo
-    ///   request; what comes back is in the board's state.
+    ///   request; what comes back is in the board's state;
+    /// - `temperature 31.5` is what the temperature sensors on its buses
+    ///   read, in degrees Celsius.
     pub fn command(&mut self, line: &str) -> Result<(), String> {
         let (verb, rest) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
         match verb {
@@ -309,6 +325,14 @@ impl Board {
                     .ok_or_else(|| format!("part `{}`: {MODELLED}", rest.trim()))?;
                 let mut machine = Machine::new(part, &[])?;
                 machine.halt();
+                if matches!(machine.bus.soc, armv6m::bus::Soc::H7(_)) {
+                    for line in &self.wiring {
+                        let wired = armv6m::devices::Wiring::parse(line).and_then(|w| machine.attach(w));
+                        if let Err(why) = wired {
+                            self.console.push(format!("board: {line}: {why}"));
+                        }
+                    }
+                }
                 self.machine = machine;
                 self.chip = part.name.to_string();
                 self.image = "(erased)".to_string();
@@ -344,6 +368,21 @@ impl Board {
                 let frames = self.host.ping(self.pings);
                 self.send_frames(frames)
             }
+            "temperature" => {
+                let celsius: f64 =
+                    rest.trim().parse().map_err(|_| format!("temperature `{}`: expected degrees Celsius", rest.trim()))?;
+                let mut sensors = 0;
+                for part in self.machine.i2c_parts_mut() {
+                    if let armv6m::devices::I2cPart::Tmp117(sensor) = part {
+                        sensor.set_celsius(celsius);
+                        sensors += 1;
+                    }
+                }
+                if sensors == 0 {
+                    return Err("there is no temperature sensor on the board's buses".into());
+                }
+                Ok(())
+            }
             "pin" => {
                 let (pin, level) = rest.trim().split_once(char::is_whitespace).unwrap_or((rest.trim(), ""));
                 let (port, pin) = parse_pin(pin).ok_or_else(|| format!("pin `{pin}`: expected a pin, `PC13`"))?;
@@ -357,7 +396,7 @@ impl Board {
                 Ok(())
             }
             "" => Ok(()),
-            other => Err(format!("`{other}`: the board takes `part NAME`, `image TEXT`, `pin PIN LEVEL`, `udp PORT TEXT` and `ping`")),
+            other => Err(format!("`{other}`: the board takes `part NAME`, `image TEXT`, `pin PIN LEVEL`, `udp PORT TEXT`, `ping` and `temperature C`")),
         }
     }
 
@@ -662,7 +701,7 @@ impl Board {
             _ => String::new(),
         };
         format!(
-            r#"{{"chip":{},"core":{},"image":{},"state":{},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"exceptions":{{{}}},"registers":{{{}}}}}"#,
+            r#"{{"chip":{},"core":{},"image":{},"state":{},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"wired":[{}],"exceptions":{{{}}},"registers":{{{}}}}}"#,
             quoted(&self.chip),
             quoted(core_name(m.core)),
             quoted(&self.image),
@@ -687,6 +726,7 @@ impl Board {
             // than a read of the lens should carry.
             quoted(&String::from_utf8_lossy(&self.serial[self.serial.len().saturating_sub(4096)..])),
             self.heard.iter().map(|(_, line)| quoted(line)).collect::<Vec<_>>().join(","),
+            m.wired().iter().map(|line| quoted(line)).collect::<Vec<_>>().join(","),
             exceptions.join(","),
             registers.join(","),
         )
@@ -731,8 +771,9 @@ impl Board {
             .filter(|&(_, &count)| count > 0)
             .map(|(n, count)| format!("{} {count}", armv6m::scs::exception::name(n as u32)))
             .collect();
+        let wired: String = m.wired().iter().map(|line| format!("wired       {line}\n")).collect();
         format!(
-            "board       {} (emulated {}), in the kernel\nimage       {}\nstate       {state}\ntime        {:.3} s simulated, {} instructions\n{leds}\nfaults      {}\nexceptions  {}\n{network}",
+            "board       {} (emulated {}), in the kernel\nimage       {}\nstate       {state}\ntime        {:.3} s simulated, {} instructions\n{leds}\nfaults      {}\nexceptions  {}\n{wired}{network}",
             self.chip,
             core_name(m.core),
             self.image,
@@ -829,13 +870,19 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             }
         };
         let part = armv6m::part::Part::named(&configuration.chip).expect("parse checked the part");
-        let machine = match Machine::new(part, &firmware) {
+        let mut machine = match Machine::new(part, &firmware) {
             Ok(machine) => machine,
             Err(why) => {
                 self.board_says(&format!("board: {}: {why}", configuration.image));
                 return Slot::Absent;
             }
         };
+        for line in &configuration.wiring {
+            let wired = armv6m::devices::Wiring::parse(line).and_then(|w| machine.attach(w));
+            if let Err(why) = wired {
+                self.board_says(&format!("board: {line}: {why}"));
+            }
+        }
         let (address, port) = configuration.probe;
         let probe = Address::Inet { address, port };
         let listener = {
@@ -879,6 +926,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             heard: VecDeque::new(),
             heard_count: 0,
             pings: 0,
+            wiring: configuration.wiring,
             multicast: 0,
             last_multicast: None,
         }))
@@ -974,8 +1022,12 @@ mod tests {
                 image: "/hubris/final.bin".into(),
                 probe: (0x7F00_0001, 3333),
                 leds: vec![Led { port: 2, pin: 6, active_low: true, color: "green" }],
+                wiring: vec![],
             }
         );
+        let wired = parse("chip stm32h753\nimage /f.bin\ni2c I2C2 0x48 tmp117\nspi SPI3 PA15 rot PD0\n").unwrap();
+        assert_eq!(wired.wiring, ["i2c I2C2 0x48 tmp117", "spi SPI3 PA15 rot PD0"]);
+        assert!(parse("image /f.bin\ni2c I2C2 0x48 lm75").is_err());
     }
 
     #[test]

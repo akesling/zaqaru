@@ -39,6 +39,7 @@ pub mod bus;
 pub mod cmsis_dap;
 pub mod dap;
 pub mod debug;
+pub mod devices;
 pub mod exception;
 pub mod eth_h7;
 pub mod exec;
@@ -592,6 +593,32 @@ impl Machine {
     pub fn drive(&mut self, port: usize, pin: u8, level: Option<bool>) {
         self.bus.soc.drive(port, pin, level);
         self.sample_interrupts();
+    }
+
+    /// Wires a part to the board's buses: see [`devices::Wiring`].
+    pub fn attach(&mut self, wiring: devices::Wiring) -> Result<(), String> {
+        let crate::bus::Soc::H7(soc) = &mut self.bus.soc else {
+            return Err(format!("parts are wired only to the H7s, not the {}", self.part.name));
+        };
+        soc.attach(wiring)?;
+        self.sample_interrupts();
+        Ok(())
+    }
+
+    /// The parts on the I2C buses, to set what they read.
+    pub fn i2c_parts_mut(&mut self) -> Vec<&mut devices::I2cPart> {
+        match &mut self.bus.soc {
+            crate::bus::Soc::H7(soc) => soc.i2cs.iter_mut().flat_map(|i2c| i2c.targets.iter_mut()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// What is wired to the board's buses, a line each.
+    pub fn wired(&self) -> Vec<String> {
+        match &self.bus.soc {
+            crate::bus::Soc::H7(soc) => soc.wired(),
+            _ => Vec::new(),
+        }
     }
 
     /// A byte arriving on USART `port`'s line (0 for USART1): taken if the

@@ -15,6 +15,8 @@ browser: a terminal and a board panel
      │   │   ├─ debug port: SW-DP v2; AP0 the M7's AHB-AP, AP1 D3's, AP2 the debug APB
      │   │   │   ├─ CMSIS-DAP v2 probe, served as a USB device (services/usb)
      │   │   │   └─ GDB remote server on 127.0.0.1:3333
+     │   │   ├─ I2C2: a TMP117 at 0x48, an AT24C02 at 0x50
+     │   │   ├─ SPI1: a W25Q80 flash; SPI3: a root of trust, speaking sprot
      │   │   └─ Ethernet, cabled to a host: IPv6, UDP, ping
      │   └─ usbfs and sysfs: /dev/bus/usb/001/002, /sys/bus/usb/devices/1-1
      └─ processes (x86-64, interpreted)
@@ -98,7 +100,11 @@ but whether a browser lets it be claimed is untested.
 | `humility readvar TICKS` | a kernel variable, read live |
 | `humility ringbuf` | the ring buffers |
 | `humility hiffy -c UserLeds.led_toggle -a index=2` | an IPC call made on the board, through the hiffy task: the yellow LED changes |
-| `humility i2c -c 2 -p F --scan` | a scan of I2C2, through hiffy and the I2C driver: nothing on a bare Nucleo |
+| `humility i2c -c 2 -p F --scan` | a scan of I2C2, through hiffy and the I2C driver: the TMP117 at 0x48 and the EEPROM at 0x50 |
+| `humility i2c -c 2 -p F -d 0x48 -r 0 -n 2` | the TMP117's temperature register, in 1/128 °C: `0x0c 0x80` is 25 °C |
+| `temperature 31.5` | what the TMP117 reads from now on |
+| `humility spi -p 1 -w 0x9f,0,0,0 -r -n 4` | the W25Q80's JEDEC ID, `ef 40 14`, through the SPI driver |
+| `humility hiffy -c SpRot.status` | sprot's status call: a request over SPI3, ROT_IRQ, and the RoT's response |
 | `humility hiffy -c Update.prep_image_update` | the update server erases flash bank 2 |
 | `humility flash -F` | flashes the archive's image onto the board through probe-rs's own flash algorithm, then resets it |
 | `humility flash --verify` | reads the flash back and compares it with the archive |
@@ -127,13 +133,20 @@ Outside the page, `zaqaru run web/demo/hubris.wasm -p 8080:80` and
 - Of the STM32H753: its memories (ITCM, DTCM, AXI SRAM, SRAM1–4, backup
   SRAM, two flash banks); PWR, RCC and flash wait states with everything
   startup waits on settled at once; GPIO A–K, EXTI and SYSCFG; the USARTs;
-  I2C1–4 with an empty bus; SPI1–6 with nothing on MISO; the
+  I2C1–4 and SPI1–6, with the parts the board file wires to them; the
   general-purpose timers as time bases; the RNG, deterministic; DBGMCU; the
   dual-bank flash interface — flash-word programming, sector and bank
   erase, the option bytes' bank swap; and Ethernet — the MAC, its DMA and
   descriptor rings, MDIO to a LAN8742A with its link up. Every other
   peripheral register reads back what was written.
 - Of the STM32G0s: RCC, GPIO, the USARTs and the flash interface.
+- What is wired to the H7's buses, from the board file's `i2c` and `spi`
+  lines: a TMP117 temperature sensor, an AT24C02 EEPROM, a W25Q80 SPI
+  flash (JEDEC and unique IDs, reads, page programs, erases), and a root
+  of trust that answers the SP-to-RoT protocol as the LPC55's sprot server
+  does — status, I/O counters and lifecycle state; it refuses updates,
+  attestation and the rest as unknown messages. A SPI part is selected by
+  its chip-select pin, driven low as a GPIO output.
 - The debug architecture: each part's debug port and APs, the ROM tables
   and CoreSight IDs, DHCSR halting and stepping, DCRSR register transfer,
   DEMCR vector catch, DFSR, the breakpoint unit (an M7's FPB, an M0+'s

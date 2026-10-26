@@ -7,8 +7,10 @@
 //! RXP while a frame waits to be read, and when the TSIZE-th frame has gone
 //! EOT, TXTF and TXC say so; IER's enables make them the interrupt.
 //!
-//! What answers on MISO is the peripheral on the bus. None is modelled
-//! yet: an absent device reads as the line idling high, 0xFF.
+//! What answers on MISO is the part on the bus its chip-select selects
+//! ([`crate::devices`]), which whoever owns the controller passes to it as
+//! the exchange of each frame; with nothing selected, the line idles high,
+//! 0xFF.
 //!
 //! Frames are bytes (DSIZE up to 8 bits), which is what Hubris's drivers
 //! use; a word access to TXDR or RXDR moves four of them, as packing does.
@@ -45,8 +47,6 @@ pub struct Spi {
     /// Frames sent in this transfer.
     sent: u32,
     received: VecDeque<u8>,
-    /// Every frame the bus carried out, for whoever is looking.
-    pub transmitted: Vec<u8>,
 }
 
 impl Spi {
@@ -108,7 +108,9 @@ impl Spi {
         }
     }
 
-    pub fn write(&mut self, offset: u32, value: u32, size: u32) {
+    /// A write; `exchange` is the bus, which takes each frame sent and
+    /// answers the frame received.
+    pub fn write(&mut self, offset: u32, value: u32, size: u32, exchange: &mut dyn FnMut(u8) -> u8) {
         match offset {
             0x00 => {
                 let starting = value & CSTART != 0 && !self.running();
@@ -130,7 +132,7 @@ impl Spi {
             0x18 => self.flags &= !(value & IFCR_CLEARS),
             0x20 => {
                 for i in 0..size.min(4) {
-                    self.shift((value >> (8 * i)) as u8);
+                    self.shift((value >> (8 * i)) as u8, exchange);
                 }
             }
             0x40..=0x4F => self.other[((offset - 0x40) / 4) as usize] = value,
@@ -139,13 +141,13 @@ impl Spi {
     }
 
     /// One frame out, and the one MISO carried in with it.
-    fn shift(&mut self, byte: u8) {
+    fn shift(&mut self, byte: u8, exchange: &mut dyn FnMut(u8) -> u8) {
         if self.cr1 & SPE == 0 || self.tsize() != 0 && self.sent >= self.tsize() {
             return;
         }
-        self.transmitted.push(byte);
+        let answer = exchange(byte);
         if self.received.len() < FIFO {
-            self.received.push_back(0xFF);
+            self.received.push_back(answer);
         }
         self.sent += 1;
         if self.tsize() != 0 && self.sent == self.tsize() {
@@ -166,21 +168,26 @@ mod tests {
     #[test]
     fn a_transfer_of_tsize_frames_ends_in_eot() {
         let mut spi = Spi::default();
-        spi.write(0x04, 3, 4);
-        spi.write(0x00, SPE, 4);
-        spi.write(0x00, SPE | CSTART, 4);
+        let mut sent = Vec::new();
+        let mut bus = |byte: u8| {
+            sent.push(byte);
+            !byte
+        };
+        spi.write(0x04, 3, 4, &mut bus);
+        spi.write(0x00, SPE, 4, &mut bus);
+        spi.write(0x00, SPE | CSTART, 4, &mut bus);
         assert_eq!(spi.read(0x14, false, 4) & (TXP | EOT), TXP);
         for byte in [1, 2, 3] {
-            spi.write(0x20, byte, 1);
+            spi.write(0x20, byte, 1, &mut bus);
         }
         let sr = spi.read(0x14, false, 4);
         assert_eq!(sr & (TXP | EOT | TXTF | RXP), EOT | TXTF | RXP);
         assert_eq!(sr >> 13 & 3, 3, "three frames short of a word");
-        spi.write(0x10, 1 << 3, 4);
+        spi.write(0x10, 1 << 3, 4, &mut bus);
         assert!(spi.interrupt(), "EOTIE");
-        assert_eq!(spi.read(0x30, true, 1), 0xFF);
-        spi.write(0x18, EOT | TXTF, 4);
+        assert_eq!(spi.read(0x30, true, 1), 0xFE, "the bus's answer to the first");
+        spi.write(0x18, EOT | TXTF, 4, &mut bus);
         assert!(!spi.interrupt());
-        assert_eq!(spi.transmitted, [1, 2, 3]);
+        assert_eq!(sent, [1, 2, 3]);
     }
 }

@@ -14,9 +14,9 @@
 //! The bus's timing is not modelled: a byte takes no time. Nothing is ever
 //! lost in arbitration or held low, so the error flags never set.
 //!
-//! A target is a register file, as most sensors and EEPROMs are: the first
-//! byte written sets its pointer, the rest are stored from it, and a read
-//! answers from it, the pointer advancing either way.
+//! The targets are the parts wired to the bus ([`crate::devices`]).
+
+use crate::devices::I2cPart;
 
 // CR1.
 const PE: u32 = 1 << 0;
@@ -47,42 +47,6 @@ const BUSY: u32 = 1 << 15;
 /// ICR's clearable flags, at their ISR positions.
 const ICR_CLEARS: u32 = ADDR | NACKF | STOPF | ERRORS;
 
-/// A target on the bus: a register file at a 7-bit address.
-#[derive(Clone, Debug)]
-pub struct Target {
-    pub address: u8,
-    pub registers: [u8; 256],
-    pointer: u8,
-    /// Whether the next byte written sets the pointer.
-    addressing: bool,
-}
-
-impl Target {
-    pub fn new(address: u8) -> Target {
-        Target { address, registers: [0; 256], pointer: 0, addressing: false }
-    }
-
-    fn start(&mut self, read: bool) {
-        self.addressing = !read;
-    }
-
-    fn write(&mut self, byte: u8) {
-        if self.addressing {
-            self.pointer = byte;
-            self.addressing = false;
-        } else {
-            self.registers[self.pointer as usize] = byte;
-            self.pointer = self.pointer.wrapping_add(1);
-        }
-    }
-
-    fn read(&mut self) -> u8 {
-        let byte = self.registers[self.pointer as usize];
-        self.pointer = self.pointer.wrapping_add(1);
-        byte
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct I2c {
     cr1: u32,
@@ -99,7 +63,7 @@ pub struct I2c {
     with: Option<usize>,
     left: u32,
     busy: bool,
-    pub targets: Vec<Target>,
+    pub targets: Vec<I2cPart>,
 }
 
 impl I2c {
@@ -189,7 +153,7 @@ impl I2c {
         self.busy = true;
         let address = (self.cr2 >> 1 & 0x7F) as u8;
         let read = self.cr2 & RD_WRN != 0;
-        self.with = self.targets.iter().position(|t| t.address == address);
+        self.with = self.targets.iter().position(|t| t.address() == address);
         match self.with {
             None => {
                 // No acknowledge: NACKF, and the STOP that follows one.
@@ -254,7 +218,9 @@ impl I2c {
     fn stop(&mut self) {
         self.isr = self.isr & !(TC | TCR | TXIS) | STOPF;
         self.busy = false;
-        self.with = None;
+        if let Some(n) = self.with.take() {
+            self.targets[n].stop();
+        }
     }
 
     /// The event interrupt line, and the error line.
@@ -277,9 +243,9 @@ mod tests {
 
     fn enabled() -> I2c {
         let mut i2c = I2c::default();
-        let mut sensor = Target::new(0x48);
+        let mut sensor = crate::devices::Registers::new(0x48);
         sensor.registers[0..2].copy_from_slice(&[0x19, 0x80]);
-        i2c.targets.push(sensor);
+        i2c.targets.push(I2cPart::Registers(sensor));
         i2c.write(0x00, PE | TXIE | RXIE | NACKIE | STOPIE | TCIE | ERRIE);
         i2c
     }

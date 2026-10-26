@@ -111,6 +111,16 @@ const HELP: &str = "\
                             none) from the host on its Ethernet cable,
                             and show what comes back — an H7's
     ping                    an ICMPv6 echo request to the board
+    humility i2c -c 2 -p F --scan
+                            the parts on I2C2: a TMP117 temperature sensor
+                            at 0x48, an AT24C02 EEPROM at 0x50
+    humility i2c -c 2 -p F -d 0x48 -r 0 -n 2
+                            the TMP117's temperature, in 1/128 °C
+    temperature C           what the TMP117 reads, in degrees Celsius
+    humility spi -p 1 -w 0x9f,0,0,0 -r -n 4
+                            the JEDEC ID of the W25Q80 flash on SPI1
+    humility hiffy -c SpRot.status
+                            the root of trust on SPI3, asked over sprot
     humility -p VID:PID …   the same against a probe connected from the
                             page — its USB panel, 'connect a USB
                             device…' — on real hardware
@@ -181,11 +191,18 @@ fn session(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
                 door.network(&format!("udp {port} {text}\n"), &out)?
             }
             Some("ping") => door.network("ping\n", &out)?,
+            Some("temperature") => {
+                let line = format!("temperature {}\n", words.get(1).map_or("", String::as_str));
+                match std::fs::write("/dev/board", line) {
+                    Ok(()) => out.write_all(format!("the TMP117 now reads {} °C\n", words[1]).as_bytes())?,
+                    Err(_) => out.write_all(b"temperature C: degrees Celsius, for a board with a TMP117\n")?,
+                }
+            }
             Some("flash") => match words.get(1) {
                 Some(name) => door.flash(name, &out)?,
                 None => out.write_all(b"flash NAME: an archive `archives` lists, or one uploaded\n")?,
             },
-            Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, button, udp, ping, flash, help and exit\n").as_bytes())?,
+            Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, button, udp, ping, temperature, flash, help and exit\n").as_bytes())?,
         }
         out.write_all(PROMPT)?;
     }
