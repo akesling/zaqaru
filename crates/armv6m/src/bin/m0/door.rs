@@ -292,7 +292,20 @@ fn upload(name: &str, bytes: &[u8]) -> String {
 /// The board a Hubris archive was built for: `board = "…"` in its
 /// `app.toml`.
 fn board_of(app_toml: &str) -> Option<&str> {
-    let line = app_toml.lines().find(|line| line.trim_start().starts_with("board"))?;
+    toml_string(app_toml, "board")
+}
+
+/// The app an archive is: `name = "…"` in its `app.toml`.
+fn app_of(app_toml: &str) -> Option<&str> {
+    toml_string(app_toml, "name")
+}
+
+/// A top-level `key = "…"`, before the first table.
+fn toml_string<'a>(app_toml: &'a str, key: &str) -> Option<&'a str> {
+    let line = app_toml
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .find(|line| line.split_once('=').is_some_and(|(k, _)| k.trim() == key))?;
     let value = line.split_once('=')?.1.trim();
     value.strip_prefix('"')?.split('"').next()
 }
@@ -349,7 +362,13 @@ impl FrontDoor {
             let mut names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
             names.sort();
             for name in names.iter().filter(|n| n.ends_with(".zip")) {
-                out += &format!("    {:<24} {directory}/{name}\n", name.trim_end_matches(".zip"));
+                // What it is, from its own `app.toml`: the app, and the board.
+                let bytes = std::fs::read(format!("{directory}/{name}")).unwrap_or_default();
+                let app_toml = crate::zip::entry(&bytes, "app.toml")
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                let (app, board) = (app_of(&app_toml).unwrap_or("-"), board_of(&app_toml).unwrap_or("-"));
+                out += &format!("    {:<14} {app:<30} {board:<18} {directory}/{name}\n", name.trim_end_matches(".zip"));
             }
         }
         let current = self.archive.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -496,6 +515,8 @@ mod tests {
     fn an_archive_says_its_board_in_app_toml() {
         assert_eq!(super::board_of("name = \"psc-c-dev\"\nboard = \"psc-c\"\n"), Some("psc-c"));
         assert_eq!(super::board_of("name = \"x\"\n"), None);
+        assert_eq!(super::app_of("name = \"psc-c-dev\"\nboard = \"psc-c\"\n[kernel]\nname = \"psc\"\n"), Some("psc-c-dev"));
+        assert_eq!(super::app_of("[kernel]\nname = \"psc\"\n"), None);
         assert_eq!(super::straps("psc-c").len(), 3);
     }
 
