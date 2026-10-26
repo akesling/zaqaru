@@ -397,6 +397,17 @@ impl Stm32h7 {
         Self::instance(TIMERS.iter().map(|t| t.0), addr)
     }
 
+    /// Whether a load at `addr` pops a FIFO — a USART's, I2C's or SPI's
+    /// receive data, the RNG's — or reads a timer, whose counter changes by
+    /// itself.
+    pub fn impure(addr: u32) -> bool {
+        USARTS.iter().any(|&(base, _)| addr == base + 0x24)
+            || I2CS.iter().any(|&(base, _, _)| addr == base + 0x24)
+            || SPIS.iter().any(|&(base, _)| addr == base + 0x30)
+            || addr == RNG + 0x08
+            || Self::timer(addr).is_some()
+    }
+
     /// The time the next timed event is due at: a timer's update, a byte
     /// on a USART's line.
     pub fn due(&self) -> Option<u64> {

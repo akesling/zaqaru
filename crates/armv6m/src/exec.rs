@@ -141,6 +141,13 @@ impl Machine {
         }
         self.bus.now = self.time;
         self.stall += self.timing.data(addr, false);
+        // A load a busy wait may not make: one that pops a FIFO, or reads a
+        // counter that runs by itself — SysTick's, the DWT's, a timer's.
+        if addr >= 0x4000_0000
+            && (self.bus.soc.impure(addr) || (0xE000_E018..0xE000_E01C).contains(&addr) || (0xE000_1000..0xE000_2000).contains(&addr))
+        {
+            self.spin.clean = false;
+        }
         self.bus.read(addr, size).map_err(|_| Fault::Bus { addr })
     }
 
@@ -155,6 +162,7 @@ impl Machine {
         }
         self.bus.now = self.time;
         self.stall += self.timing.data(addr, true);
+        self.stores += 1;
         self.bus.write(addr, size, value).map_err(|_| Fault::Bus { addr })?;
         // A store to the flash interface or to CCR may change the wait
         // states: the flash's latency, the caches.
@@ -212,6 +220,11 @@ impl Machine {
         // instruction — refills the pipeline.
         if matches!(result, Ok(Flow::Next)) && self.cpu.pc != pc.wrapping_add(if wide { 4 } else { 2 }) {
             self.stall += self.timing.branch + if wide { self.timing.bl } else { 0 };
+            // Backward, to a loop's head: what the busy wait detector
+            // looks at.
+            if self.cpu.pc < pc {
+                self.looped = Some(self.cpu.pc);
+            }
         }
         result
     }

@@ -891,7 +891,7 @@ impl Board {
             _ => String::new(),
         };
         format!(
-            r#"{{"chip":{},"core":{},"image":{},"state":{},"speed":{},"paused":{},"ratio":{:.4},"clocks":{{{}}},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"wired":[{}],"exceptions":{{{}}},"registers":{{{}}}}}"#,
+            r#"{{"chip":{},"core":{},"image":{},"state":{},"speed":{},"paused":{},"ratio":{:.4},"skipped_ms":{:.3},"clocks":{{{}}},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"wired":[{}],"exceptions":{{{}}},"registers":{{{}}}}}"#,
             quoted(&self.chip),
             quoted(core_name(m.core)),
             quoted(&self.image),
@@ -899,6 +899,7 @@ impl Board {
             quoted(&self.speed.show()),
             self.paused,
             self.ratio,
+            m.skipped as f64 / 1e9,
             {
                 let c = m.bus.soc.clocks();
                 let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
@@ -972,7 +973,7 @@ impl Board {
             .collect();
         let wired: String = m.wired().iter().map(|line| format!("wired       {line}\n")).collect();
         format!(
-            "board       {} (emulated {}), in the kernel\nimage       {}\nstate       {state}\ntime        {:.6} s simulated, {} instructions\nspeed       {}, managing {:.3}× the container's clock\nclocks      {}\n{leds}\nfaults      {}\nexceptions  {}\n{wired}{network}",
+            "board       {} (emulated {}), in the kernel\nimage       {}\nstate       {state}\ntime        {:.6} s simulated, {} instructions\nspeed       {}, managing {:.3}× the container's clock; {:.3} s of busy waits skipped\nclocks      {}\n{leds}\nfaults      {}\nexceptions  {}\n{wired}{network}",
             self.chip,
             core_name(m.core),
             self.image,
@@ -980,6 +981,7 @@ impl Board {
             m.retired,
             self.speed.show(),
             self.ratio,
+            m.skipped as f64 / 1e12,
             self.clocks_text(),
             self.faults,
             taken.join(", "),

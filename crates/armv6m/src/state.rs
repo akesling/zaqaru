@@ -33,7 +33,7 @@ pub enum Mode {
     Handler,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cpu {
     /// r0–r12 and lr. Index 13 is never read or written: the stack pointer
     /// is banked, and lives in `msp` and `psp`.

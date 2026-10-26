@@ -186,6 +186,15 @@ pub struct Machine {
     half: u64,
     /// The buses' wait states, as the clocks and the caches have them.
     pub(crate) timing: timing::Timing,
+    /// A loop's head the last instruction branched back to, for the busy
+    /// wait detector (see [`Machine::spin`]); what it last saw there; and
+    /// what it has counted since.
+    pub(crate) looped: Option<u32>,
+    spin: Spin,
+    pub(crate) stores: u64,
+    pub(crate) entries: u64,
+    /// Simulated time busy waits were skipped through, in picoseconds.
+    pub skipped: u64,
     pub retired: u64,
     pub events: Vec<Event>,
     /// How many times each exception has been entered.
@@ -217,6 +226,24 @@ pub struct Machine {
     /// — and a kernel's working set is a few dozen granules, which turns
     /// eight region comparisons per access into one.
     granted: Box<[[Grant; GRANTS]; 3]>,
+}
+
+/// The machine at a loop's head, the last time a backward branch went
+/// there: whether the iteration since did anything that keeps it from
+/// being the same next time.
+#[derive(Clone, Debug, Default)]
+struct Spin {
+    head: u32,
+    cpu: Cpu,
+    stores: u64,
+    entries: u64,
+    cycles: u64,
+    retired: u64,
+    /// When the next event was due: if it has come since, the iteration
+    /// saw what it changed, or will next time.
+    due: u64,
+    /// Cleared by a load a busy wait may not make.
+    clean: bool,
 }
 
 /// Granules remembered per kind of access.
@@ -264,6 +291,11 @@ impl Machine {
             stall: 0,
             half: 0,
             timing: timing::Timing::default(),
+            looped: None,
+            spin: Spin::default(),
+            stores: 0,
+            entries: 0,
+            skipped: 0,
             retired: 0,
             events: Vec::new(),
             taken: Box::new([0; scs::exception::COUNT]),
@@ -451,6 +483,9 @@ impl Machine {
             }
             self.retired += 1;
             self.charge_stalls(1);
+            if let Some(head) = self.looped.take() {
+                self.spin(head, until);
+            }
         }
         Outcome::Budget
     }
@@ -504,6 +539,47 @@ impl Machine {
             }
             self.tick_due = self.tick_due.min(self.bus.soc.due().unwrap_or(u64::MAX));
         }
+    }
+
+    /// A busy wait, skipped. A backward branch to the loop's head found the
+    /// machine as it was the last time: every register the same, and in
+    /// between no store, no exception, no event falling due, and no load
+    /// that pops a FIFO or reads a counter that runs by itself. So nothing
+    /// the loop reads can change
+    /// before the next timed event — a peripheral's, SysTick's — and the
+    /// iterations until then would each be this one again. They are taken
+    /// as run: their cycles, their time and their instructions, up to the
+    /// last that ends before the event; the loop then goes on, and sees
+    /// what the event changed when it comes.
+    fn spin(&mut self, head: u32, until: u64) {
+        let same = self.spin.clean
+            && self.spin.head == head
+            && self.spin.stores == self.stores
+            && self.spin.entries == self.entries
+            && self.spin.due == self.tick_due
+            && self.spin.cpu == self.cpu;
+        if same {
+            let cycles = self.cycles - self.spin.cycles;
+            let per = cycles * self.period;
+            let to = self.tick_due.min(until);
+            if per > 0 && to > self.time {
+                let n = (to - self.time - 1) / per;
+                self.cycles += n * cycles;
+                self.time += n * per;
+                self.retired += n * (self.retired - self.spin.retired);
+                self.skipped += n * per;
+            }
+        }
+        self.spin = Spin {
+            head,
+            cpu: self.cpu.clone(),
+            stores: self.stores,
+            entries: self.entries,
+            cycles: self.cycles,
+            retired: self.retired,
+            due: self.tick_due,
+            clean: true,
+        };
     }
 
     /// When the next timed event is due, in picoseconds: SysTick reaching

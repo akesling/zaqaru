@@ -63,6 +63,7 @@ impl Machine {
     /// has to happen here the same way.
     pub(crate) fn enter(&mut self, n: u32) -> Result<(), Outcome> {
         self.stall += self.timing.entry;
+        self.entries += 1;
         let from_handler = self.cpu.mode == Mode::Handler;
         let on_psp = self.cpu.on_psp();
         let extended = self.cpu.fpca;

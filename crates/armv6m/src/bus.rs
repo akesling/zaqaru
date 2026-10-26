@@ -370,6 +370,16 @@ impl Soc {
         }
     }
 
+    /// Whether a load at `addr` changes something (a FIFO popped) or reads
+    /// something that changes by itself (a timer's counter): what a busy
+    /// wait may not do and still be skipped (see `Machine::spin`).
+    pub fn impure(&self, addr: u32) -> bool {
+        match self {
+            Soc::G0(_) => crate::stm32g0::USARTS.iter().any(|&(base, _)| addr == base + 0x24),
+            Soc::H7(_) => Stm32h7::impure(addr),
+        }
+    }
+
     /// The clocks RCC is giving out.
     pub fn clocks(&self) -> crate::clock::Clocks {
         match self {
