@@ -105,6 +105,8 @@ but whether a browser lets it be claimed is untested.
 | `temperature 31.5` | what the TMP117 reads from now on |
 | `humility spi -p 1 -w 0x9f,0,0,0 -r -n 4` | the W25Q80's JEDEC ID, `ef 40 14`, through the SPI driver |
 | `humility hiffy -c SpRot.status` | sprot's status call: a request over SPI3, ROT_IRQ, and the RoT's response |
+| `humility hiffy -c SpRot.rot_state` | the RoT's boot state: slot A active and valid, slot B erased; `rot_boot_info`, `block_size` and `io_stats` answer too |
+| `humility hiffy -c SpRot.read_caboose_region -a slot=A,offset=0 -n 140` | the RoT image's caboose, TLV-C as Hubris writes one |
 | `humility hiffy -T 15000 -c Update.prep_image_update` | the update server erases flash bank 2: five seconds of the board's time, as the part's datasheet has it, past hiffy's default timeout |
 | `humility flash -F` | flashes the archive's image onto the board through probe-rs's own flash algorithm, then resets it |
 | `humility flash --verify` | reads the flash back and compares it with the archive |
@@ -147,8 +149,10 @@ Outside the page, `zaqaru run web/demo/hubris.wasm -p 8080:80` and
   lines: a TMP117 temperature sensor, an AT24C02 EEPROM, a W25Q80 SPI
   flash (JEDEC and unique IDs, reads, page programs, erases), and a root
   of trust that answers the SP-to-RoT protocol as the LPC55's sprot server
-  does — status, I/O counters and lifecycle state; it refuses updates,
-  attestation and the rest as unknown messages. A SPI part is selected by
+  does — status, I/O counters, lifecycle state, boot state and boot
+  information, the update block size, and its images' cabooses; it refuses
+  updates, attestation and the rest as unknown messages, as an LPC55 built
+  without them does. A SPI part is selected by
   its chip-select pin, driven low as a GPIO output.
 - The debug architecture: each part's debug port and APs, the ROM tables
   and CoreSight IDs, DHCSR halting and stepping, DCRSR register transfer,

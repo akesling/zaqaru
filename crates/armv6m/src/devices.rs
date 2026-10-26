@@ -453,8 +453,12 @@ const BUF_SIZE: usize = 1024;
 /// with nothing clocked while a response waits drops it.
 ///
 /// It answers what an RoT can say without being one: its status, its I/O
-/// counters and its lifecycle state. The rest — updates, attestation,
-/// cabooses, dumps — it refuses as a message type it does not know.
+/// counters and its lifecycle state; its boot state and boot information —
+/// slot A active and valid, slot B and stage0's next slot erased; its
+/// update block size; and the caboose of its slot A image and of stage0,
+/// TLV-C as Hubris writes one (see [`caboose`]). The rest — updates,
+/// attestation, dumps, the SP's watchdog — it refuses as a message type it
+/// does not know, as an LPC55 built without them does.
 #[derive(Clone, Debug)]
 pub struct Rot {
     /// The ROT_IRQ line: (port, pin), 0 for port A.
@@ -584,6 +588,24 @@ impl Rot {
                         }
                         // State(LifecycleState): Development.
                         [10, 0] => vec![OK, 10, OK, 0, 2],
+                        // RotState: RotState::V2 { state }.
+                        [2] => [&[OK, 3, 1][..], &boot_state()].concat(),
+                        // Update(GetBlockSize): an LPC55's 512-byte page.
+                        [3, 0] => [&[OK, 4, 0][..], &512u32.to_le_bytes()].concat(),
+                        // Update(BootInfo), and VersionedBootInfo, V1 or V2.
+                        [3, 7] => [&[OK, 4, 1][..], &boot_info(1)].concat(),
+                        [3, 8, version] => {
+                            let v = version.min(2);
+                            [&[OK, 4, 2, v - 1][..], &boot_info(v.max(1))].concat()
+                        }
+                        // Caboose(Size, Read), and their component forms:
+                        // Hubris's slots, and stage0's.
+                        [6, 0, slot] => caboose_size(0, slot),
+                        [6, 2, component, slot] => caboose_size(component, slot),
+                        [6, 1, slot, ref read @ ..] if read.len() == 8 => caboose_read(0, slot, read, 1),
+                        [6, 3, component, slot, ref read @ ..] if read.len() == 8 => {
+                            caboose_read(component, slot, read, 3)
+                        }
                         _ => protocol(bad_type),
                     }
                 }
@@ -596,6 +618,116 @@ impl Rot {
         message.extend(crc.to_le_bytes());
         message
     }
+}
+
+/// FWIDs: slot A's and stage0's images, made up; an erased slot's, the
+/// SHA3-256 of nothing, as the LPC55 measures one.
+const FWID_A: [u8; 32] = *b"zaqaru emulated RoT slot A image";
+const FWID_STAGE0: [u8; 32] = *b"zaqaru emulated RoT stage0 image";
+const FWID_ERASED: [u8; 32] = [
+    0xa7, 0xff, 0xc6, 0xf8, 0xbf, 0x1e, 0xd7, 0x66, 0x51, 0xc1, 0x47, 0x56, 0xa0, 0x61, 0xd6, 0x62, 0xf5, 0x80, 0xff, 0x4d,
+    0xe4, 0x3b, 0x49, 0xfa, 0x82, 0xd8, 0x0a, 0x4b, 0x80, 0xf8, 0x43, 0x4a,
+];
+/// `Result<(), ImageError>`: Ok, or FirstPageErased.
+const IMAGE_OK: [u8; 1] = [0];
+const IMAGE_ERASED: [u8; 2] = [1, 1];
+
+/// RotBootStateV2, hubpacked: slot A active; A, B, stage0, stage0next.
+fn boot_state() -> Vec<u8> {
+    let slots: [(&[u8; 32], &[u8]); 4] =
+        [(&FWID_A, &IMAGE_OK), (&FWID_ERASED, &IMAGE_ERASED), (&FWID_STAGE0, &IMAGE_OK), (&FWID_ERASED, &IMAGE_ERASED)];
+    let mut state = vec![0u8];
+    for (digest, status) in slots {
+        state.extend(digest);
+        state.extend(status);
+    }
+    state
+}
+
+/// RotBootInfo (1) or RotBootInfoV2 (2), hubpacked: slot A active and
+/// preferred, nothing pending or transient.
+fn boot_info(version: u8) -> Vec<u8> {
+    let preferences = [0u8, 0, 0, 0];
+    if version == 1 {
+        // Each slot's digest an Option: A's, and B's of its erased flash.
+        return [&preferences[..], &[1], &FWID_A, &[1], &FWID_ERASED].concat();
+    }
+    let fwid = |digest: &[u8; 32]| [&[0u8][..], digest].concat();
+    [
+        &preferences[..],
+        &fwid(&FWID_A),
+        &fwid(&FWID_ERASED),
+        &fwid(&FWID_STAGE0),
+        &fwid(&FWID_ERASED),
+        &IMAGE_OK,
+        &IMAGE_ERASED,
+        &IMAGE_OK,
+        &IMAGE_ERASED,
+    ]
+    .concat()
+}
+
+/// The caboose of a component's (Hubris 0, stage0 1) slot (A 0, B 1), if
+/// it has one: only the images there are have one.
+fn caboose_of(component: u8, slot: u8) -> Option<Vec<u8>> {
+    let name: &[u8] = match (component, slot) {
+        (0, 0) => b"zaqaru-rot",
+        (1, 0) => b"zaqaru-stage0",
+        _ => return None,
+    };
+    let commit = [b'0'; 40];
+    Some(caboose(&[(b"GITC", &commit), (b"BORD", b"rot-carrier-2"), (b"NAME", name), (b"VERS", b"0.0.0")]))
+}
+
+/// `RspBody::Caboose`: a `Result<CabooseRsp, RawCabooseError>`, its error
+/// MissingCaboose when the slot has none.
+fn caboose_size(component: u8, slot: u8) -> Vec<u8> {
+    let response = if component == 0 { 0 } else { 2 };
+    match caboose_of(component, slot) {
+        Some(caboose) => [&[0, 7, 0, response][..], &(caboose.len() as u32).to_le_bytes()].concat(),
+        None => vec![0, 7, 1, 2],
+    }
+}
+
+/// A caboose read: `start` and `size`, and the bytes after the response,
+/// as the LPC55 sends its blobs; InvalidRead if it reaches past the end.
+fn caboose_read(component: u8, slot: u8, read: &[u8], response: u8) -> Vec<u8> {
+    let Some(caboose) = caboose_of(component, slot) else { return vec![0, 7, 1, 2] };
+    let start = u32::from_le_bytes(read[0..4].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(read[4..8].try_into().unwrap()) as usize;
+    match caboose.get(start..start.saturating_add(size)) {
+        Some(bytes) => [&[0, 7, 0, response][..], bytes].concat(),
+        None => vec![0, 7, 1, 0],
+    }
+}
+
+/// A caboose's contents: TLV-C chunks, each a tag, a length, the header's
+/// checksum, the body padded to four bytes, and the body's CRC-32C.
+pub fn caboose(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (tag, body) in chunks {
+        let len = body.len() as u32;
+        let header = !u32::from_le_bytes(**tag).wrapping_mul(0x6b32_9f69).wrapping_add(len);
+        out.extend(*tag);
+        out.extend(len.to_le_bytes());
+        out.extend(header.to_le_bytes());
+        out.extend(*body);
+        out.resize(out.len().next_multiple_of(4), 0);
+        out.extend(crc32c(body).to_le_bytes());
+    }
+    out
+}
+
+/// CRC-32C, the iSCSI polynomial, TLV-C's.
+fn crc32c(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { crc >> 1 ^ 0x82F6_3B78 } else { crc >> 1 };
+        }
+    }
+    !crc
 }
 
 /// CRC-16/XMODEM, sprot's.
@@ -812,8 +944,39 @@ mod tests {
         *bad.last_mut().unwrap() ^= 1;
         rot.request = bad;
         assert_eq!(&rot.answer()[6..9], &[1, 0, 0], "Err(Protocol(InvalidCrc))");
-        rot.request = request(&[3, 0]);
+        // Update(Prep(ImageB)): no updates here.
+        rot.request = request(&[3, 1, 2]);
         assert_eq!(&rot.answer()[6..9], &[1, 0, 3], "Err(Protocol(BadMessageType))");
+    }
+
+    #[test]
+    fn the_rot_s_boot_state_and_caboose() {
+        let mut rot = Rot::new((3, 0));
+        rot.request = request(&[2]);
+        let state = rot.answer();
+        let size = u16::from_le_bytes([state[4], state[5]]) as usize;
+        assert_eq!(size, 3 + 1 + 4 * 32 + 1 + 2 + 1 + 2, "RotState::V2, all four slots");
+        rot.request = request(&[6, 0, 0]);
+        let sized = rot.answer();
+        let len = u32::from_le_bytes(sized[10..14].try_into().unwrap()) as usize;
+        let mut read = vec![6, 1, 0];
+        read.extend(0u32.to_le_bytes());
+        read.extend((len as u32).to_le_bytes());
+        rot.request = request(&read);
+        let caboose = rot.answer();
+        assert_eq!(&caboose[6..10], &[0, 7, 0, 1], "Ok(CabooseRsp::Read)");
+        assert_eq!(&caboose[10..14], b"GITC");
+        rot.request = request(&[6, 0, 1]);
+        assert_eq!(&rot.answer()[6..10], &[0, 7, 1, 2], "slot B has none: MissingCaboose");
+    }
+
+    #[test]
+    fn tlvc_checksums_are_tlvc_s() {
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+        let chunk = caboose(&[(b"VERS", b"1.0")]);
+        assert_eq!(chunk.len(), 12 + 4 + 4);
+        let header = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+        assert_eq!(header, !u32::from_le_bytes(*b"VERS").wrapping_mul(0x6b32_9f69).wrapping_add(3));
     }
 
     #[test]
