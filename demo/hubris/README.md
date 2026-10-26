@@ -115,6 +115,8 @@ but whether a browser lets it be claimed is untested.
 | `ping` | an ICMPv6 echo request to the board, and its reply |
 | `button` | presses and releases B1, PC13: the user_button task toggles the red LED |
 | `archives` | the Hubris builds there are to flash |
+| `flash gimletlet` | Oxide's Gimletlet 2, with its NIC's KSZ8463 switch and its RoT wired: its network comes up through the switch's VLANs, and `udp hello` and `ping` reach it |
+| `flash psc` | Oxide's PSC rev C, with its revision straps driven and its KSZ8463, FRAM, RoT and temperature sensor wired; the framulator's FRAM test passes. Its management network waits for power and PHYs (VSC85x2) the bench does not have |
 | `flash g031` | makes the board the part the archive was built for, erased, and flashes it — `g031`, `g070`, `h753`, or one uploaded |
 | `humility -p VID:PID …` | the same, through a probe connected from the page |
 | `clock` | the board's simulated time, its speed, and the clocks RCC gives out |
@@ -146,14 +148,18 @@ Outside the page, `zaqaru run web/demo/hubris.wasm -p 8080:80` and
   peripheral register reads back what was written.
 - Of the STM32G0s: RCC, GPIO, the USARTs and the flash interface.
 - What is wired to the H7's buses, from the board file's `i2c` and `spi`
-  lines: a TMP117 temperature sensor, an AT24C02 EEPROM, a W25Q80 SPI
+  lines — or, for an Oxide board flashed onto the bench, the parts that
+  board has (and the straps it drives), from the door's table of them: a TMP117 temperature sensor, an AT24C02 EEPROM, a W25Q80 SPI
   flash (JEDEC and unique IDs, reads, page programs, erases), and a root
   of trust that answers the SP-to-RoT protocol as the LPC55's sprot server
   does — status, I/O counters, lifecycle state, boot state and boot
   information, the update block size, and its images' cabooses; it refuses
   updates, attestation and the rest as unknown messages, as an LPC55 built
-  without them does. A SPI part is selected by
-  its chip-select pin, driven low as a GPIO output.
+  without them does; a KSZ8463 Ethernet switch, whose VLAN table and port
+  VLAN IDs tag and untag the frames between the MAC and the cable, as it
+  sits between them on a Gimletlet; and an MB85RS64T FRAM. The MAC inserts
+  VLAN tags from its context descriptors and strips them into RDES0. A SPI
+  part is selected by its chip-select pin, driven low as a GPIO output.
 - The debug architecture: each part's debug port and APs, the ROM tables
   and CoreSight IDs, DHCSR halting and stepping, DCRSR register transfer,
   DEMCR vector catch, DFSR, the breakpoint unit (an M7's FPB, an M0+'s

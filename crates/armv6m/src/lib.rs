@@ -725,8 +725,15 @@ impl Machine {
         let (edges, serial) = self.bus.soc.outputs();
         self.events.extend(edges.drain(..).map(|edge| Event::Pin { time, edge }));
         self.events.extend(serial.drain(..).map(|byte| Event::Serial { time, byte }));
-        if let Some(frames) = self.bus.soc.frames() {
-            self.events.extend(frames.drain(..).map(|frame| Event::Frame { time, frame }));
+        let crate::bus::Soc::H7(soc) = &mut self.bus.soc else { return };
+        let frames: Vec<Vec<u8>> = soc.eth.outgoing.drain(..).collect();
+        for frame in frames {
+            // Through the switch, if there is one, to the cable.
+            let frame = match soc.switch() {
+                Some(switch) => switch.to_cable(frame),
+                None => Some(frame),
+            };
+            self.events.extend(frame.map(|frame| Event::Frame { time, frame }));
         }
     }
 
@@ -748,7 +755,13 @@ impl Machine {
     /// descriptor for it. False if the part has no Ethernet.
     pub fn deliver(&mut self, frame: Vec<u8>) -> bool {
         let crate::bus::Soc::H7(soc) = &mut self.bus.soc else { return false };
-        soc.eth.arrive(frame, self.time);
+        let frame = match soc.switch() {
+            Some(switch) => switch.from_cable(frame),
+            None => Some(frame),
+        };
+        if let Some(frame) = frame {
+            soc.eth.arrive(frame, self.time);
+        }
         // The frame is due when it is all in.
         self.sync_systick();
         true

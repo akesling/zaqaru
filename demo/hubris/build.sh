@@ -63,16 +63,19 @@ fi
 # The board boots the H753 demo; the G031 and G070 demos — the G070's
 # pings over USART1 — are there to flash onto it (`flash g070` at the
 # bench's prompt), and so is anything else a user uploads.
+# Oxide's own boards are there too: a Gimletlet, and a PSC, whose straps
+# the bench drives when it is flashed (see the door's `flash`).
 mkdir -p "$work/bench/archives"
-for app in g031 g070 h753; do
-  case $app in
-    h7*) dir=demo-stm32h7-nucleo ;;
-    *) dir=demo-stm32g0-nucleo ;;
-  esac
-  echo "build: Hubris, app-$app.toml"
-  (cd "$hubris" && cargo xtask dist "app/$dir/app-$app.toml")
-  cp "$hubris/target/demo-stm32${app}-nucleo/dist/default/build-demo-stm32${app}-nucleo-image-default.zip" \
-    "$work/bench/archives/$app.zip"
+for app in g031:demo-stm32g0-nucleo/app-g031.toml:demo-stm32g031-nucleo \
+  g070:demo-stm32g0-nucleo/app-g070.toml:demo-stm32g070-nucleo \
+  h753:demo-stm32h7-nucleo/app-h753.toml:demo-stm32h753-nucleo \
+  gimletlet:gimletlet/app.toml:gimletlet \
+  psc:psc/rev-c-dev.toml:psc-c-dev; do
+  name=${app%%:*} rest=${app#*:}
+  toml=${rest%%:*} image=${rest#*:}
+  echo "build: Hubris, $toml"
+  (cd "$hubris" && cargo xtask dist "app/$toml")
+  cp "$hubris/target/$image/dist/default/build-$image-image-default.zip" "$work/bench/archives/$name.zip"
 done
 dist="$hubris/target/demo-stm32h753-nucleo/dist/default"
 cp "$dist/final.bin" "$work/bench/final.bin"

@@ -197,9 +197,11 @@ pub struct Board {
     pub heard: VecDeque<(u64, String)>,
     heard_count: u64,
     pings: u16,
-    /// The parts wired to the buses, as the configuration's lines, for a
-    /// part put on the bench to be wired the same.
+    /// The parts wired to the buses, as configuration lines, for a part
+    /// put on the bench to be wired the same; and the configuration's own,
+    /// for `rewire`.
     pub wiring: Vec<String>,
+    configured: Vec<String>,
     /// Datagrams the board sent to a group rather than to the host —
     /// udpbroadcast's, every second — counted, and the latest, apart from
     /// what was sent to the host.
@@ -398,7 +400,11 @@ impl Board {
     /// - `temperature 31.5` is what the temperature sensors on its buses
     ///   read, in degrees Celsius;
     /// - `speed`, `pause`, `resume` and `advance`: see
-    ///   [`Board::clock_command`].
+    ///   [`Board::clock_command`];
+    /// - `wire LINE` wires a part to the board's buses now, as a board
+    ///   file's `i2c` and `spi` lines do; `unwire` leaves the next part put
+    ///   on the bench with nothing wired, and `rewire` with what the board
+    ///   file wires — for a board other than the bench's own.
     pub fn command(&mut self, line: &str) -> Result<(), String> {
         let (verb, rest) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
         match verb {
@@ -452,6 +458,20 @@ impl Board {
                 self.send_frames(frames)
             }
             "speed" | "pause" | "resume" | "advance" => self.clock_command(verb, rest.trim()).map(|_| ()),
+            "wire" => {
+                let line = rest.trim();
+                self.machine.attach(armv6m::devices::Wiring::parse(line)?)?;
+                self.wiring.push(line.to_string());
+                Ok(())
+            }
+            "unwire" => {
+                self.wiring.clear();
+                Ok(())
+            }
+            "rewire" => {
+                self.wiring = self.configured.clone();
+                Ok(())
+            }
             "temperature" => {
                 let celsius: f64 =
                     rest.trim().parse().map_err(|_| format!("temperature `{}`: expected degrees Celsius", rest.trim()))?;
@@ -480,7 +500,7 @@ impl Board {
                 Ok(())
             }
             "" => Ok(()),
-            other => Err(format!("`{other}`: the board takes `part NAME`, `image TEXT`, `pin PIN LEVEL`, `udp PORT TEXT`, `ping`, `temperature C`, `speed X`, `pause`, `resume` and `advance D`")),
+            other => Err(format!("`{other}`: the board takes `part NAME`, `image TEXT`, `pin PIN LEVEL`, `udp PORT TEXT`, `ping`, `temperature C`, `speed X`, `pause`, `resume`, `advance D`, `wire LINE`, `unwire` and `rewire`")),
         }
     }
 
@@ -1138,6 +1158,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             heard: VecDeque::new(),
             heard_count: 0,
             pings: 0,
+            configured: configuration.wiring.clone(),
             wiring: configuration.wiring,
             multicast: 0,
             last_multicast: None,

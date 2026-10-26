@@ -343,6 +343,15 @@ impl Stm32h7 {
         Ok(())
     }
 
+    /// The switch between the MAC and the cable, if a KSZ8463 is wired:
+    /// the MAC is its port 3 and the cable its port 1.
+    pub fn switch(&self) -> Option<&crate::devices::Ksz8463> {
+        self.spi_parts.iter().find_map(|w| match &w.part {
+            SpiPart::Ksz8463(ksz) => Some(ksz),
+            _ => None,
+        })
+    }
+
     /// What is wired to the buses, as the lines that would wire it.
     pub fn wired(&self) -> Vec<String> {
         let i2c = self.i2cs.iter().enumerate().flat_map(|(n, i2c)| {

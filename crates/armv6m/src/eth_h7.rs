@@ -17,6 +17,10 @@
 //! the interpacket gap, at the 100 Mbit/s of MACCR's FES (10 without it).
 //! A frame sent reaches the far end, and raises TI, when it is off the
 //! wire; one arriving reaches the receive DMA when it is all in. The
+//! VLAN tags are the MAC's: a context descriptor's VLTV sets the tag the
+//! next frames are sent with, inserted when their TDES2 asks; a tagged
+//! frame arriving, with MACVTR's EVLS, has its tag stripped and reported
+//! in RDES0. The
 //! checksum offload is not modelled, which Hubris's stack, computing its
 //! own, does not notice; neither are the MAC's filters, which promiscuous
 //! mode — what Hubris sets — passes everything through anyway.
@@ -143,6 +147,30 @@ pub struct Ethernet {
     /// Frames that have gone, for whoever is at the other end.
     pub outgoing: Vec<Vec<u8>>,
     missed: u32,
+    /// The VLAN tag a context descriptor last set, for frames to come.
+    pub tx_vlan: Option<u16>,
+}
+
+/// MACVTR: EVLS, stripping VLAN tags on receive.
+const MACVTR: u32 = 0x0050;
+
+/// A frame with a VLAN tag inserted after its addresses.
+pub fn tagged(frame: &[u8], tci: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(frame.len() + 4);
+    out.extend_from_slice(&frame[..12.min(frame.len())]);
+    out.extend_from_slice(&[0x81, 0x00]);
+    out.extend_from_slice(&tci.to_be_bytes());
+    out.extend_from_slice(frame.get(12..).unwrap_or(&[]));
+    out
+}
+
+/// A frame's VLAN tag, if it has one, and the frame without it.
+pub fn untagged(frame: &[u8]) -> Option<(u16, Vec<u8>)> {
+    if frame.get(12..14) != Some(&[0x81, 0x00]) || frame.len() < 18 {
+        return None;
+    }
+    let tci = u16::from_be_bytes([frame[14], frame[15]]);
+    Some((tci, [&frame[..12], &frame[16..]].concat()))
 }
 
 /// MACCR's FES: 100 Mbit/s rather than 10.
@@ -159,6 +187,11 @@ impl Ethernet {
 
     pub fn contains(addr: u32) -> bool {
         (BASE..END).contains(&addr)
+    }
+
+    /// Whether VLAN tags are stripped from frames received.
+    pub fn strips_vlan(&self) -> bool {
+        self.reg(MACVTR) >> 21 & 3 != 0
     }
 
     /// A frame's time on the wire, in picoseconds: preamble and start

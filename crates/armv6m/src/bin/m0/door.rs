@@ -103,8 +103,9 @@ const HELP: &str = "\
                             run it
     archives                the Hubris builds there are to flash
     flash NAME              make the board the part NAME was built for and
-                            flash it — g031, g070, h753, or one you
-                            uploaded (drop an archive on the terminal)
+                            flash it — g031, g070, h753, Oxide's
+                            gimletlet and psc, or one you uploaded (drop
+                            an archive on the terminal)
     button                  press and release the Nucleo's user button,
                             PC13 on an H7's
     udp [PORT] TEXT         send TEXT to the board's UDP PORT (7, echo, if
@@ -288,6 +289,39 @@ fn upload(name: &str, bytes: &[u8]) -> String {
     }
 }
 
+/// The board a Hubris archive was built for: `board = "…"` in its
+/// `app.toml`.
+fn board_of(app_toml: &str) -> Option<&str> {
+    let line = app_toml.lines().find(|line| line.trim_start().starts_with("board"))?;
+    let value = line.split_once('=')?.1.trim();
+    value.strip_prefix('"')?.split('"').next()
+}
+
+/// The parts a board has on its buses that its Hubris expects, as board
+/// file lines; `None` for a board the bench's own wiring is (a Nucleo).
+/// A Gimletlet's KSZ8463 NIC and RoT; a PSC's KSZ8463, FRAM, RoT and
+/// temperature sensor.
+fn wiring(board: &str) -> Option<&'static [&'static str]> {
+    match board {
+        "gimletlet-2" => Some(&["spi SPI3 PA15 rot PD0", "spi SPI4 PE11 ksz8463"]),
+        "psc-b" | "psc-c" => {
+            Some(&["spi SPI2 PI0 ksz8463", "spi SPI2 PB12 mb85rs64t", "spi SPI4 PE4 rot PE3", "i2c I2C2 0x48 tmp117"])
+        }
+        _ => None,
+    }
+}
+
+/// What a board drives on its own pins that its Hubris reads at startup:
+/// the straps that say which revision it is. A PSC's are PG0 to PG2, which
+/// its startup reads and asserts on.
+fn straps(board: &str) -> &'static [&'static str] {
+    match board {
+        "psc-b" => &["pin PG0 high", "pin PG1 low", "pin PG2 low"],
+        "psc-c" => &["pin PG0 low", "pin PG1 high", "pin PG2 low"],
+        _ => &[],
+    }
+}
+
 /// The part a Hubris archive was built for, from the `chip: Some("…")` its
 /// `img/flash.ron` says.
 fn part_of(flash_ron: &str) -> Option<&str> {
@@ -375,19 +409,35 @@ impl FrontDoor {
         let Some(archive) = Self::find(name) else {
             return out.write_all(format!("flash: no archive `{name}`; `archives` lists them\n").as_bytes());
         };
-        // Read from the archive itself: `img/flash.ron` names the part.
-        let flash_ron = std::fs::read(&archive)
-            .ok()
-            .and_then(|bytes| crate::zip::entry(&bytes, "img/flash.ron"))
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default();
+        // Read from the archive itself: `img/flash.ron` names the part, and
+        // `app.toml` the board.
+        let bytes = std::fs::read(&archive).unwrap_or_default();
+        let text = |name: &str| {
+            crate::zip::entry(&bytes, name).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
+        };
+        let (flash_ron, app_toml) = (text("img/flash.ron"), text("app.toml"));
         let Some(part) = part_of(&flash_ron) else {
             return out.write_all(format!("flash: {archive} does not say what part it is for\n").as_bytes());
         };
+        let board = board_of(&app_toml).unwrap_or("");
+        let parts = wiring(board);
+        let _ = std::fs::write("/dev/board", if parts.is_some() { "unwire\n" } else { "rewire\n" });
         if let Err(e) = std::fs::write("/dev/board", format!("part {part}\n")) {
             return out.write_all(format!("flash: the board would not become an {part}: {e}\n").as_bytes());
         }
         out.write_all(format!("the board is now an {part}, erased; flashing {archive}\n").as_bytes())?;
+        if let Some(parts) = parts {
+            for line in parts {
+                if let Err(e) = std::fs::write("/dev/board", format!("wire {line}\n")) {
+                    out.write_all(format!("flash: {board}'s `{line}`: {e}\n").as_bytes())?;
+                }
+            }
+            out.write_all(format!("{board}'s parts: {}\n", parts.join("; ")).as_bytes())?;
+        }
+        let straps = straps(board);
+        if !straps.is_empty() && straps.iter().all(|line| std::fs::write("/dev/board", format!("{line}\n")).is_ok()) {
+            out.write_all(format!("{board}'s straps: {}\n", straps.join(", ")).as_bytes())?;
+        }
         let previous = self.archive.lock().unwrap_or_else(|e| e.into_inner()).replace(archive.clone());
         let flashed = self.run_humility(&["flash".to_string()], out)?;
         if flashed {
@@ -424,6 +474,13 @@ fn split(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::split;
+
+    #[test]
+    fn an_archive_says_its_board_in_app_toml() {
+        assert_eq!(super::board_of("name = \"psc-c-dev\"\nboard = \"psc-c\"\n"), Some("psc-c"));
+        assert_eq!(super::board_of("name = \"x\"\n"), None);
+        assert_eq!(super::straps("psc-c").len(), 3);
+    }
 
     #[test]
     fn an_archive_says_its_part_in_flash_ron() {

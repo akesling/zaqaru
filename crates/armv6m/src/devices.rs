@@ -12,6 +12,12 @@
 //! - [`NorFlash`], a Winbond W25Q80 SPI NOR flash: its JEDEC ID, reads,
 //!   write-enable, page programs that only clear bits, and sector, block
 //!   and chip erases, each busy for its datasheet's typical time.
+//! - [`Ksz8463`], Microchip's three-port Ethernet switch, managed over SPI
+//!   as Oxide's boards manage it: its registers, its chip ID, its two PHY
+//!   ports' link up, and the indirect access to its VLAN table, MAC table
+//!   and MIB counters.
+//! - [`Fram`], a Fujitsu MB85RS64T: 8 KiB of FRAM, its device ID, and
+//!   reads and writes that take no time.
 //! - [`Rot`], the root of trust a Hubris service processor talks to over
 //!   SPI: the SP-to-RoT protocol (`drv/sprot-api`) as the LPC55's server
 //!   answers it, with its ROT_IRQ line to say a response is ready, a while
@@ -252,12 +258,16 @@ impl Registers {
 pub enum SpiPart {
     Flash(NorFlash),
     Rot(Rot),
+    Ksz8463(Ksz8463),
+    Fram(Fram),
 }
 
 impl SpiPart {
     pub fn select(&mut self) {
         match self {
             SpiPart::Flash(p) => p.select(),
+            SpiPart::Ksz8463(p) => p.select(),
+            SpiPart::Fram(p) => p.select(),
             SpiPart::Rot(p) => p.select(),
         }
     }
@@ -267,6 +277,8 @@ impl SpiPart {
     pub fn exchange(&mut self, mosi: u8, now: u64) -> u8 {
         match self {
             SpiPart::Flash(p) => p.exchange(mosi, now),
+            SpiPart::Ksz8463(p) => p.exchange(mosi),
+            SpiPart::Fram(p) => p.exchange(mosi),
             SpiPart::Rot(p) => p.exchange(mosi),
         }
     }
@@ -275,6 +287,8 @@ impl SpiPart {
     pub fn deselect(&mut self, now: u64) {
         match self {
             SpiPart::Flash(p) => p.deselect(now),
+            SpiPart::Ksz8463(p) => p.deselect(),
+            SpiPart::Fram(p) => p.deselect(),
             SpiPart::Rot(p) => p.deselect(now),
         }
     }
@@ -283,8 +297,8 @@ impl SpiPart {
     /// response ready.
     pub fn due(&self) -> Option<u64> {
         match self {
-            SpiPart::Flash(_) => None,
             SpiPart::Rot(p) => p.ready_at,
+            _ => None,
         }
     }
 
@@ -298,14 +312,16 @@ impl SpiPart {
     /// ROT_IRQ, low when a response waits.
     pub fn line(&self) -> Option<((usize, u8), bool)> {
         match self {
-            SpiPart::Flash(_) => None,
             SpiPart::Rot(p) => Some((p.irq, !p.responding)),
+            _ => None,
         }
     }
 
     pub fn describe(&self) -> String {
         match self {
             SpiPart::Flash(p) => format!("W25Q80 flash, {} KiB", p.memory.len() / 1024),
+            SpiPart::Ksz8463(p) => format!("KSZ8463 switch, {}", if p.enabled() { "started" } else { "stopped" }),
+            SpiPart::Fram(_) => "MB85RS64T FRAM, 8 KiB".to_string(),
             SpiPart::Rot(p) => format!(
                 "root of trust (sprot v{}), ROT_IRQ on {}, {} requests answered",
                 CURRENT_VERSION,
@@ -439,6 +455,259 @@ impl NorFlash {
 impl Default for NorFlash {
     fn default() -> Self {
         NorFlash::new()
+    }
+}
+
+/// Microchip's KSZ8463: a command of two bytes, big-endian — a write bit,
+/// the address's bits 9 to 2, and four byte enables — then the data,
+/// little-endian, from the first byte enabled. Registers are 16 bits.
+///
+/// Writes to CIDER start and stop the switch; GRR's reset puts the
+/// registers back; IACR asks for an indirect access, which completes at
+/// once: a VLAN table entry written or read through IADR4 and 5, a
+/// dynamic MAC table entry read (none: the table is empty), a MIB counter
+/// read (zero, and valid).
+#[derive(Clone, Debug)]
+pub struct Ksz8463 {
+    registers: Vec<u16>,
+    vlans: [u32; 16],
+    command: u16,
+    frames: usize,
+    wrote: bool,
+}
+
+impl Ksz8463 {
+    const CIDER: usize = 0x000;
+    const IADR1: usize = 0x026;
+    const IADR4: usize = 0x02C;
+    const IADR5: usize = 0x02E;
+    const IACR: usize = 0x030;
+    const GRR: usize = 0x126;
+
+    pub fn new() -> Ksz8463 {
+        let mut part = Ksz8463 { registers: vec![0; 0x200], vlans: [0; 16], command: 0, frames: 0, wrote: false };
+        part.reset();
+        part
+    }
+
+    fn reset(&mut self) {
+        self.registers.fill(0);
+        self.registers[Self::CIDER / 2] = 0x8452;
+        // Ports 1 and 2's PHYs: autonegotiating 100BASE-TX full duplex, and
+        // the link up with it done.
+        for (control, status) in [(0x04C, 0x04E), (0x058, 0x05A)] {
+            self.registers[control / 2] = 0x3100;
+            self.registers[status / 2] = 0x786D;
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.registers[Self::CIDER / 2] & 1 != 0
+    }
+
+    /// Port 1's default VLAN ID: what a frame arriving untagged there is
+    /// given.
+    fn port1_vid(&self) -> u16 {
+        self.registers[0x070 / 2] & 0xFFF
+    }
+
+    /// The ports a VLAN goes to, as a mask of ports 1 (bit 0) to 3, if its
+    /// table entry is valid; `None` if the table has no entries at all,
+    /// which is a switch not doing VLANs.
+    fn vlan_ports(&self, vid: u16) -> Option<Option<u8>> {
+        let valid = |entry: &&u32| *entry & 1 << 19 != 0;
+        if !self.vlans.iter().any(|e| valid(&e)) {
+            return None;
+        }
+        Some(self.vlans.iter().filter(valid).find(|&&e| e as u16 & 0xFFF == vid).map(|&e| (e >> 16 & 7) as u8))
+    }
+
+    /// A frame from the SP (port 3) toward the cable (port 1), as the
+    /// switch forwards it: untagged, if its VLAN goes to port 1, and
+    /// dropped if not.
+    pub fn to_cable(&self, frame: Vec<u8>) -> Option<Vec<u8>> {
+        if !self.enabled() {
+            return None;
+        }
+        match (crate::eth_h7::untagged(&frame), self.vlan_ports(0)) {
+            (_, None) => Some(frame),
+            (Some((tci, inner)), Some(_)) => match self.vlan_ports(tci & 0xFFF) {
+                Some(Some(ports)) if ports & 1 != 0 => Some(inner),
+                _ => None,
+            },
+            (None, Some(_)) => None,
+        }
+    }
+
+    /// A frame from the cable (port 1) toward the SP (port 3): given port
+    /// 1's VLAN, and tagged with it, if that VLAN goes to port 3.
+    pub fn from_cable(&self, frame: Vec<u8>) -> Option<Vec<u8>> {
+        if !self.enabled() {
+            return None;
+        }
+        let vid = self.port1_vid();
+        match self.vlan_ports(vid) {
+            None => Some(frame),
+            Some(Some(ports)) if ports & 4 != 0 => Some(crate::eth_h7::tagged(&frame, vid)),
+            Some(_) => None,
+        }
+    }
+
+    fn select(&mut self) {
+        self.frames = 0;
+        self.wrote = false;
+    }
+
+    /// The byte address the data's `n`th byte goes to.
+    fn address(&self, n: usize) -> usize {
+        let base = usize::from(self.command >> 4 & 0x3FC);
+        let enables = self.command >> 2 & 0xF;
+        (base + enables.trailing_zeros().min(3) as usize + n) & 0x3FF
+    }
+
+    fn exchange(&mut self, mosi: u8) -> u8 {
+        let frame = self.frames;
+        self.frames += 1;
+        match frame {
+            0 => {
+                self.command = u16::from(mosi) << 8;
+                0
+            }
+            1 => {
+                self.command |= u16::from(mosi);
+                0
+            }
+            n => {
+                let at = self.address(n - 2);
+                let register = &mut self.registers[at / 2];
+                let shift = 8 * (at & 1);
+                if self.command & 0x8000 != 0 {
+                    *register = *register & !(0xFF << shift) | u16::from(mosi) << shift;
+                    self.wrote = true;
+                    0
+                } else {
+                    (*register >> shift) as u8
+                }
+            }
+        }
+    }
+
+    /// What a write does, once its last byte is in.
+    fn deselect(&mut self) {
+        if !std::mem::take(&mut self.wrote) {
+            return;
+        }
+        match self.address(0) & !1 {
+            Self::CIDER => self.registers[0] = 0x8452 | self.registers[0] & 1,
+            Self::GRR if self.registers[Self::GRR / 2] & 1 != 0 => {
+                self.reset();
+                self.registers[Self::GRR / 2] = 1;
+            }
+            Self::IACR => self.indirect(self.registers[Self::IACR / 2]),
+            _ => {}
+        }
+    }
+
+    /// IACR: read (bit 12) or write, the table (bits 11 and 10: static MAC,
+    /// VLAN, dynamic MAC, MIB) and the entry.
+    fn indirect(&mut self, iacr: u16) {
+        let read = iacr & 1 << 12 != 0;
+        let entry = usize::from(iacr & 0x3FF);
+        let data = |r: &[u16]| u32::from(r[Self::IADR5 / 2]) << 16 | u32::from(r[Self::IADR4 / 2]);
+        match (iacr >> 10 & 3, read) {
+            (0b01, false) => self.vlans[entry % 16] = data(&self.registers),
+            (0b01, true) => {
+                let v = self.vlans[entry % 16];
+                self.registers[Self::IADR5 / 2] = (v >> 16) as u16;
+                self.registers[Self::IADR4 / 2] = v as u16;
+            }
+            // Ready, and empty.
+            (0b10, true) => self.registers[Self::IADR1 / 2] = 1 << 2,
+            // Valid, and nothing counted.
+            (0b11, true) => {
+                self.registers[Self::IADR5 / 2] = 1 << 14;
+                self.registers[Self::IADR4 / 2] = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Default for Ksz8463 {
+    fn default() -> Self {
+        Ksz8463::new()
+    }
+}
+
+/// A Fujitsu MB85RS64T: 8 KiB of ferroelectric RAM, two-byte addresses,
+/// and none of a flash's waiting.
+#[derive(Clone, Debug)]
+pub struct Fram {
+    pub memory: Vec<u8>,
+    command: Option<u8>,
+    address: u16,
+    frames: usize,
+    write_enabled: bool,
+}
+
+impl Fram {
+    /// RDID: Fujitsu, a continuation code, and the MB85RS64T.
+    const ID: [u8; 4] = [0x04, 0x7F, 0x23, 0x03];
+
+    pub fn new() -> Fram {
+        Fram { memory: vec![0; 8 * 1024], command: None, address: 0, frames: 0, write_enabled: false }
+    }
+
+    fn select(&mut self) {
+        self.command = None;
+        self.frames = 0;
+    }
+
+    fn exchange(&mut self, mosi: u8) -> u8 {
+        let Some(command) = self.command else {
+            self.command = Some(mosi);
+            match mosi {
+                0x06 => self.write_enabled = true,
+                0x04 => self.write_enabled = false,
+                _ => {}
+            }
+            return 0;
+        };
+        let n = self.frames;
+        self.frames += 1;
+        if matches!(command, 0x02 | 0x03) && n < 2 {
+            self.address = self.address << 8 | u16::from(mosi);
+            return 0;
+        }
+        let at = usize::from(self.address) % self.memory.len();
+        match command {
+            0x9F => Self::ID.get(n).copied().unwrap_or(0),
+            0x05 => u8::from(self.write_enabled) << 1,
+            0x03 => {
+                self.address = self.address.wrapping_add(1);
+                self.memory[at]
+            }
+            0x02 if self.write_enabled => {
+                self.memory[at] = mosi;
+                self.address = self.address.wrapping_add(1);
+                0
+            }
+            _ => 0,
+        }
+    }
+
+    fn deselect(&mut self) {
+        // A write ends at chip-select's rising edge, and clears WEL.
+        if self.command == Some(0x02) {
+            self.write_enabled = false;
+        }
+        self.command = None;
+    }
+}
+
+impl Default for Fram {
+    fn default() -> Self {
+        Fram::new()
     }
 }
 
@@ -752,7 +1021,7 @@ pub enum Wiring {
 }
 
 /// The parts [`Wiring::parse`] knows.
-pub const PARTS: &str = "i2c parts are tmp117, at24c02 and registers; spi parts are w25q80 and rot";
+pub const PARTS: &str = "i2c parts are tmp117, at24c02 and registers; spi parts are w25q80, mb85rs64t, ksz8463 and rot";
 
 impl Wiring {
     /// `i2c I2C2 0x48 tmp117`, `spi SPI1 PD14 w25q80`, `spi SPI3 PA15 rot
@@ -789,6 +1058,8 @@ impl Wiring {
                 let cs = parse_pin(cs).ok_or_else(|| format!("`{cs}`: expected a pin, `PD14`"))?;
                 let part = match (*part, rest) {
                     ("w25q80", []) => SpiPart::Flash(NorFlash::new()),
+                    ("ksz8463", []) => SpiPart::Ksz8463(Ksz8463::new()),
+                    ("mb85rs64t", []) => SpiPart::Fram(Fram::new()),
                     ("rot", [irq]) => {
                         SpiPart::Rot(Rot::new(parse_pin(irq).ok_or_else(|| format!("`{irq}`: expected ROT_IRQ's pin"))?))
                     }
@@ -977,6 +1248,39 @@ mod tests {
         assert_eq!(chunk.len(), 12 + 4 + 4);
         let header = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
         assert_eq!(header, !u32::from_le_bytes(*b"VERS").wrapping_mul(0x6b32_9f69).wrapping_add(3));
+    }
+
+    fn transfer(part: &mut SpiPart, bytes: &[u8]) -> Vec<u8> {
+        part.select();
+        let out = bytes.iter().map(|&b| part.exchange(b, 0)).collect();
+        part.deselect(0);
+        out
+    }
+
+    #[test]
+    fn the_ksz8463_answers_its_id_and_its_indirect_reads() {
+        let mut ksz = SpiPart::Ksz8463(Ksz8463::new());
+        // A read of CIDER, address 0, the low half: as the driver packs it.
+        assert_eq!(&transfer(&mut ksz, &[0x00, 0x0C, 0, 0])[2..], &[0x52, 0x84]);
+        // Start it: a write of 1 to CIDER.
+        transfer(&mut ksz, &[0x80, 0x0C, 1, 0]);
+        assert_eq!(&transfer(&mut ksz, &[0x00, 0x0C, 0, 0])[2..], &[0x53, 0x84]);
+        // A MIB counter: IACR (0x030) = read, MIB, offset; IADR5 (0x02E,
+        // the high half of 0x02C) valid.
+        let iacr = 1u16 << 12 | 0b11 << 10;
+        transfer(&mut ksz, &[0x83, 0x0C, iacr as u8, (iacr >> 8) as u8]);
+        assert_eq!(&transfer(&mut ksz, &[0x02, 0xF0, 0, 0])[2..], &[0x00, 0x40]);
+    }
+
+    #[test]
+    fn the_fram_answers_its_id_and_keeps_what_is_written() {
+        let mut fram = SpiPart::Fram(Fram::new());
+        assert_eq!(&transfer(&mut fram, &[0x9F, 0, 0, 0, 0])[1..], &[0x04, 0x7F, 0x23, 0x03]);
+        transfer(&mut fram, &[0x02, 0x00, 0x10, 1, 2]);
+        assert_eq!(&transfer(&mut fram, &[0x03, 0x00, 0x10, 0, 0])[3..], &[0, 0], "no WREN, no write");
+        transfer(&mut fram, &[0x06]);
+        transfer(&mut fram, &[0x02, 0x00, 0x10, 1, 2]);
+        assert_eq!(&transfer(&mut fram, &[0x03, 0x00, 0x10, 0, 0])[3..], &[1, 2]);
     }
 
     #[test]

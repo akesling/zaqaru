@@ -300,8 +300,11 @@ impl Bus {
                     eth.tx_unavailable();
                     break;
                 }
-                // A context descriptor (CTXT, bit 30) carries a VLAN tag for
-                // the next; this model does not tag.
+                // A context descriptor (CTXT, bit 30) carries, with VLTV, the
+                // VLAN tag for the frames after it.
+                if tdes3 & 1 << 30 != 0 && tdes3 & 1 << 16 != 0 {
+                    eth.tx_vlan = Some(tdes3 as u16);
+                }
                 if tdes3 & 1 << 30 == 0 {
                     if tdes3 & FD != 0 {
                         frame.clear();
@@ -318,7 +321,12 @@ impl Bus {
                 }
                 eth.tx_advance();
                 if tdes3 & 1 << 30 == 0 && tdes3 & LD != 0 {
-                    eth.transmitted(std::mem::take(&mut frame), tdes2, self.now);
+                    let mut frame = std::mem::take(&mut frame);
+                    // TDES2's VTIR: insert the context's tag.
+                    if let (0b10, Some(tag)) = (tdes2 >> 14 & 3, eth.tx_vlan) {
+                        frame = crate::eth_h7::tagged(&frame, tag);
+                    }
+                    eth.transmitted(frame, tdes2, self.now);
                 }
             }
         }
@@ -331,6 +339,14 @@ impl Bus {
                 break;
             }
             let (_, mut frame) = eth.incoming.pop_front().unwrap();
+            // A tagged frame, stripped: its tag goes in RDES0.
+            let mut rdes0 = 0;
+            if eth.strips_vlan() {
+                if let Some((tci, inner)) = crate::eth_h7::untagged(&frame) {
+                    rdes0 = u32::from(tci);
+                    frame = inner;
+                }
+            }
             frame.extend_from_slice(&crate::eth_h7::fcs(&frame).to_le_bytes());
             // A frame longer than a buffer would go on into the next
             // descriptor; Hubris's buffers hold the longest there is.
@@ -342,7 +358,7 @@ impl Bus {
             // IPv6-header-present bit set for what is IPv6.
             let ipv6 = frame.get(12..14) == Some(&[0x86, 0xDD]);
             let rdes1: u32 = if ipv6 { 1 << 5 } else { 0 };
-            let words = [0, rdes1, 0, FD | LD | 1 << 25 | len as u32 & 0x7FFF];
+            let words = [rdes0, rdes1, 0, FD | LD | 1 << 25 | len as u32 & 0x7FFF];
             if let Some(slot) = Self::dma_slice(rams, at, 16) {
                 for (i, word) in words.iter().enumerate() {
                     slot[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
