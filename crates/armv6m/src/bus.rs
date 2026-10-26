@@ -237,7 +237,7 @@ impl Bus {
             // interface decides; it answers in its status register, not
             // with a bus error.
             Target::Memory { region: Region::Flash, offset } => {
-                self.soc.program(&mut self.flash, offset, size, value);
+                self.soc.program(&mut self.flash, offset, size, value, self.now);
                 Ok(())
             }
             Target::Memory { region: Region::System, .. } => Err(Unmapped),
@@ -318,11 +318,11 @@ impl Bus {
                 }
                 eth.tx_advance();
                 if tdes3 & 1 << 30 == 0 && tdes3 & LD != 0 {
-                    eth.transmitted(std::mem::take(&mut frame), tdes2);
+                    eth.transmitted(std::mem::take(&mut frame), tdes2, self.now);
                 }
             }
         }
-        while eth.rx_running() && !eth.incoming.is_empty() {
+        while eth.rx_running() && eth.arrived(self.now) {
             let at = eth.rx_current;
             let Some([buffer, _, _, rdes3]) = Self::dma_words(rams, at) else { break };
             if rdes3 & OWN == 0 || rdes3 & BUF1V == 0 {
@@ -330,7 +330,7 @@ impl Bus {
                 eth.incoming.pop_front();
                 break;
             }
-            let mut frame = eth.incoming.pop_front().unwrap();
+            let (_, mut frame) = eth.incoming.pop_front().unwrap();
             frame.extend_from_slice(&crate::eth_h7::fcs(&frame).to_le_bytes());
             // A frame longer than a buffer would go on into the next
             // descriptor; Hubris's buffers hold the longest there is.
@@ -381,21 +381,21 @@ impl Soc {
     /// A read of `size` bytes at the word `addr`, at time `now`.
     pub fn read(&mut self, addr: u32, size: u32, now: u64) -> Option<u32> {
         match self {
-            Soc::G0(soc) => soc.read(addr),
+            Soc::G0(soc) => soc.read(addr, now),
             Soc::H7(soc) => soc.read(addr, size, now),
         }
     }
 
     pub fn peek(&self, addr: u32, now: u64) -> u32 {
         match self {
-            Soc::G0(soc) => soc.peek(addr),
+            Soc::G0(soc) => soc.peek(addr, now),
             Soc::H7(soc) => soc.peek(addr, now),
         }
     }
 
     pub fn write(&mut self, addr: u32, value: u32, size: u32, now: u64, flash: &mut [u8]) -> Option<()> {
         match self {
-            Soc::G0(soc) => soc.write(addr, value, flash),
+            Soc::G0(soc) => soc.write(addr, value, now, flash),
             Soc::H7(soc) => soc.write(addr, value, size, now, flash),
         }
     }
@@ -403,24 +403,29 @@ impl Soc {
     /// The time the next timed event in the peripherals is due at.
     pub fn due(&self) -> Option<u64> {
         match self {
-            Soc::G0(_) => None,
+            Soc::G0(soc) => soc.due(),
             Soc::H7(soc) => soc.due(),
         }
     }
 
     /// Brings the peripherals' timed state up to time `now`.
     pub fn advance(&mut self, now: u64) {
-        if let Soc::H7(soc) = self {
-            soc.advance(now);
+        match self {
+            Soc::G0(soc) => soc.advance(now),
+            Soc::H7(soc) => soc.advance(now),
         }
     }
 
     /// A store into main flash, which the flash interface programs or
     /// refuses.
-    fn program(&mut self, flash: &mut [u8], offset: usize, size: u32, value: u32) {
+    fn program(&mut self, flash: &mut [u8], offset: usize, size: u32, value: u32, now: u64) {
         match self {
             Soc::G0(soc) => soc.flash_interface.program(flash, offset, size, value),
-            Soc::H7(soc) => soc.flash_interface.store(flash, offset % (2 * flash_h7::BANK), size, value),
+            Soc::H7(soc) => {
+                soc.flash_interface.now = now;
+                soc.flash_interface.advance(now);
+                soc.flash_interface.store(flash, offset % (2 * flash_h7::BANK), size, value)
+            }
         }
     }
 
@@ -432,11 +437,12 @@ impl Soc {
         }
     }
 
-    /// A byte arriving on USART `port`'s line; false if it was not taken.
-    pub fn receive(&mut self, port: usize, byte: u8) -> bool {
+    /// A byte arriving on USART `port`'s line at `now`; false if it was
+    /// not taken.
+    pub fn receive(&mut self, port: usize, byte: u8, now: u64) -> bool {
         match self {
-            Soc::G0(soc) => soc.receive(port, byte),
-            Soc::H7(soc) => soc.receive(port, byte),
+            Soc::G0(soc) => soc.receive(port, byte, now),
+            Soc::H7(soc) => soc.receive(port, byte, now),
         }
     }
 

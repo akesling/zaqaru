@@ -189,7 +189,7 @@ impl Default for Stm32h7 {
         };
         soc.rcc[0xD0 / 4] = RSR_POR | RSR_PIN | RSR_BOR | RSR_D2 | RSR_D1 | RSR_CPU;
         soc.rng.state = 0x2545_F491;
-        soc.reset_registers();
+        soc.reset_registers(0);
         soc
     }
 }
@@ -198,7 +198,7 @@ impl Stm32h7 {
     /// A system reset: what software reset, and RSR saying so.
     pub fn reset(&mut self, flash: &mut [u8], now: u64) {
         self.rcc[0xD0 / 4] |= RSR_SFT | RSR_PIN | RSR_CPU;
-        self.reset_registers();
+        self.reset_registers(now);
         self.flash_interface.reset(flash);
         self.reclock(now);
     }
@@ -215,9 +215,71 @@ impl Stm32h7 {
             let bus = usize::from(n >= APB1_TIMERS);
             timer.set_period(Clocks::period(clocks.timers[bus]), now);
         }
+        // D2CCIP2R: USART1 and 6's kernel clock, and the rest's: their
+        // APB, PLL2Q, PLL3Q, HSI, CSI or LSE.
+        let ccip2 = self.rcc[0x54 / 4];
+        for n in 0..self.usarts.len() {
+            self.advance_usart(n, now);
+            let (bus, sel) = if n == 0 || n == 5 { (1, ccip2 >> 3 & 7) } else { (0, ccip2 & 7) };
+            let hz = match sel {
+                0 => clocks.pclk[bus],
+                1 => clocks.pll[1][1],
+                2 => clocks.pll[2][1],
+                3 => clocks.hsi,
+                4 => clocks.csi,
+                _ => 32_768,
+            };
+            self.usarts[n].set_clock(Clocks::period(hz));
+        }
+        // I2C1 to 3's kernel clock from D2CCIP2R's I2C123SEL, I2C4's from
+        // D3CCIPR's I2C4SEL: their APB, PLL3R, HSI or CSI.
+        let kernel = |sel: u32, pclk: u64| match sel & 3 {
+            0 => pclk,
+            1 => clocks.pll[2][2],
+            2 => clocks.hsi,
+            _ => clocks.csi,
+        };
+        for (n, i2c) in self.i2cs.iter_mut().enumerate() {
+            i2c.advance(now);
+            let hz = if n < 3 { kernel(ccip2 >> 12, clocks.pclk[0]) } else { kernel(self.rcc[0x58 / 4] >> 8, clocks.pclk[3]) };
+            i2c.set_clock(Clocks::period(hz));
+        }
+        // SPI1 to 3's kernel clock from D2CCIP1R's SPI123SEL — PLL1Q, PLL2P,
+        // PLL3P, I2S_CKIN, or per_ck, which is HSI unless CKPERSEL says
+        // otherwise; SPI4 and 5's from SPI45SEL and SPI6's from D3CCIPR's
+        // SPI6SEL — their APB, PLL2Q, PLL3Q, HSI, CSI or HSE.
+        let ccip1 = self.rcc[0x50 / 4];
+        let per = match self.rcc[0x4C / 4] >> 28 & 3 {
+            0 => clocks.hsi,
+            1 => clocks.csi,
+            _ => crate::clock::HSE,
+        };
+        let peripheral = |sel: u32, pclk: u64| match sel & 7 {
+            0 => pclk,
+            1 => clocks.pll[1][1],
+            2 => clocks.pll[2][1],
+            3 => clocks.hsi,
+            4 => clocks.csi,
+            _ => crate::clock::HSE,
+        };
+        for n in 0..self.spis.len() {
+            self.advance_spi(n, now);
+            let hz = match n {
+                0..=2 => match ccip1 >> 12 & 7 {
+                    0 => clocks.pll[0][1],
+                    1 => clocks.pll[1][0],
+                    2 => clocks.pll[2][0],
+                    3 => 0,
+                    _ => per,
+                },
+                3 | 4 => peripheral(ccip1 >> 16, clocks.pclk[1]),
+                _ => peripheral(self.rcc[0x58 / 4] >> 28, clocks.pclk[3]),
+            };
+            self.spis[n].set_clock(Clocks::period(hz));
+        }
     }
 
-    fn reset_registers(&mut self) {
+    fn reset_registers(&mut self, now: u64) {
         let rsr = self.rcc[0xD0 / 4];
         self.rcc = [0; 0x100];
         self.rcc[0xD0 / 4] = rsr;
@@ -257,7 +319,7 @@ impl Stm32h7 {
             timer.reset();
         }
         self.eth.reset();
-        self.chip_selects();
+        self.chip_selects(now);
     }
 
     /// Wires a part to the board's buses.
@@ -275,7 +337,7 @@ impl Stm32h7 {
                     return Err(format!("the H7 has no SPI{}", controller + 1));
                 }
                 self.spi_parts.push(SpiWired { controller, cs, part, selected: false });
-                self.chip_selects();
+                self.chip_selects(0);
             }
         }
         Ok(())
@@ -296,7 +358,7 @@ impl Stm32h7 {
     /// The SPI parts' chip-selects, after any change to the pins: a part
     /// is selected while its pin is an output driven low (a board pulls an
     /// undriven one high), and the lines the parts drive back follow.
-    fn chip_selects(&mut self) {
+    fn chip_selects(&mut self, now: u64) {
         for wired in &mut self.spi_parts {
             let (port, pin) = wired.cs;
             let gpio = &self.gpio[port];
@@ -307,7 +369,7 @@ impl Stm32h7 {
                 if low {
                     wired.part.select();
                 } else {
-                    wired.part.deselect();
+                    wired.part.deselect(now);
                 }
             }
             if let Some(((port, pin), level)) = wired.part.line() {
@@ -335,16 +397,55 @@ impl Stm32h7 {
         Self::instance(TIMERS.iter().map(|t| t.0), addr)
     }
 
-    /// The cycle the next timed event is due at: a timer's update.
+    /// The time the next timed event is due at: a timer's update, a byte
+    /// on a USART's line.
     pub fn due(&self) -> Option<u64> {
-        self.timers.iter().filter_map(Timer::due).min()
+        let timers = self.timers.iter().filter_map(Timer::due);
+        let usarts = self.usarts.iter().filter_map(Usart::due);
+        let i2cs = self.i2cs.iter().filter_map(I2c::due);
+        let spis = self.spis.iter().filter_map(Spi::due);
+        let parts = self.spi_parts.iter().filter_map(|w| w.part.due());
+        let rest = [self.flash_interface.due(), self.eth.due()].into_iter().flatten();
+        timers.chain(usarts).chain(i2cs).chain(spis).chain(parts).chain(rest).min()
     }
 
-    /// Brings the timers up to cycle `now`.
+    /// Brings the timed peripherals up to time `now`.
     pub fn advance(&mut self, now: u64) {
         for timer in &mut self.timers {
             timer.advance(now);
         }
+        for n in 0..self.usarts.len() {
+            self.advance_usart(n, now);
+        }
+        for i2c in &mut self.i2cs {
+            i2c.advance(now);
+        }
+        for n in 0..self.spis.len() {
+            self.advance_spi(n, now);
+        }
+        for wired in &mut self.spi_parts {
+            wired.part.advance(now);
+        }
+        self.chip_selects(now);
+        self.flash_interface.advance(now);
+        self.eth.advance(now);
+    }
+
+    /// SPI `n` brought up to `now`, exchanging each frame with whatever
+    /// its chip-select selects.
+    fn advance_spi(&mut self, n: usize, now: u64) {
+        let parts = &mut self.spi_parts;
+        let mut bus = |mosi: u8, at: u64| {
+            parts.iter_mut().find(|w| w.controller == n && w.selected).map_or(0xFF, |w| w.part.exchange(mosi, at))
+        };
+        self.spis[n].advance(now, &mut bus);
+    }
+
+    /// A USART brought up to `now`, and what it finished sending passed on.
+    fn advance_usart(&mut self, n: usize, now: u64) {
+        let usart = &mut self.usarts[n];
+        usart.advance(now);
+        self.serial.extend(usart.sent.drain(..).map(|byte| usart::Byte { port: n as u8, byte }));
     }
 
     /// Whether `addr` is in the H7's peripheral windows: APB1 and 2, AHB1
@@ -439,9 +540,10 @@ impl Stm32h7 {
         lines
     }
 
-    /// A byte arriving on USART `port`'s line; false if it was not taken.
-    pub fn receive(&mut self, port: usize, byte: u8) -> bool {
-        self.usarts.get_mut(port).is_some_and(|usart| usart.receive(byte))
+    /// A byte arriving on USART `port`'s line at `now`; false if it was
+    /// not taken.
+    pub fn receive(&mut self, port: usize, byte: u8, now: u64) -> bool {
+        self.usarts.get_mut(port).is_some_and(|usart| usart.receive(byte, now))
     }
 
     /// Something outside drives a pin, or lets go of it.
@@ -482,12 +584,15 @@ impl Stm32h7 {
             self.unmodelled.insert(addr);
         }
         if let Some((n, offset)) = Self::usart(addr) {
+            self.advance_usart(n, now);
             return Some(self.usarts[n].read(offset, true));
         }
         if let Some((n, offset)) = Self::i2c(addr) {
-            return Some(self.i2cs[n].read(offset, true));
+            self.i2cs[n].advance(now);
+            return Some(self.i2cs[n].read(offset, true, now));
         }
         if let Some((n, offset)) = Self::spi(addr) {
+            self.advance_spi(n, now);
             return Some(self.spis[n].read(offset, true, size));
         }
         if let Some((n, offset)) = Self::timer(addr) {
@@ -505,10 +610,16 @@ impl Stm32h7 {
             return self.eth.read(addr);
         }
         if let Some((n, offset)) = Self::i2c(addr) {
-            return self.i2cs[n].clone().read(offset, false);
+            let mut i2c = self.i2cs[n].clone();
+            i2c.advance(now);
+            return i2c.read(offset, false, now);
         }
         if let Some((n, offset)) = Self::spi(addr) {
-            return self.spis[n].clone().read(offset, false, 4);
+            // A look leaves the parts on the bus alone: what they would
+            // answer is not known without asking them.
+            let mut spi = self.spis[n].clone();
+            spi.advance(now, &mut |_, _| 0xFF);
+            return spi.read(offset, false, 4);
         }
         if let Some((n, offset)) = Self::timer(addr) {
             let mut timer = self.timers[n].clone();
@@ -553,10 +664,15 @@ impl Stm32h7 {
             };
         }
         if flash_h7::Interface::contains(addr) {
-            return self.flash_interface.read(addr);
+            let mut interface = self.flash_interface.clone();
+            interface.now = now;
+            interface.advance(now);
+            return interface.read(addr);
         }
         if let Some((n, offset)) = Self::usart(addr) {
-            return self.usarts[n].clone().read(offset, false);
+            let mut usart = self.usarts[n].clone();
+            usart.advance(now);
+            return usart.read(offset, false);
         }
         self.other.get(&addr).copied().unwrap_or(0)
     }
@@ -574,13 +690,11 @@ impl Stm32h7 {
         if Ethernet::contains(addr) {
             self.eth.write(addr, value);
         } else if let Some((n, offset)) = Self::i2c(addr) {
-            self.i2cs[n].write(offset, value);
+            self.i2cs[n].advance(now);
+            self.i2cs[n].write(offset, value, now);
         } else if let Some((n, offset)) = Self::spi(addr) {
-            let parts = &mut self.spi_parts;
-            let mut bus = |mosi: u8| {
-                parts.iter_mut().find(|w| w.controller == n && w.selected).map_or(0xFF, |w| w.part.exchange(mosi))
-            };
-            self.spis[n].write(offset, value, size, &mut bus);
+            self.advance_spi(n, now);
+            self.spis[n].write(offset, value, size, now);
         } else if let Some((n, offset)) = Self::timer(addr) {
             self.timers[n].write(offset, value, now);
         } else if (RCC..RCC + 0x400).contains(&addr) {
@@ -595,7 +709,11 @@ impl Stm32h7 {
             if gpio.odr != before {
                 self.edges.push(Edge { port: port as u8, before: before as u16, after: gpio.odr as u16 });
             }
-            self.chip_selects();
+            // What the buses were doing finishes before a chip-select moves.
+            for n in 0..self.spis.len() {
+                self.advance_spi(n, now);
+            }
+            self.chip_selects(now);
         } else if (EXTI..EXTI + 0x100).contains(&addr) {
             match addr - EXTI {
                 // SWIER1: a one pends its line.
@@ -617,11 +735,12 @@ impl Stm32h7 {
                 self.dbgmcu[(offset / 4) as usize] = value;
             }
         } else if flash_h7::Interface::contains(addr) {
+            self.flash_interface.now = now;
+            self.flash_interface.advance(now);
             self.flash_interface.write(addr, value, flash);
         } else if let Some((n, offset)) = Self::usart(addr) {
-            if let Some(byte) = self.usarts[n].write(offset, value) {
-                self.serial.push(usart::Byte { port: n as u8, byte });
-            }
+            self.advance_usart(n, now);
+            self.usarts[n].write(offset, value, now);
         } else {
             self.unmodelled.insert(addr);
             self.other.insert(addr, value);

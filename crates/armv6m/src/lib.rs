@@ -464,7 +464,10 @@ impl Machine {
             .map_or(u64::MAX, |n| self.time.saturating_add(n.saturating_mul(self.period)));
         if let Some(due) = self.bus.soc.due() {
             if due <= self.time {
+                self.bus.now = self.time;
                 self.bus.soc.advance(self.time);
+                // A frame all in goes to the receive DMA.
+                self.bus.run_dma();
                 self.drain_edges();
                 self.sample_interrupts();
             }
@@ -638,9 +641,9 @@ impl Machine {
     /// descriptor for it. False if the part has no Ethernet.
     pub fn deliver(&mut self, frame: Vec<u8>) -> bool {
         let crate::bus::Soc::H7(soc) = &mut self.bus.soc else { return false };
-        soc.eth.incoming.push_back(frame);
-        self.bus.run_dma();
-        self.sample_interrupts();
+        soc.eth.arrive(frame, self.time);
+        // The frame is due when it is all in.
+        self.sync_systick();
         true
     }
 
@@ -680,8 +683,9 @@ impl Machine {
     /// A byte arriving on USART `port`'s line (0 for USART1): taken if the
     /// receiver is on, and its interrupt raised if enabled.
     pub fn receive(&mut self, port: usize, byte: u8) -> bool {
-        let taken = self.bus.soc.receive(port, byte);
-        self.sample_interrupts();
+        let taken = self.bus.soc.receive(port, byte, self.time);
+        // The byte is due when its frame has passed.
+        self.sync_systick();
         taken
     }
 }

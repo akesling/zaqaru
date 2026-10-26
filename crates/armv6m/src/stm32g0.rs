@@ -113,9 +113,45 @@ impl Stm32g0 {
         [lines, 0, 0, 0, 0, 0, 0, 0]
     }
 
-    /// A byte arriving on USART `port`'s line; false if it was not taken.
-    pub fn receive(&mut self, port: usize, byte: u8) -> bool {
-        self.usarts.get_mut(port).is_some_and(|usart| usart.receive(byte))
+    /// A byte arriving on USART `port`'s line at `now`; false if it was
+    /// not taken.
+    pub fn receive(&mut self, port: usize, byte: u8, now: u64) -> bool {
+        self.usarts.get_mut(port).is_some_and(|usart| usart.receive(byte, now))
+    }
+
+    /// The time the next byte on a USART's line is due at.
+    pub fn due(&self) -> Option<u64> {
+        self.usarts.iter().filter_map(Usart::due).min()
+    }
+
+    /// Brings the USARTs' lines up to `now`.
+    pub fn advance(&mut self, now: u64) {
+        for n in 0..self.usarts.len() {
+            self.advance_usart(n, now);
+        }
+    }
+
+    fn advance_usart(&mut self, n: usize, now: u64) {
+        let usart = &mut self.usarts[n];
+        usart.advance(now);
+        self.serial.extend(usart.sent.drain(..).map(|byte| usart::Byte { port: n as u8, byte }));
+    }
+
+    /// The USARTs' kernel clocks, from CCIPR's USART1SEL and USART2SEL:
+    /// the APB, the system clock, HSI16 or LSE.
+    fn reclock(&mut self, now: u64) {
+        let clocks = self.clocks();
+        let ccipr = self.rcc[0x54 / 4];
+        for n in 0..self.usarts.len() {
+            self.advance_usart(n, now);
+            let hz = match ccipr >> (2 * n) & 3 {
+                0 => clocks.pclk[0],
+                1 => clocks.sys,
+                2 => clocks.hsi,
+                _ => 32_768,
+            };
+            self.usarts[n].set_clock(crate::clock::Clocks::period(hz));
+        }
     }
 
     /// Whether `addr` is in the G0's peripheral windows: APB, AHB, and the
@@ -131,7 +167,7 @@ impl Stm32g0 {
         }
     }
 
-    pub fn read(&mut self, addr: u32) -> Option<u32> {
+    pub fn read(&mut self, addr: u32, now: u64) -> Option<u32> {
         if !Self::contains(addr) {
             return None;
         }
@@ -139,12 +175,13 @@ impl Stm32g0 {
             self.unmodelled.insert(addr);
         }
         if let Some((n, offset)) = Self::usart(addr) {
+            self.advance_usart(n, now);
             return Some(self.usarts[n].read(offset, true));
         }
-        Some(self.peek(addr))
+        Some(self.peek(addr, now))
     }
 
-    pub fn peek(&self, addr: u32) -> u32 {
+    pub fn peek(&self, addr: u32, now: u64) -> u32 {
         if (RCC..RCC + 0x400).contains(&addr) {
             return self.rcc_read(addr - RCC);
         }
@@ -160,14 +197,16 @@ impl Stm32g0 {
         if let Some((n, offset)) = Self::usart(addr) {
             // A peek is a read without effects, and only RDR has any; the
             // `Usart` is cloned rather than mutated to say so.
-            return self.usarts[n].clone().read(offset, false);
+            let mut usart = self.usarts[n].clone();
+            usart.advance(now);
+            return usart.read(offset, false);
         }
         self.other.get(&addr).copied().unwrap_or(0)
     }
 
     /// A register write; `flash` is main flash, which the flash
     /// interface erases.
-    pub fn write(&mut self, addr: u32, value: u32, flash: &mut [u8]) -> Option<()> {
+    pub fn write(&mut self, addr: u32, value: u32, now: u64, flash: &mut [u8]) -> Option<()> {
         if !Self::contains(addr) {
             return None;
         }
@@ -177,12 +216,12 @@ impl Stm32g0 {
         }
         if (RCC..RCC + 0x400).contains(&addr) {
             self.rcc[((addr - RCC) / 4) as usize] = value;
+            self.reclock(now);
             return Some(());
         }
         if let Some((n, offset)) = Self::usart(addr) {
-            if let Some(byte) = self.usarts[n].write(offset, value) {
-                self.serial.push(usart::Byte { port: n as u8, byte });
-            }
+            self.advance_usart(n, now);
+            self.usarts[n].write(offset, value, now);
             return Some(());
         }
         if addr >= IOPORT {

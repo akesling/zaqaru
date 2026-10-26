@@ -12,7 +12,11 @@
 //!
 //! The DMA reaches memory through the bus, so the work is done there (see
 //! `Bus::run_dma`); this module keeps the registers and says what is to
-//! be done. Frames carry no timing: one sent is on the wire at once. The
+//! be done. Frames take their time on the wire, each way, one after
+//! another: its preamble, the frame padded to 64 bytes with its FCS, and
+//! the interpacket gap, at the 100 Mbit/s of MACCR's FES (10 without it).
+//! A frame sent reaches the far end, and raises TI, when it is off the
+//! wire; one arriving reaches the receive DMA when it is all in. The
 //! checksum offload is not modelled, which Hubris's stack, computing its
 //! own, does not notice; neither are the MAC's filters, which promiscuous
 //! mode — what Hubris sets — passes everything through anyway.
@@ -128,17 +132,26 @@ pub struct Ethernet {
     pub rx_current: u32,
     /// Whether the transmit DMA has been told there may be work.
     pub tx_kicked: bool,
-    /// Frames from the wire waiting for the receive DMA, and frames the
-    /// transmit DMA put on the wire, for whoever is at the other end.
-    pub incoming: VecDeque<Vec<u8>>,
+    /// Frames on their way in, each with when it is all in, for the
+    /// receive DMA; and when the line is free for the next.
+    pub incoming: VecDeque<(u64, Vec<u8>)>,
+    rx_free: u64,
+    /// Frames going out, with when each is off the wire and its TDES2;
+    /// and when the line is free for the next.
+    wire: VecDeque<(u64, Vec<u8>, u32)>,
+    tx_free: u64,
+    /// Frames that have gone, for whoever is at the other end.
     pub outgoing: Vec<Vec<u8>>,
     missed: u32,
 }
 
+/// MACCR's FES: 100 Mbit/s rather than 10.
+const FES: u32 = 1 << 14;
+
 impl Ethernet {
     pub fn reset(&mut self) {
-        let incoming = std::mem::take(&mut self.incoming);
-        *self = Ethernet { registers: vec![0; 0x2000 / 4], incoming, ..Ethernet::default() };
+        let (incoming, rx_free) = (std::mem::take(&mut self.incoming), self.rx_free);
+        *self = Ethernet { registers: vec![0; 0x2000 / 4], incoming, rx_free, ..Ethernet::default() };
         // MACCR's and MACMDIOAR's reset values are zero; the version
         // register is the Synopsys core's 4.2.
         self.registers[(MACVR / 4) as usize] = 0x0000_3042;
@@ -146,6 +159,45 @@ impl Ethernet {
 
     pub fn contains(addr: u32) -> bool {
         (BASE..END).contains(&addr)
+    }
+
+    /// A frame's time on the wire, in picoseconds: preamble and start
+    /// delimiter, the frame padded and with its FCS, and the gap after.
+    fn wire_time(&self, len: usize) -> u64 {
+        let byte = if self.reg(0) & FES != 0 { 80_000 } else { 800_000 };
+        (8 + (len + 4).max(64) + 12) as u64 * byte
+    }
+
+    /// A frame from the far end, at `now`: on the wire behind any still
+    /// arriving.
+    pub fn arrive(&mut self, frame: Vec<u8>, now: u64) {
+        let at = self.rx_free.max(now) + self.wire_time(frame.len());
+        self.rx_free = at;
+        self.incoming.push_back((at, frame));
+    }
+
+    /// The next frame all in by `now`, for the receive DMA.
+    pub fn arrived(&self, now: u64) -> bool {
+        self.incoming.front().is_some_and(|&(at, _)| at <= now)
+    }
+
+    /// When a frame is next off the wire, either way.
+    pub fn due(&self) -> Option<u64> {
+        let out = self.wire.front().map(|&(at, _, _)| at);
+        let into = self.incoming.front().map(|&(at, _)| at);
+        out.into_iter().chain(into).min()
+    }
+
+    /// Brings the transmit side up to `now`: the frames off the wire gone,
+    /// and TI for those that ask.
+    pub fn advance(&mut self, now: u64) {
+        while self.wire.front().is_some_and(|&(at, _, _)| at <= now) {
+            let (_, frame, tdes2) = self.wire.pop_front().unwrap();
+            self.outgoing.push(frame);
+            if tdes2 & TDES2_IOC != 0 {
+                self.status(TI);
+            }
+        }
     }
 
     fn reg(&self, offset: u32) -> u32 {
@@ -247,11 +299,11 @@ impl Ethernet {
     }
 
     /// A frame sent: TDES2 asked for an interrupt or not.
-    pub fn transmitted(&mut self, frame: Vec<u8>, tdes2: u32) {
-        self.outgoing.push(frame);
-        if tdes2 & TDES2_IOC != 0 {
-            self.status(TI);
-        }
+    /// The transmit DMA has a frame for the wire, at `now`.
+    pub fn transmitted(&mut self, frame: Vec<u8>, tdes2: u32, now: u64) {
+        let at = self.tx_free.max(now) + self.wire_time(frame.len());
+        self.tx_free = at;
+        self.wire.push_back((at, frame, tdes2));
     }
 
     /// The transmit DMA found a descriptor it does not own.

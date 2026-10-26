@@ -8,8 +8,13 @@
 //! programming it when the last byte lands (or FW forces it), START, EOP,
 //! QW and the error flags — PGSERR for a store without PG, STRBERR for one
 //! byte written twice, INCERR for a store to another word with the buffer
-//! part-full — and the interrupt they raise. Every operation completes at
-//! once: BSY and QW are never seen set.
+//! part-full — and the interrupt they raise.
+//!
+//! An operation takes the time DS12110's table 52 gives it, typically, at
+//! CR's PSIZE parallelism: a flash word 290, 180, 130 or 100 µs at x8,
+//! x16, x32 or x64; a sector 2, 1.8, 1.1 or 1 s; a bank 13, 8, 6 or 5 s.
+//! BSY and QW hold while it runs, and EOP comes when it ends. What it does
+//! to the flash's contents happens at once.
 //!
 //! The banks are logical. Flash is the bus's 2 MiB, the first half at
 //! `0x0800_0000`, and bank 1's registers drive the half there; a swap
@@ -41,7 +46,9 @@ const CR_RESET: u32 = LOCK | 0b11 << 4;
 const CR_INTERRUPTS: u32 = 0x0FEF_0000;
 
 // SR.
+const BSY: u32 = 1 << 0;
 const WBNE: u32 = 1 << 1;
+const QW: u32 = 1 << 2;
 const EOP: u32 = 1 << 16;
 const WRPERR: u32 = 1 << 17;
 const PGSERR: u32 = 1 << 18;
@@ -72,16 +79,47 @@ struct Bank {
     /// of them have been written.
     buffer: Option<(usize, [u8; WORD], u32)>,
     other: [u32; 0x40],
+    /// When the operations queued end, and whether one is running.
+    busy_until: u64,
+    running: bool,
 }
 
 impl Default for Bank {
     fn default() -> Self {
-        Bank { cr: CR_RESET, sr: 0, key: 0, keyed_wrong: false, buffer: None, other: [0; 0x40] }
+        Bank {
+            cr: CR_RESET,
+            sr: 0,
+            key: 0,
+            keyed_wrong: false,
+            buffer: None,
+            other: [0; 0x40],
+            busy_until: 0,
+            running: false,
+        }
+    }
+}
+
+/// Typical times, in microseconds, by PSIZE: a flash word programmed, a
+/// sector erased, a bank erased.
+const PROGRAM_US: [u64; 4] = [290, 180, 130, 100];
+const SECTOR_US: [u64; 4] = [2_000_000, 1_800_000, 1_100_000, 1_000_000];
+const BANK_US: [u64; 4] = [13_000_000, 8_000_000, 6_000_000, 5_000_000];
+
+impl Bank {
+    /// An operation of `us[PSIZE]` microseconds, queued behind any running
+    /// from `now`.
+    fn busy(&mut self, now: u64, us: &[u64; 4]) {
+        let psize = (self.cr >> 4 & 3) as usize;
+        self.busy_until = self.busy_until.max(now) + us[psize] * 1_000_000;
+        self.running = true;
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Interface {
+    /// The time it is, in picoseconds, which whoever owns the interface
+    /// sets before each access.
+    pub now: u64,
     acr: u32,
     banks: [Bank; 2],
     optcr: u32,
@@ -93,6 +131,7 @@ pub struct Interface {
 impl Default for Interface {
     fn default() -> Self {
         Interface {
+            now: 0,
             acr: 0x37,
             banks: Default::default(),
             optcr: OPTLOCK,
@@ -109,7 +148,7 @@ impl Interface {
     /// `flash` exchanged — if it has not been.
     pub fn reset(&mut self, flash: &mut [u8]) {
         let (optsr, swapped) = (self.optsr_cur, self.optcr & SWAP_BANK != 0);
-        *self = Interface { optsr_cur: optsr, optsr_prg: optsr, ..Interface::default() };
+        *self = Interface { now: self.now, optsr_cur: optsr, optsr_prg: optsr, ..Interface::default() };
         let swap = optsr & SWAP_BANK_OPT != 0;
         if swap != swapped && flash.len() == 2 * BANK {
             let (one, two) = flash.split_at_mut(BANK);
@@ -122,6 +161,22 @@ impl Interface {
 
     pub fn contains(addr: u32) -> bool {
         (BASE..END).contains(&addr)
+    }
+
+    /// When the next operation running ends.
+    pub fn due(&self) -> Option<u64> {
+        self.banks.iter().filter(|bank| bank.running).map(|bank| bank.busy_until).min()
+    }
+
+    /// Brings the banks up to `now`: an operation that has ended says so
+    /// in EOP.
+    pub fn advance(&mut self, now: u64) {
+        for bank in &mut self.banks {
+            if bank.running && bank.busy_until <= now {
+                bank.running = false;
+                bank.sr |= EOP;
+            }
+        }
     }
 
     /// Whether the interface's interrupt is asserted: an operation ended,
@@ -147,7 +202,11 @@ impl Interface {
             0x00 => self.acr,
             0x04 | 0x08 => 0,
             0x0C => bank.cr,
-            0x10 => bank.sr | if bank.buffer.is_some() { WBNE } else { 0 },
+            // SR: BSY and QW while an operation runs.
+            0x10 => {
+                let busy = if bank.running && self.now < bank.busy_until { BSY | QW } else { 0 };
+                bank.sr | busy | if bank.buffer.is_some() { WBNE } else { 0 }
+            }
             0x14 => 0,
             0x18 => self.optcr,
             0x1C => self.optsr_cur,
@@ -209,6 +268,7 @@ impl Interface {
     }
 
     fn control(&mut self, b: usize, value: u32, flash: &mut [u8]) {
+        let now = self.now;
         let bank = &mut self.banks[b];
         if bank.cr & LOCK != 0 {
             return;
@@ -216,7 +276,7 @@ impl Interface {
         bank.cr = value & !(START | FW);
         if value & FW != 0 {
             if let Some((word, bytes, _)) = bank.buffer.take() {
-                Self::program(bank, flash, word, &bytes);
+                Self::program(bank, flash, word, &bytes, now);
             }
         }
         if value & START != 0 {
@@ -227,14 +287,14 @@ impl Interface {
             };
             if value & BER != 0 {
                 half.fill(0xFF);
+                bank.busy(now, &BANK_US);
             } else if value & SER != 0 {
                 let sector = (value >> 8 & 7) as usize;
                 half[sector * SECTOR..(sector + 1) * SECTOR].fill(0xFF);
+                bank.busy(now, &SECTOR_US);
             } else {
                 bank.sr |= PGSERR;
-                return;
             }
-            bank.sr |= EOP;
         }
     }
 
@@ -242,6 +302,7 @@ impl Interface {
     /// buffer of the bank it falls in, programming the flash word when the
     /// buffer is full.
     pub fn store(&mut self, flash: &mut [u8], offset: usize, size: u32, value: u32) {
+        let now = self.now;
         let b = offset / BANK;
         let Some(bank) = self.banks.get_mut(b) else { return };
         if bank.cr & LOCK != 0 {
@@ -270,18 +331,18 @@ impl Interface {
         bytes[first..first + size as usize].copy_from_slice(&value.to_le_bytes()[..size as usize]);
         if *written == u32::MAX {
             let (word, bytes, _) = bank.buffer.take().unwrap();
-            Self::program(bank, flash, word, &bytes);
+            Self::program(bank, flash, word, &bytes, now);
         }
     }
 
     /// Programs a flash word. Programming only clears bits; a word that is
     /// not erased is the part's ECC's to complain about, which this has
     /// none of.
-    fn program(bank: &mut Bank, flash: &mut [u8], word: usize, bytes: &[u8; WORD]) {
+    fn program(bank: &mut Bank, flash: &mut [u8], word: usize, bytes: &[u8; WORD], now: u64) {
         for (cell, byte) in flash[word..word + WORD].iter_mut().zip(bytes) {
             *cell &= byte;
         }
-        bank.sr |= EOP;
+        bank.busy(now, &PROGRAM_US);
     }
 }
 
@@ -311,7 +372,11 @@ mod tests {
         assert_eq!(f.read(BASE + 0x110) & WBNE, WBNE, "the buffer waits");
         assert!(flash[at..at + WORD].iter().all(|&b| b == 0xFF));
         f.store(&mut flash, at + 28, 4, 0x7777_7777);
-        assert_eq!(f.read(BASE + 0x110) & (WBNE | EOP), EOP);
+        assert_eq!(f.read(BASE + 0x110) & (WBNE | EOP | BSY | QW), BSY | QW, "programming, for 100 µs at x64");
+        assert_eq!(f.due(), Some(100_000_000));
+        f.now = 100_000_000;
+        f.advance(f.now);
+        assert_eq!(f.read(BASE + 0x110) & (WBNE | EOP | BSY), EOP);
         assert_eq!(flash[at + 4..at + 8], [0x11; 4]);
 
         f.store(&mut flash, at + 0x20, 1, 0);
@@ -327,11 +392,14 @@ mod tests {
     fn a_sector_erase_erases_its_sector_of_its_bank() {
         let (mut f, mut flash) = unlocked();
         flash.fill(0);
-        f.write(BASE + 0x10C, SER | 3 << 8 | START, &mut flash);
+        f.write(BASE + 0x10C, SER | 3 << 8 | 0b11 << 4 | START, &mut flash);
         let sector = BANK + 3 * SECTOR;
         assert!(flash[sector..sector + SECTOR].iter().all(|&b| b == 0xFF));
         assert!(flash[3 * SECTOR..4 * SECTOR].iter().all(|&b| b == 0), "bank 1 untouched");
-        assert_eq!(f.read(BASE + 0x110) & EOP, EOP);
+        assert_eq!(f.read(BASE + 0x110) & (EOP | BSY), BSY);
+        f.now = 1_000_000_000_000;
+        f.advance(f.now);
+        assert_eq!(f.read(BASE + 0x110) & (EOP | BSY), EOP, "a second at x64");
         f.write(BASE + 0x0C, BER | START, &mut flash);
         assert!(flash[..BANK].iter().all(|&b| b == 0xFF));
     }

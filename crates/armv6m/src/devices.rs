@@ -6,14 +6,16 @@
 //! - [`Tmp117`], TI's temperature sensor: 16-bit registers behind a
 //!   pointer, the temperature in 1/128 °C, the device ID 0x0117.
 //! - [`At24`], an AT24C02 EEPROM: 256 bytes behind an address byte, written
-//!   a page of 8 at a time, read on from wherever the address is.
+//!   a page of 8 at a time, read on from wherever the address is; for the
+//!   5 ms after a write it is busy writing, and does not acknowledge.
 //! - [`Registers`], a plain register file, as most sensors are.
 //! - [`NorFlash`], a Winbond W25Q80 SPI NOR flash: its JEDEC ID, reads,
 //!   write-enable, page programs that only clear bits, and sector, block
-//!   and chip erases.
+//!   and chip erases, each busy for its datasheet's typical time.
 //! - [`Rot`], the root of trust a Hubris service processor talks to over
 //!   SPI: the SP-to-RoT protocol (`drv/sprot-api`) as the LPC55's server
-//!   answers it, with its ROT_IRQ line to say a response is ready.
+//!   answers it, with its ROT_IRQ line to say a response is ready, a while
+//!   after the request.
 //!
 //! A board says what it has wired, a line each, in the form [`Wiring`]
 //! parses: `i2c I2C2 0x48 tmp117`, `spi SPI1 PD14 w25q80`, `spi SPI3 PA15
@@ -36,13 +38,15 @@ impl I2cPart {
         }
     }
 
-    /// A START (or a repeated one) addressed to it, reading or writing.
-    pub fn start(&mut self, read: bool) {
+    /// A START (or a repeated one) addressed to it at `now`, reading or
+    /// writing: whether it acknowledges.
+    pub fn start(&mut self, read: bool, now: u64) -> bool {
         match self {
             I2cPart::Tmp117(p) => p.start(read),
-            I2cPart::At24(p) => p.start(read),
+            I2cPart::At24(p) => return p.start(read, now),
             I2cPart::Registers(p) => p.start(read),
         }
+        true
     }
 
     pub fn write(&mut self, byte: u8) {
@@ -61,10 +65,10 @@ impl I2cPart {
         }
     }
 
-    /// The STOP that ends a transfer with it.
-    pub fn stop(&mut self) {
+    /// The STOP that ends a transfer with it, at `now`.
+    pub fn stop(&mut self, now: u64) {
         if let I2cPart::At24(p) = self {
-            p.stop();
+            p.stop(now);
         }
     }
 
@@ -154,17 +158,29 @@ pub struct At24 {
     pub memory: Vec<u8>,
     pointer: u8,
     addressing: bool,
+    /// Whether data has been written since the START: the STOP begins the
+    /// write cycle.
+    written: bool,
+    /// When the write cycle ends.
+    busy_until: u64,
 }
 
 impl At24 {
     const PAGE: u8 = 8;
+    /// t_WR, the write cycle: 5 ms.
+    const WRITE_CYCLE: u64 = 5_000_000_000;
 
     pub fn new(address: u8) -> At24 {
-        At24 { address, memory: vec![0xFF; 256], pointer: 0, addressing: false }
+        At24 { address, memory: vec![0xFF; 256], pointer: 0, addressing: false, written: false, busy_until: 0 }
     }
 
-    fn start(&mut self, read: bool) {
+    fn start(&mut self, read: bool, now: u64) -> bool {
+        if now < self.busy_until {
+            return false;
+        }
         self.addressing = !read;
+        self.written = false;
+        true
     }
 
     fn write(&mut self, byte: u8) {
@@ -174,6 +190,7 @@ impl At24 {
             return;
         }
         self.memory[self.pointer as usize] = byte;
+        self.written = true;
         // A page write wraps within its page.
         let page = self.pointer & !(Self::PAGE - 1);
         self.pointer = page | (self.pointer.wrapping_add(1) & (Self::PAGE - 1));
@@ -185,8 +202,11 @@ impl At24 {
         byte
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self, now: u64) {
         self.addressing = false;
+        if std::mem::take(&mut self.written) {
+            self.busy_until = now + Self::WRITE_CYCLE;
+        }
     }
 }
 
@@ -242,19 +262,35 @@ impl SpiPart {
         }
     }
 
-    /// One frame: what the controller sent on MOSI, and what the part
-    /// answers on MISO.
-    pub fn exchange(&mut self, mosi: u8) -> u8 {
+    /// One frame, ending at `now`: what the controller sent on MOSI, and
+    /// what the part answers on MISO.
+    pub fn exchange(&mut self, mosi: u8, now: u64) -> u8 {
         match self {
-            SpiPart::Flash(p) => p.exchange(mosi),
+            SpiPart::Flash(p) => p.exchange(mosi, now),
             SpiPart::Rot(p) => p.exchange(mosi),
         }
     }
 
-    pub fn deselect(&mut self) {
+    /// Chip-select going high again, at `now`.
+    pub fn deselect(&mut self, now: u64) {
         match self {
-            SpiPart::Flash(p) => p.deselect(),
-            SpiPart::Rot(p) => p.deselect(),
+            SpiPart::Flash(p) => p.deselect(now),
+            SpiPart::Rot(p) => p.deselect(now),
+        }
+    }
+
+    /// When the part next does something by itself: the RoT having its
+    /// response ready.
+    pub fn due(&self) -> Option<u64> {
+        match self {
+            SpiPart::Flash(_) => None,
+            SpiPart::Rot(p) => p.ready_at,
+        }
+    }
+
+    pub fn advance(&mut self, now: u64) {
+        if let SpiPart::Rot(p) = self {
+            p.advance(now);
         }
     }
 
@@ -281,7 +317,10 @@ impl SpiPart {
 }
 
 /// A Winbond W25Q80: 1 MiB of NOR flash, and the commands to read, program
-/// and erase it.
+/// and erase it. A program or erase leaves it busy (status register 1's
+/// BUSY) for the datasheet's typical time — 0.7 ms a page, 45 ms a 4 KiB
+/// sector, 120 and 150 ms a 32 and 64 KiB block, 2 s the chip — and while
+/// busy it takes nothing but a read of its status.
 #[derive(Clone, Debug)]
 pub struct NorFlash {
     pub memory: Vec<u8>,
@@ -290,15 +329,17 @@ pub struct NorFlash {
     address: u32,
     frames: usize,
     write_enabled: bool,
+    busy_until: u64,
 }
 
 impl NorFlash {
     const SIZE: usize = 1 << 20;
     const JEDEC_ID: [u8; 3] = [0xEF, 0x40, 0x14];
     const UNIQUE_ID: [u8; 8] = [0xD1, 0x5A, 0x51, 0x00, 0x5A, 0x51, 0x00, 0x01];
+    const MS: u64 = 1_000_000_000;
 
     pub fn new() -> NorFlash {
-        NorFlash { memory: vec![0xFF; Self::SIZE], command: None, address: 0, frames: 0, write_enabled: false }
+        NorFlash { memory: vec![0xFF; Self::SIZE], command: None, address: 0, frames: 0, write_enabled: false, busy_until: 0 }
     }
 
     fn select(&mut self) {
@@ -307,15 +348,19 @@ impl NorFlash {
         self.address = 0;
     }
 
-    fn exchange(&mut self, mosi: u8) -> u8 {
+    fn exchange(&mut self, mosi: u8, now: u64) -> u8 {
+        let busy = now < self.busy_until;
         let Some(command) = self.command else {
-            self.command = Some(mosi);
+            // Busy, it hears only a read of its status.
+            self.command = Some(if busy && mosi != 0x05 { 0x00 } else { mosi });
             match mosi {
+                _ if busy => {}
                 0x06 => self.write_enabled = true,
                 0x04 => self.write_enabled = false,
                 0x60 | 0xC7 if self.write_enabled => {
                     self.memory.fill(0xFF);
                     self.write_enabled = false;
+                    self.busy_until = now + 2000 * Self::MS;
                 }
                 _ => {}
             }
@@ -328,7 +373,7 @@ impl NorFlash {
         if addressed && n < 3 {
             self.address = self.address << 8 | u32::from(mosi);
             if n == 2 {
-                self.addressed(command);
+                self.addressed(command, now);
             }
             return 0xFF;
         }
@@ -339,7 +384,9 @@ impl NorFlash {
             0x90 => [0xEF, 0x13].get(n.wrapping_sub(3)).copied().unwrap_or(0xFF),
             0xAB => 0x13,
             0x4B => Self::UNIQUE_ID.get(n.wrapping_sub(4)).copied().unwrap_or(0xFF),
-            // Status register 1: WEL; never busy.
+            // Status register 1: BUSY and WEL, which a program or erase
+            // clears when it ends.
+            0x05 if busy => 0x03,
             0x05 => u8::from(self.write_enabled) << 1,
             0x35 | 0x15 => 0,
             0x03 => {
@@ -363,24 +410,27 @@ impl NorFlash {
     }
 
     /// The address has come: the erases happen now.
-    fn addressed(&mut self, command: u8) {
-        let size = match command {
-            0x20 => 4 << 10,
-            0x52 => 32 << 10,
-            0xD8 => 64 << 10,
+    fn addressed(&mut self, command: u8, now: u64) {
+        let (size, ms) = match command {
+            0x20 => (4 << 10, 45),
+            0x52 => (32 << 10, 120),
+            0xD8 => (64 << 10, 150),
             _ => return,
         };
         if self.write_enabled {
             let start = (self.address as usize % Self::SIZE) & !(size - 1);
             self.memory[start..start + size].fill(0xFF);
             self.write_enabled = false;
+            self.busy_until = now + ms * Self::MS;
         }
     }
 
-    fn deselect(&mut self) {
-        // A program ends at chip-select's rising edge, and clears WEL.
-        if self.command == Some(0x02) && self.frames > 3 {
+    fn deselect(&mut self, now: u64) {
+        // A program begins at chip-select's rising edge, and clears WEL
+        // when it ends.
+        if self.command == Some(0x02) && self.frames > 3 && self.write_enabled {
             self.write_enabled = false;
+            self.busy_until = now + 7 * Self::MS / 10;
         }
         self.command = None;
     }
@@ -410,6 +460,8 @@ pub struct Rot {
     /// The ROT_IRQ line: (port, pin), 0 for port A.
     pub irq: (usize, u8),
     responding: bool,
+    /// When the response being made will be ready.
+    ready_at: Option<u64>,
     request: Vec<u8>,
     response: Vec<u8>,
     sent: usize,
@@ -421,8 +473,28 @@ pub struct Rot {
 }
 
 impl Rot {
+    /// How long the RoT takes from a request's chip-select going high to
+    /// ROT_IRQ: its interrupt, its handling, the response packed.
+    const LATENCY: u64 = 100_000_000;
+
     pub fn new(irq: (usize, u8)) -> Rot {
-        Rot { irq, responding: false, request: Vec::new(), response: Vec::new(), sent: 0, clocked: 0, stats: [0; 8] }
+        Rot {
+            irq,
+            responding: false,
+            ready_at: None,
+            request: Vec::new(),
+            response: Vec::new(),
+            sent: 0,
+            clocked: 0,
+            stats: [0; 8],
+        }
+    }
+
+    fn advance(&mut self, now: u64) {
+        if self.ready_at.is_some_and(|at| at <= now) {
+            self.ready_at = None;
+            self.responding = true;
+        }
     }
 
     fn select(&mut self) {
@@ -447,7 +519,7 @@ impl Rot {
         0
     }
 
-    fn deselect(&mut self) {
+    fn deselect(&mut self, now: u64) {
         if self.responding {
             if self.clocked == 0 {
                 self.stats[3] += 1;
@@ -457,12 +529,12 @@ impl Rot {
             self.responding = false;
             return;
         }
-        if self.request.is_empty() {
+        if self.request.is_empty() || self.ready_at.is_some() {
             return;
         }
         self.response = self.answer();
         self.sent = 0;
-        self.responding = true;
+        self.ready_at = Some(now + Self::LATENCY);
     }
 
     /// The response to the request clocked in: a `Result<RspBody,
@@ -645,22 +717,28 @@ mod tests {
     }
 
     #[test]
-    fn an_eeprom_page_write_wraps_within_its_page() {
+    fn an_eeprom_page_write_wraps_within_its_page_and_then_is_busy() {
         let mut e = At24::new(0x50);
-        e.start(false);
+        assert!(e.start(false, 0));
         for byte in [0x06, 1, 2, 3, 4] {
             e.write(byte);
         }
+        e.stop(1000);
         assert_eq!(&e.memory[0..8], &[3, 4, 0xFF, 0xFF, 0xFF, 0xFF, 1, 2]);
+        assert!(!e.start(true, 1000 + At24::WRITE_CYCLE - 1), "still writing: no acknowledge");
+        assert!(e.start(true, 1000 + At24::WRITE_CYCLE));
     }
 
     #[test]
     fn the_flash_answers_its_jedec_id_and_programs_only_clear_bits() {
         let mut f = NorFlash::new();
-        let transfer = |f: &mut NorFlash, bytes: &[u8]| -> Vec<u8> {
+        // Each transfer a second after the last: the flash is never busy.
+        let mut now = 0;
+        let mut transfer = |f: &mut NorFlash, bytes: &[u8]| -> Vec<u8> {
+            now += 1000 * NorFlash::MS;
             f.select();
-            let out = bytes.iter().map(|&b| f.exchange(b)).collect();
-            f.deselect();
+            let out = bytes.iter().map(|&b| f.exchange(b, now)).collect();
+            f.deselect(now);
             out
         };
         assert_eq!(transfer(&mut f, &[0x9F, 0, 0, 0]), [0xFF, 0xEF, 0x40, 0x14]);
@@ -674,6 +752,24 @@ mod tests {
         transfer(&mut f, &[0x06]);
         transfer(&mut f, &[0x20, 0, 0, 0]);
         assert_eq!(f.memory[0], 0xFF, "erased");
+    }
+
+    #[test]
+    fn the_flash_is_busy_while_it_programs() {
+        let mut f = NorFlash::new();
+        for (bytes, at) in [(&[0x06][..], 0), (&[0x02, 0, 0, 0, 0x0F][..], 0)] {
+            f.select();
+            bytes.iter().for_each(|&b| _ = f.exchange(b, at));
+            f.deselect(at);
+        }
+        let status = |f: &mut NorFlash, at| {
+            f.select();
+            let s = [f.exchange(0x05, at), f.exchange(0, at)][1];
+            f.deselect(at);
+            s
+        };
+        assert_eq!(status(&mut f, NorFlash::MS / 2), 0x03, "BUSY and WEL");
+        assert_eq!(status(&mut f, NorFlash::MS), 0x00);
     }
 
     /// A sprot request as the SP packs one.
@@ -692,13 +788,16 @@ mod tests {
         assert_eq!(rot.line(), Some(((3, 0), true)), "ROT_IRQ idles high");
         rot.select();
         for byte in request(&[0]) {
-            rot.exchange(byte);
+            rot.exchange(byte, 0);
         }
-        rot.deselect();
+        rot.deselect(0);
+        assert_eq!(rot.line(), Some(((3, 0), true)), "still working on it");
+        assert_eq!(rot.due(), Some(Rot::LATENCY));
+        rot.advance(Rot::LATENCY);
         assert_eq!(rot.line(), Some(((3, 0), false)), "a response waits");
         rot.select();
-        let response: Vec<u8> = (0..23).map(|_| rot.exchange(0)).collect();
-        rot.deselect();
+        let response: Vec<u8> = (0..23).map(|_| rot.exchange(0, Rot::LATENCY)).collect();
+        rot.deselect(Rot::LATENCY);
         assert_eq!(rot.line(), Some(((3, 0), true)));
         let size = u16::from_le_bytes([response[4], response[5]]) as usize;
         assert_eq!(&response[6..6 + size], &[0, 1, 6, 0, 0, 0, 2, 0, 0, 0, 0, 4, 0, 4]);
