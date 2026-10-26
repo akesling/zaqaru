@@ -3,7 +3,7 @@ name = "zaqaru-armv6m"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
-description = "An ARMv6-M machine: a Cortex-M0+ interpreter and enough of an STM32G031 to boot Hubris"
+description = "An M-profile machine: a Cortex-M0+ or Cortex-M7 interpreter and enough of an STM32G0 or STM32H753 to boot Hubris"
 
 [lib]
 name = "armv6m"

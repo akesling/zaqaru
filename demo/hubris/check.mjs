@@ -6,11 +6,13 @@
 //
 // The lines default to `board` and `humility tasks`, typed one after another
 // into one session, as the page's terminal does; `wait:N` runs N seconds
-// without typing. Prints what each line answered and how long it took, in
+// without typing, and `upload:PATH` sends a file of this host's as the page
+// does one dropped on its terminal. Prints what each line answered and how long it took, in
 // wall time and in instructions, and exits 0 when `humility tasks` showed
 // a task RUNNING.
 
 import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import { Container, Edge, KIND, standardMounts, text } from "../../web/zaqaru.js";
 
 const [modulePath, ...asked] = process.argv.slice(2);
@@ -73,7 +75,14 @@ for (const line of lines) {
     continue;
   }
   const mark = screen.length;
-  session.send(new TextEncoder().encode(`${line}\n`));
+  const uploading = /^upload:(.+)$/.exec(line);
+  if (uploading) {
+    const bytes = readFileSync(uploading[1]);
+    const head = new TextEncoder().encode(`upload ${basename(uploading[1])} ${bytes.length}\n`);
+    session.send(new Uint8Array([...head, ...bytes]));
+  } else {
+    session.send(new TextEncoder().encode(`${line}\n`));
+  }
   const from = performance.now();
   const fromRetired = retired;
   const answered = await runUntil(() => screen.length > mark && screen.endsWith(PROMPT), 600000);

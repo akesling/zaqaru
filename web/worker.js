@@ -34,7 +34,7 @@
 //               { type: "read", id, path }              one path, at the instant in view
 //               { type: "request", id, port, request }  live: through the edge
 //               { type: "open", id, port }               live: a connection that stays open
-//               { type: "write", id, data }              live: more for an open connection
+//               { type: "write", id, data }              live: more for an open connection, a string or bytes
 // Messages out: { type: "loaded", ... }  { type: "progress", ... }
 //               { type: "state", ... }   { type: "value", id, path, value | error }
 //               { type: "response", id, response }
@@ -514,7 +514,11 @@ onmessage = async (event) => {
     else if (message.type === "read") readOne(message.id, message.path);
     else if (message.type === "request") request(message.id, message.port, message.request);
     else if (message.type === "open") openStream(message.id, message.port);
-    else if (message.type === "write") streams.get(message.id)?.send(new TextEncoder().encode(message.data));
+    // Text a line at a time, or bytes: a file dropped on the terminal.
+    else if (message.type === "write") {
+      const bytes = typeof message.data === "string" ? new TextEncoder().encode(message.data) : new Uint8Array(message.data);
+      streams.get(message.id)?.send(bytes);
+    }
     // The page has been granted a USB device: attach it, and the next
     // program to start finds it.
     else if (message.type === "usb") await usb?.refresh();

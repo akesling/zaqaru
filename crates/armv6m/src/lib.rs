@@ -1,5 +1,6 @@
-//! An ARMv6-M machine: a Cortex-M0+ interpreter, and enough of an
-//! STM32G031 around it to boot Hubris.
+//! An M-profile machine: a Cortex-M0+ (ARMv6-M) or Cortex-M7 (ARMv7E-M,
+//! with its FPU) interpreter, and enough of an STM32G0 or STM32H753 around
+//! it to boot Hubris.
 //!
 //! The x86 machine next door runs *programs*, under a kernel of its own.
 //! This one runs a *kernel*: the code under test is the thing that owns
@@ -14,17 +15,22 @@
 //! The pieces:
 //!
 //! - [`state::Cpu`] — the registers, as a struct.
-//! - [`exec`] — what each of the ARMv6-M instructions means.
+//! - [`exec`] — what each of the ARMv6-M instructions means, and the
+//!   16-bit ones of ARMv7-M; [`thumb2`] the 32-bit ones; [`fpu`] the
+//!   floating-point unit's.
 //! - [`exception`] — entering and leaving handlers, and deciding which one.
 //! - [`scs`] — SysTick, the NVIC, the SCB and the MPU, as memory-mapped
 //!   registers.
 //! - [`debug`] and [`dap`] — halting debug, and the debug port a probe
 //!   reaches it through.
-//! - [`bus`] and [`stm32g0`] — the rest of the address space.
+//! - [`bus`], [`part`], [`stm32g0`] and [`stm32h7`] — the rest of the
+//!   address space, and the peripherals in it.
+//! - [`net`] — a host at the other end of an H7's Ethernet cable.
 //! - [`Machine`] — the run loop.
 //!
-//! **Time is retired instructions.** Each one is one cycle of the 16 MHz
-//! clock Hubris configures SysTick against, and nothing else advances it:
+//! **Time is retired instructions.** Each one is one cycle of the clock
+//! Hubris configures SysTick against — 16 MHz on a G0, 400 MHz on an H7 —
+//! and nothing else advances it:
 //! a run is a pure function of the image, the same way a zaqaru container
 //! is a pure function of its tape. `wfi` does not spin; it jumps the clock
 //! to the next event, which is also what makes an idle system cheap to run.

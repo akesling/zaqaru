@@ -692,6 +692,32 @@ function makeTerminalPanel() {
   $("term-out").onclick = () => {
     if (!window.getSelection().toString()) $("term-in").focus();
   };
+  // A file dropped on the terminal goes to the session as the door takes
+  // one: `upload NAME SIZE`, then its bytes. A Hubris archive dropped so is
+  // then there to `flash`.
+  element.ondragover = (event) => {
+    if (!event.dataTransfer?.types.includes("Files")) return;
+    event.preventDefault();
+    element.classList.add("dropping");
+  };
+  element.ondragleave = () => element.classList.remove("dropping");
+  element.ondrop = async (event) => {
+    event.preventDefault();
+    element.classList.remove("dropping");
+    for (const file of event.dataTransfer.files) await uploadToTerminal(file);
+  };
+}
+
+async function uploadToTerminal(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const name = file.name.replace(/\s+/g, "_");
+  const head = new TextEncoder().encode(`upload ${name} ${bytes.length}\n`);
+  const message = new Uint8Array(head.length + bytes.length);
+  message.set(head);
+  message.set(bytes, head.length);
+  terminalWrite(`upload ${name}  (${bytes.length.toLocaleString()} bytes, dropped)\n`);
+  worker.postMessage({ type: "write", id: terminalId, data: message }, [message.buffer]);
+  if (!playing && finished === null) $("play").click();
 }
 
 function openTerminal() {
@@ -976,6 +1002,8 @@ const renderers = {
       .join("");
     const lit = leds.map((led) => `${escape(led.pin)} ${escape(led.state ?? "never driven")}`).join(", ");
     const heard = (value.heard ?? []).slice(-4).map((line) => `<div class="dim">heard ${escape(line)}</div>`).join("");
+    // What the USARTs sent, the tail of it, as a serial console shows it.
+    const serial = value.serial ? `<div class="key">serial</div><pre class="serial">${escape(value.serial.slice(-2000))}</pre>` : "";
     panel.body.innerHTML = `<div class="board">
       <div class="leds">${lamps}</div>
       <div><b>${escape(value.chip)}</b>${value.core ? ` (${escape(value.core)})` : ""} · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated</div>
@@ -983,8 +1011,11 @@ const renderers = {
       ${heard}
       <div class="dim">${escape(value.image)} · ${value.instructions.toLocaleString()} instructions · ${escape(value.mode)} mode, ${value.privileged ? "privileged" : "unprivileged"}</div>
       <div class="dim">${exceptions}</div>
+      ${serial}
       <div class="registers">${registers}</div>
     </div>`;
+    const transcript = panel.body.querySelector(".serial");
+    if (transcript) transcript.scrollTop = transcript.scrollHeight;
   },
 
   processes(value, panel, state) {
