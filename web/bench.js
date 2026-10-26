@@ -125,7 +125,7 @@ export function drawBoard(value, probed = new Set()) {
   });
   // The LEDs, and the button, along the top.
   (value.leds ?? []).forEach((led, i) => {
-    const x = 300 + i * 46;
+    const x = 470 + i * 46;
     const on = led.state === "on";
     const color = { green: "#3ddc6a", red: "#ff4d42", yellow: "#ffd23a", blue: "#4aa3ff", white: "#ffffff" }[led.color] ?? "#3ddc6a";
     out.push(`<g data-probe="${led.pin}" style="cursor:pointer"><title>${esc(led.pin)}: ${esc(led.color)} LED, ${esc(led.state ?? "never driven")}</title>`);
@@ -135,7 +135,7 @@ export function drawBoard(value, probed = new Set()) {
   });
   if (board.button) {
     const state = pinState(value, board.button);
-    const x = 300 + (value.leds ?? []).length * 46 + 20;
+    const x = 470 + (value.leds ?? []).length * 46 + 20;
     out.push(`<g data-probe="${board.button}" style="cursor:pointer"><title>the user button, ${board.button}: ${state?.high ? "pressed" : "released"} — the terminal's \`button\` presses it</title>`);
     out.push(`<rect x="${x - 12}" y="20" width="24" height="20" rx="3" fill="#2c2f34" stroke="${probed.has(board.button) ? "#ff5d5d" : "#0007"}" stroke-width="2"/><circle cx="${x}" cy="30" r="6" fill="${state?.high ? "#4aa3ff" : "#4a5059"}"/>`);
     out.push(`<text x="${x}" y="52" text-anchor="middle" fill="${board.ink}" font-size="9">USER</text></g>`);
