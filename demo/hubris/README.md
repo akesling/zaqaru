@@ -50,11 +50,34 @@ python3 -m http.server -d . 8000
 ```
 
 The page opens on a terminal, in session with the container, and the
-board beside it: its LEDs drawn as their pins drive them (green PB0, red
-PB14, yellow PE1), its state, time and registers, and what the host on its
-Ethernet cable last heard, read from the container's store. "show the machine" opens the
-rest of the debugger — processes, files, the timeline — and the slider
-seeks the whole bench, board included, to any instant of the run.
+board beside it, drawn from what it says of itself: its chip with every
+GPIO pin coloured by its mode and level as the firmware drives it, its
+LEDs and button, its buses with the parts on them, the Ethernet jack, the
+serial port and the debug probe. "show the machine" opens the rest of
+the debugger — processes, files, the timeline — and the slider seeks the
+whole bench, board included, to any instant of the run.
+
+## Probes
+
+Click anything on the drawn board to put a probe on it, as you would clip
+a logic analyzer on, and the panel shows what crosses it, in the board's
+simulated time:
+
+| probe on | shows |
+|----------|-------|
+| a pin | its level as a waveform, over a window from 1 ms to 10 s, and its latest edges: an LED's blink, a chip-select, ROT_IRQ, the button |
+| an I2C bus | its transactions, decoded: `0x48 W 00 · 0x48 R 0c 80` — Humility's read of the TMP117, through hiffy and the I2C driver |
+| a SPI bus | each chip-select's transfer, what went out and what came back: the flash's JEDEC ID, the RoT's sprot messages, the KSZ8463's registers |
+| the serial port | its bytes as text, each way |
+| the Ethernet jack | its frames, summarized: addresses, VLAN, IPv6, UDP ports or ICMPv6 |
+| a part | what it holds: the TMP117's temperature, the EEPROM's bytes, the RoT's state and last request, the switch's ports and VLANs |
+
+The probes read the board's trace (`board/trace/{since}/{channels}` in the
+container's store), which the kernel keeps as the board runs: so a probe
+put on shows the recent past, and pausing the board's clock or moving it
+on by a millisecond (`pause`, `advance 1ms`, or the panel's buttons) holds
+a transaction still to read. A Gimletlet or a PSC flashed onto the bench is
+drawn as itself, with its own LEDs and parts.
 
 `build.sh` builds Hubris's `app/demo-stm32h7-nucleo/app-h753.toml`, and
 the G031 and G070 demos to flash in its place, on this host. It builds
