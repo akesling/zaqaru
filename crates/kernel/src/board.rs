@@ -183,6 +183,13 @@ pub struct Board {
     pub now: u64,
     /// The board's LEDs, and whether each is lit, if it has been driven.
     pub leds: Vec<(Led, Option<bool>)>,
+    /// Which board this is, as Hubris names it: `nucleo-h753zi`,
+    /// `gimletlet-2`; empty if nobody has said.
+    pub name: String,
+    /// What has crossed the chip's pins and buses, numbered, the latest
+    /// [`TRACE_KEPT`]; and the number the next will have.
+    trace: VecDeque<(u64, armv6m::trace::Record)>,
+    trace_next: u64,
     /// What the USARTs have sent, the latest [`SERIAL_KEPT`] bytes or so.
     pub serial: Vec<u8>,
     pub faults: u64,
@@ -209,6 +216,10 @@ pub struct Board {
     last_multicast: Option<String>,
 }
 
+/// How many trace records the board keeps, and serves at a time.
+const TRACE_KEPT: usize = 200_000;
+const TRACE_SERVED: usize = 5_000;
+
 /// How many of what the host heard the board keeps.
 const HEARD_KEPT: usize = 16;
 
@@ -234,6 +245,8 @@ pub struct Configuration {
     pub leds: Vec<Led>,
     /// The parts wired to the buses, a line each: `i2c I2C2 0x48 tmp117`.
     pub wiring: Vec<String>,
+    /// Which board this is, as Hubris names it: `nucleo-h753zi`.
+    pub name: String,
 }
 
 /// A user LED on the board: which pin, and which level lights it.
@@ -265,21 +278,25 @@ impl Led {
         }
     }
 
-    /// `PC6 low`, `PA5 high`.
+    /// `PC6 low`, `PA5 high`, `PB14 high red`: the pin, the level that
+    /// lights it, and its colour, green if not said.
     fn parse(text: &str) -> Option<Led> {
-        let (pin, level) = text.split_once(char::is_whitespace).unwrap_or((text, "high"));
-        let bytes = pin.as_bytes();
-        let port = match bytes {
-            [b'P', port @ b'A'..=b'K', ..] => port - b'A',
-            _ => return None,
-        };
-        let pin = pin[2..].parse().ok().filter(|&pin: &u8| pin < 16)?;
-        let active_low = match level.trim() {
+        let mut words = text.split_whitespace();
+        let (port, pin) = parse_pin(words.next()?)?;
+        let active_low = match words.next().unwrap_or("high") {
             "low" => true,
             "high" => false,
             _ => return None,
         };
-        Some(Led { port, pin, active_low, color: "green" })
+        let color = match words.next().unwrap_or("green") {
+            "green" => "green",
+            "red" => "red",
+            "yellow" => "yellow",
+            "blue" => "blue",
+            "white" => "white",
+            _ => return None,
+        };
+        Some(Led { port, pin, active_low, color })
     }
 
     fn name(&self) -> String {
@@ -307,6 +324,7 @@ const SERIAL_KEPT: usize = 16 * 1024;
 pub fn parse(text: &str) -> Result<Configuration, String> {
     let (mut chip, mut image, mut probe, mut led) = (None, None, None, None);
     let mut wiring = Vec::new();
+    let mut name = String::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -318,6 +336,7 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
             .ok_or_else(|| format!("`{line}`: expected `key value`"))?;
         match key {
             "chip" => chip = Some(value.to_string()),
+            "name" => name = value.to_string(),
             "image" => image = Some(value.to_string()),
             "probe" => probe = Some(parse_address(value).ok_or_else(|| format!("probe `{value}`: expected a.b.c.d:port"))?),
             "led" => led = Some(Led::parse(value).ok_or_else(|| format!("led `{value}`: expected a pin and a level, `PC6 low`"))?),
@@ -338,6 +357,7 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
         probe: probe.unwrap_or((crate::socket::INADDR_LOOPBACK, 3333)),
         leds: led.map_or_else(|| Led::of(part.name), |led| vec![led]),
         wiring,
+        name,
     })
 }
 
@@ -401,6 +421,9 @@ impl Board {
     ///   read, in degrees Celsius;
     /// - `speed`, `pause`, `resume` and `advance`: see
     ///   [`Board::clock_command`];
+    /// - `name gimletlet-2` says which board this is, and `leds PG2 high
+    ///   green, PG3 high` what its LEDs are — for a board other than the
+    ///   bench's own;
     /// - `wire LINE` wires a part to the board's buses now, as a board
     ///   file's `i2c` and `spi` lines do; `unwire` leaves the next part put
     ///   on the bench with nothing wired, and `rewire` with what the board
@@ -413,6 +436,8 @@ impl Board {
                     .ok_or_else(|| format!("part `{}`: {MODELLED}", rest.trim()))?;
                 let mut machine = Machine::new(part, &[])?;
                 machine.halt();
+                machine.trace().on = true;
+                self.name.clear();
                 if matches!(machine.bus.soc, armv6m::bus::Soc::H7(_)) {
                     for line in &self.wiring {
                         let wired = armv6m::devices::Wiring::parse(line).and_then(|w| machine.attach(w));
@@ -440,6 +465,16 @@ impl Board {
                     part.name.to_ascii_uppercase(),
                     part.flash / 1024
                 ));
+                Ok(())
+            }
+            "name" => {
+                self.name = rest.trim().to_string();
+                Ok(())
+            }
+            "leds" => {
+                let leds: Option<Vec<Led>> = rest.split(',').filter(|led| !led.trim().is_empty()).map(Led::parse).collect();
+                let leds = leds.ok_or_else(|| format!("leds `{}`: expected `PG2 high green, PG3 high red`", rest.trim()))?;
+                self.leds = leds.into_iter().map(|led| (led, None)).collect();
                 Ok(())
             }
             "image" if !rest.trim().is_empty() => {
@@ -684,6 +719,14 @@ impl Board {
 
     /// Turns the machine's events into console lines and board state.
     fn collect(&mut self) {
+        let records: Vec<armv6m::trace::Record> = self.machine.trace().records.drain(..).collect();
+        for record in records {
+            self.trace.push_back((self.trace_next, record));
+            self.trace_next += 1;
+        }
+        if self.trace.len() > TRACE_KEPT {
+            self.trace.drain(..self.trace.len() - TRACE_KEPT);
+        }
         let events: Vec<Event> = self.machine.events.drain(..).collect();
         for event in events {
             match event {
@@ -911,7 +954,8 @@ impl Board {
             _ => String::new(),
         };
         format!(
-            r#"{{"chip":{},"core":{},"image":{},"state":{},"speed":{},"paused":{},"ratio":{:.4},"skipped_ms":{:.3},"clocks":{{{}}},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"wired":[{}],"exceptions":{{{}}},"registers":{{{}}}}}"#,
+            r#"{{"name":{},"chip":{},"core":{},"image":{},"state":{},"speed":{},"paused":{},"ratio":{:.4},"skipped_ms":{:.3},"clocks":{{{}}},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"wired":[{}],"gpio":[{}],"parts":[{}],"trace_next":{},"exceptions":{{{}}},"registers":{{{}}}}}"#,
+            quoted(&self.name),
             quoted(&self.chip),
             quoted(core_name(m.core)),
             quoted(&self.image),
@@ -946,9 +990,83 @@ impl Board {
             quoted(&String::from_utf8_lossy(&self.serial[self.serial.len().saturating_sub(4096)..])),
             self.heard.iter().map(|(_, line)| quoted(line)).collect::<Vec<_>>().join(","),
             m.wired().iter().map(|line| quoted(line)).collect::<Vec<_>>().join(","),
+            m.ports()
+                .iter()
+                .enumerate()
+                .map(|(n, (idr, odr, moder))| {
+                    format!(r#"{{"port":"{}","idr":{idr},"odr":{odr},"moder":{moder}}}"#, (b'A' + n as u8) as char)
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            m.parts()
+                .iter()
+                .map(|part| {
+                    let values: Vec<String> =
+                        part.values.iter().map(|(name, value)| format!("{}:{}", quoted(name), quoted(value))).collect();
+                    format!(
+                        r#"{{"bus":{},"at":{},"kind":{},"line":{},"values":{{{}}}}}"#,
+                        quoted(&part.bus),
+                        quoted(&part.at),
+                        quoted(part.kind),
+                        part.line.as_deref().map_or("null".into(), quoted),
+                        values.join(",")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            self.trace_next,
             exceptions.join(","),
             registers.join(","),
         )
+    }
+
+    /// What has crossed the pins and buses, from record `since` on, on the
+    /// channels asked for (`PB0`, `I2C2`, `SPI3`, `USART1`, `ETH`; all, if
+    /// none), at most [`TRACE_SERVED`] of them, as JSON: the records, the
+    /// number of the next, and the oldest still kept. Times are in
+    /// nanoseconds of simulated time.
+    pub fn trace_json(&self, since: u64, channels: &[&str]) -> String {
+        use crate::system::server::quoted;
+        use armv6m::trace::{I2cEvent, Signal, SpiEvent};
+        let first = self.trace.front().map_or(self.trace_next, |(n, _)| *n);
+        let mut out = Vec::new();
+        let mut next = since.max(first);
+        for (n, record) in self.trace.iter().skip(since.saturating_sub(first) as usize) {
+            if out.len() == TRACE_SERVED {
+                break;
+            }
+            next = n + 1;
+            let channel = record.signal.channel();
+            if !channels.is_empty() && !channels.iter().any(|c| c.eq_ignore_ascii_case(&channel)) {
+                continue;
+            }
+            let what = match &record.signal {
+                Signal::Pin { high, .. } => format!(r#""high":{high}"#),
+                Signal::I2c { event, .. } => match event {
+                    I2cEvent::Start { address, read, ack } => {
+                        format!(r#""ev":"start","addr":{address},"read":{read},"ack":{ack}"#)
+                    }
+                    I2cEvent::Byte { byte } => format!(r#""ev":"byte","b":{byte}"#),
+                    I2cEvent::Stop => r#""ev":"stop""#.to_string(),
+                },
+                Signal::Spi { event, .. } => match event {
+                    SpiEvent::Select { port, pin } => {
+                        format!(r#""ev":"select","cs":"P{}{pin}""#, (b'A' + port) as char)
+                    }
+                    SpiEvent::Frame { mosi, miso } => format!(r#""ev":"frame","mosi":{mosi},"miso":{miso}"#),
+                    SpiEvent::Deselect { port, pin } => {
+                        format!(r#""ev":"deselect","cs":"P{}{pin}""#, (b'A' + port) as char)
+                    }
+                },
+                Signal::Usart { received, byte, .. } => format!(r#""rx":{received},"b":{byte}"#),
+                Signal::Eth { received, len, head } => {
+                    let hex: String = head.iter().map(|b| format!("{b:02x}")).collect();
+                    format!(r#""rx":{received},"len":{len},"head":{}"#, quoted(&hex))
+                }
+            };
+            out.push(format!(r#"{{"n":{n},"t":{},"ch":{},{what}}}"#, record.time / 1000, quoted(&channel)));
+        }
+        format!(r#"{{"first":{first},"next":{next},"records":[{}]}}"#, out.join(","))
     }
 
     /// The board's state, as the console's `board` command and the store
@@ -1101,6 +1219,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 return Slot::Absent;
             }
         };
+        // Recording what crosses the pins and buses, for a probe to show.
+        machine.trace().on = true;
         for line in &configuration.wiring {
             let wired = armv6m::devices::Wiring::parse(line).and_then(|w| machine.attach(w));
             if let Err(why) = wired {
@@ -1149,6 +1269,9 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             ratio: 0.0,
             now: 0,
             leds: configuration.leds.into_iter().map(|led| (led, None)).collect(),
+            name: configuration.name,
+            trace: VecDeque::new(),
+            trace_next: 0,
             serial: Vec::new(),
             faults: 0,
             console: Vec::new(),
@@ -1256,6 +1379,7 @@ mod tests {
                 probe: (0x7F00_0001, 3333),
                 leds: vec![Led { port: 2, pin: 6, active_low: true, color: "green" }],
                 wiring: vec![],
+                name: String::new(),
             }
         );
         let wired = parse("chip stm32h753\nimage /f.bin\ni2c I2C2 0x48 tmp117\nspi SPI3 PA15 rot PD0\n").unwrap();
@@ -1283,6 +1407,8 @@ mod tests {
         assert_eq!((g070.chip.as_str(), g070.leds), ("stm32g070", vec![Led { port: 0, pin: 5, active_low: false, color: "green" }]));
         let told = parse("chip stm32g031\nimage /f.bin\nled PA12 low").unwrap();
         assert_eq!(told.leds, vec![Led { port: 0, pin: 12, active_low: true, color: "green" }]);
+        assert_eq!(Led::parse("PB14 high red"), Some(Led { port: 1, pin: 14, active_low: false, color: "red" }));
+        assert_eq!(Led::parse("PB14 high mauve"), None);
         assert!(parse("image /f.bin\nled PZ9 low").is_err());
         let h753 = parse("chip STM32H753ZITx\nimage /f.bin").unwrap();
         assert_eq!((h753.chip.as_str(), h753.leds.len()), ("stm32h753", 3));

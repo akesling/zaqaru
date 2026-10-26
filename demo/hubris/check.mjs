@@ -9,7 +9,8 @@
 // without typing, and `upload:PATH` sends a file of this host's as the page
 // does one dropped on its terminal; `gdb:COMMAND` sends `monitor COMMAND`
 // to the board's GDB server, as GDB would — a `qRcmd` packet on the
-// probe's port — and shows what it printed. Prints what each line answered
+// probe's port — and shows what it printed; `read:PATH` reads a path of
+// the container's store, as the page does, and shows its value. Prints what each line answered
 // and how long it took, in wall time and in instructions, and exits 0 when
 // `humility tasks` showed a task RUNNING.
 
@@ -85,6 +86,11 @@ for (const line of lines) {
     const seconds = Number(waiting[1]);
     await runUntil(() => false, seconds * 1000);
     console.error(`check: waited ${seconds} s, ${((retired - fromRetired) / 1e6).toFixed(0)} M instructions`);
+    continue;
+  }
+  const reading = /^read:(.+)$/.exec(line);
+  if (reading) {
+    console.log(`(store) ${reading[1]}\n${JSON.stringify(container.value(reading[1]))}`);
     continue;
   }
   const monitor = /^gdb:(.+)$/.exec(line);

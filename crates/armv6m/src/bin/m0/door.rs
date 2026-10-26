@@ -311,6 +311,17 @@ fn wiring(board: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// A board's LEDs, as the board's own `leds` command takes them, where they
+/// are not its part's Nucleo's: a Gimletlet's four on PG2 to PG5, a PSC's
+/// one on PA3.
+fn leds(board: &str) -> Option<&'static str> {
+    match board {
+        "gimletlet-1" | "gimletlet-2" => Some("PG2 high green, PG3 high green, PG4 high green, PG5 high green"),
+        "psc-b" | "psc-c" => Some("PA3 high green"),
+        _ => None,
+    }
+}
+
 /// What a board drives on its own pins that its Hubris reads at startup:
 /// the straps that say which revision it is. A PSC's are PG0 to PG2, which
 /// its startup reads and asserts on.
@@ -426,6 +437,12 @@ impl FrontDoor {
             return out.write_all(format!("flash: the board would not become an {part}: {e}\n").as_bytes());
         }
         out.write_all(format!("the board is now an {part}, erased; flashing {archive}\n").as_bytes())?;
+        if !board.is_empty() {
+            let _ = std::fs::write("/dev/board", format!("name {board}\n"));
+        }
+        if let Some(leds) = leds(board) {
+            let _ = std::fs::write("/dev/board", format!("leds {leds}\n"));
+        }
         if let Some(parts) = parts {
             for line in parts {
                 if let Err(e) = std::fs::write("/dev/board", format!("wire {line}\n")) {

@@ -3,6 +3,7 @@
 # USB, a CMSIS-DAP probe Humility finds by itself; `probe` is where a GDB
 # server on the same debug port listens too, for a debugger that speaks GDB.
 chip   stm32h753
+name   nucleo-h753zi
 image  /hubris/final.bin
 probe  127.0.0.1:3333
 
