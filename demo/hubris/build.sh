@@ -19,7 +19,11 @@
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
-hubris=$(cd "${1:?usage: demo/hubris/build.sh <hubris-checkout> [out-dir]}" && pwd)
+if [ $# -lt 1 ]; then
+  echo "usage: demo/hubris/build.sh <hubris-checkout> [out-dir]" >&2
+  exit 2
+fi
+hubris=$(cd "$1" && pwd)
 out=${2:-$repo/web/demo}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
