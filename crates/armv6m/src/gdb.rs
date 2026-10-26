@@ -248,3 +248,16 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_monitor_command_and_its_output() {
+        let hex: String = "advance 10ms".bytes().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(monitor(&format!("qRcmd,{hex}")).as_deref(), Some("advance 10ms"));
+        assert_eq!(monitor("qC"), None);
+        assert_eq!(output("ok\n"), "O6f6b0a");
+    }
+}
