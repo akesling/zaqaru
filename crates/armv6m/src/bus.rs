@@ -473,10 +473,10 @@ impl Soc {
     }
 
     /// Something outside drives a pin to a level, or lets go of it.
-    pub fn drive(&mut self, port: usize, pin: u8, level: Option<bool>) {
+    pub fn drive(&mut self, port: usize, pin: u8, level: Option<bool>, now: u64) {
         match self {
-            Soc::G0(soc) => soc.drive(port, pin, level),
-            Soc::H7(soc) => soc.drive(port, pin, level),
+            Soc::G0(soc) => soc.drive(port, pin, level, now),
+            Soc::H7(soc) => soc.drive(port, pin, level, now),
         }
     }
 

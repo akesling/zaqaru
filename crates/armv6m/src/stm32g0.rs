@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::flash;
 pub use crate::gpio::Edge;
 use crate::gpio::Gpio;
+use crate::trace::{Signal, Trace};
 use crate::usart::{self, Usart};
 
 const RCC: u32 = 0x4002_1000;
@@ -56,6 +57,10 @@ pub struct Stm32g0 {
     /// The part's DEV_ID, which DBGMCU_IDCODE reports.
     pub dev_id: u16,
     pub flash_interface: flash::Interface,
+    /// What crosses the pins and the USARTs, for whoever is watching; and
+    /// the pins' levels as it last saw them.
+    pub trace: Trace,
+    watched: [u16; PORTS],
 }
 
 impl Default for Stm32g0 {
@@ -70,6 +75,8 @@ impl Default for Stm32g0 {
             serial: Vec::new(),
             dev_id: crate::part::STM32G031.dev_id,
             flash_interface: flash::Interface::default(),
+            trace: Trace::default(),
+            watched: [0; PORTS],
         };
         soc.reset();
         soc
@@ -134,6 +141,12 @@ impl Stm32g0 {
     fn advance_usart(&mut self, n: usize, now: u64) {
         let usart = &mut self.usarts[n];
         usart.advance(now);
+        for byte in usart.sent.iter().copied() {
+            self.trace.record(now, Signal::Usart { port: n as u8, received: false, byte });
+        }
+        for byte in usart.arrived.drain(..) {
+            self.trace.record(now, Signal::Usart { port: n as u8, received: true, byte });
+        }
         self.serial.extend(usart.sent.drain(..).map(|byte| usart::Byte { port: n as u8, byte }));
     }
 
@@ -161,10 +174,28 @@ impl Stm32g0 {
     }
 
     /// Something outside drives a pin, or lets go of it.
-    pub fn drive(&mut self, port: usize, pin: u8, level: Option<bool>) {
+    pub fn drive(&mut self, port: usize, pin: u8, level: Option<bool>, now: u64) {
         if let Some(gpio) = self.gpio.get_mut(port) {
             gpio.drive(pin, level);
         }
+        self.watch_pins(now);
+    }
+
+    /// The pins whose level changed since last looked at, for the trace.
+    fn watch_pins(&mut self, now: u64) {
+        for (port, gpio) in self.gpio.iter().enumerate() {
+            let level = gpio.idr() as u16;
+            let changed = level ^ self.watched[port];
+            self.watched[port] = level;
+            for pin in (0..16).filter(|pin| changed >> pin & 1 != 0) {
+                self.trace.record(now, Signal::Pin { port: port as u8, pin, high: level >> pin & 1 != 0 });
+            }
+        }
+    }
+
+    /// The GPIO ports' state: each one's levels, outputs and modes.
+    pub fn ports(&self) -> Vec<(u16, u16, u32)> {
+        self.gpio.iter().map(|gpio| (gpio.idr() as u16, gpio.odr as u16, gpio.moder)).collect()
     }
 
     pub fn read(&mut self, addr: u32, now: u64) -> Option<u32> {
@@ -232,6 +263,7 @@ impl Stm32g0 {
             if gpio.odr != before {
                 self.edges.push(Edge { port: port as u8, before: before as u16, after: gpio.odr as u16 });
             }
+            self.watch_pins(now);
             return Some(());
         }
         self.unmodelled.insert(addr);

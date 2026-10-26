@@ -93,8 +93,10 @@ pub struct Usart {
     /// RDR, or the receive FIFO.
     received: VecDeque<u8>,
     overrun: bool,
-    /// What has finished going out on the line, for whoever is listening.
+    /// What has finished going out on the line, and what has come in on
+    /// it, for whoever is listening.
     pub sent: Vec<u8>,
+    pub arrived: Vec<u8>,
 }
 
 impl Default for Usart {
@@ -115,6 +117,7 @@ impl Default for Usart {
             received: VecDeque::new(),
             overrun: false,
             sent: Vec::new(),
+            arrived: Vec::new(),
         }
     }
 }
@@ -184,6 +187,7 @@ impl Usart {
         }
         while !self.line.is_empty() && self.line_at <= now {
             let byte = self.line.pop_front().unwrap();
+            self.arrived.push(byte);
             if self.received.len() < self.depth() {
                 self.received.push_back(byte);
             } else {

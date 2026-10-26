@@ -33,6 +33,7 @@ use crate::gpio::{Edge, Gpio};
 use crate::i2c::I2c;
 use crate::spi_h7::Spi;
 use crate::timer::Timer;
+use crate::trace::{Signal, SpiEvent, Trace};
 use crate::usart::{self, Usart};
 
 const RCC: u32 = 0x5802_4400;
@@ -143,6 +144,10 @@ pub struct Stm32h7 {
     /// What RCC's registers make of the oscillators, worked out again
     /// whenever they are written.
     pub clocks: Clocks,
+    /// What crosses the pins and buses, for whoever is watching; and the
+    /// pins' levels as it last saw them.
+    pub trace: Trace,
+    watched: [u16; PORTS],
 }
 
 /// A part on a SPI bus: its controller, its chip-select, and whether that
@@ -186,6 +191,8 @@ impl Default for Stm32h7 {
             timers: TIMERS.iter().map(|&(_, _, wide)| Timer::new(wide, Clocks::period(HSI))).collect(),
             eth: Ethernet::default(),
             clocks: Clocks::reset(HSI),
+            trace: Trace::default(),
+            watched: [0; PORTS],
         };
         soc.rcc[0xD0 / 4] = RSR_POR | RSR_PIN | RSR_BOR | RSR_D2 | RSR_D1 | RSR_CPU;
         soc.rng.state = 0x2545_F491;
@@ -303,6 +310,7 @@ impl Stm32h7 {
         // CPUIMR1: the direct lines, 22 and up, unmasked.
         self.exti[0x80 / 4] = 0xFFC0_0000;
         self.sensed = std::array::from_fn(|port| self.gpio[port].idr() as u16);
+        self.watch_pins(now);
         self.rng.cr = 0;
         self.dbgmcu = [0; 0x20];
         self.other.clear();
@@ -352,6 +360,14 @@ impl Stm32h7 {
         })
     }
 
+    /// The parts on the buses, as whoever is watching sees them.
+    pub fn parts(&self) -> Vec<crate::devices::PartView> {
+        use crate::devices::PartView;
+        let i2c = self.i2cs.iter().enumerate().flat_map(|(n, i2c)| i2c.targets.iter().map(move |part| PartView::i2c(n, part)));
+        let spi = self.spi_parts.iter().map(|w| PartView::spi(w.controller, w.cs, &w.part));
+        i2c.chain(spi).collect()
+    }
+
     /// What is wired to the buses, as the lines that would wire it.
     pub fn wired(&self) -> Vec<String> {
         let i2c = self.i2cs.iter().enumerate().flat_map(|(n, i2c)| {
@@ -375,10 +391,13 @@ impl Stm32h7 {
             let low = output && gpio.odr >> pin & 1 == 0;
             if low != wired.selected {
                 wired.selected = low;
+                let (controller, port, pin) = (wired.controller as u8, port as u8, pin);
                 if low {
                     wired.part.select();
+                    self.trace.record(now, Signal::Spi { controller, event: SpiEvent::Select { port, pin } });
                 } else {
                     wired.part.deselect(now);
+                    self.trace.record(now, Signal::Spi { controller, event: SpiEvent::Deselect { port, pin } });
                 }
             }
             if let Some(((port, pin), level)) = wired.part.line() {
@@ -386,6 +405,7 @@ impl Stm32h7 {
             }
         }
         self.sense();
+        self.watch_pins(now);
     }
 
     /// Which of a kind of peripheral an address is in, and the offset into
@@ -437,8 +457,9 @@ impl Stm32h7 {
         for n in 0..self.usarts.len() {
             self.advance_usart(n, now);
         }
-        for i2c in &mut self.i2cs {
-            i2c.advance(now);
+        for n in 0..self.i2cs.len() {
+            self.i2cs[n].advance(now);
+            self.trace_i2c(n);
         }
         for n in 0..self.spis.len() {
             self.advance_spi(n, now);
@@ -454,9 +475,12 @@ impl Stm32h7 {
     /// SPI `n` brought up to `now`, exchanging each frame with whatever
     /// its chip-select selects.
     fn advance_spi(&mut self, n: usize, now: u64) {
-        let parts = &mut self.spi_parts;
+        let (parts, trace) = (&mut self.spi_parts, &mut self.trace);
         let mut bus = |mosi: u8, at: u64| {
-            parts.iter_mut().find(|w| w.controller == n && w.selected).map_or(0xFF, |w| w.part.exchange(mosi, at))
+            let miso =
+                parts.iter_mut().find(|w| w.controller == n && w.selected).map_or(0xFF, |w| w.part.exchange(mosi, at));
+            trace.record(at, Signal::Spi { controller: n as u8, event: SpiEvent::Frame { mosi, miso } });
+            miso
         };
         self.spis[n].advance(now, &mut bus);
     }
@@ -465,6 +489,12 @@ impl Stm32h7 {
     fn advance_usart(&mut self, n: usize, now: u64) {
         let usart = &mut self.usarts[n];
         usart.advance(now);
+        for byte in usart.sent.iter().copied() {
+            self.trace.record(now, Signal::Usart { port: n as u8, received: false, byte });
+        }
+        for byte in usart.arrived.drain(..) {
+            self.trace.record(now, Signal::Usart { port: n as u8, received: true, byte });
+        }
         self.serial.extend(usart.sent.drain(..).map(|byte| usart::Byte { port: n as u8, byte }));
     }
 
@@ -566,11 +596,36 @@ impl Stm32h7 {
         self.usarts.get_mut(port).is_some_and(|usart| usart.receive(byte, now))
     }
 
-    /// Something outside drives a pin, or lets go of it.
-    pub fn drive(&mut self, port: usize, pin: u8, level: Option<bool>) {
+    /// Something outside drives a pin, or lets go of it, at `now`.
+    pub fn drive(&mut self, port: usize, pin: u8, level: Option<bool>, now: u64) {
         if let Some(gpio) = self.gpio.get_mut(port) {
             gpio.drive(pin, level);
             self.sense();
+            self.watch_pins(now);
+        }
+    }
+
+    /// The pins whose level changed since last looked at, for the trace.
+    fn watch_pins(&mut self, now: u64) {
+        for port in 0..PORTS {
+            let level = self.gpio[port].idr() as u16;
+            let changed = level ^ self.watched[port];
+            self.watched[port] = level;
+            for pin in (0..16).filter(|pin| changed >> pin & 1 != 0) {
+                self.trace.record(now, Signal::Pin { port: port as u8, pin, high: level >> pin & 1 != 0 });
+            }
+        }
+    }
+
+    /// The GPIO ports' state: each one's levels, outputs and modes.
+    pub fn ports(&self) -> Vec<(u16, u16, u32)> {
+        self.gpio.iter().map(|gpio| (gpio.idr() as u16, gpio.odr as u16, gpio.moder)).collect()
+    }
+
+    /// What I2C `n` carried since last asked, onto the trace.
+    fn trace_i2c(&mut self, n: usize) {
+        for (time, event) in self.i2cs[n].events.drain(..) {
+            self.trace.record(time, Signal::I2c { controller: n as u8, event });
         }
     }
 
@@ -609,7 +664,9 @@ impl Stm32h7 {
         }
         if let Some((n, offset)) = Self::i2c(addr) {
             self.i2cs[n].advance(now);
-            return Some(self.i2cs[n].read(offset, true, now));
+            let value = self.i2cs[n].read(offset, true, now);
+            self.trace_i2c(n);
+            return Some(value);
         }
         if let Some((n, offset)) = Self::spi(addr) {
             self.advance_spi(n, now);
@@ -712,6 +769,7 @@ impl Stm32h7 {
         } else if let Some((n, offset)) = Self::i2c(addr) {
             self.i2cs[n].advance(now);
             self.i2cs[n].write(offset, value, now);
+            self.trace_i2c(n);
         } else if let Some((n, offset)) = Self::spi(addr) {
             self.advance_spi(n, now);
             self.spis[n].write(offset, value, size, now);
@@ -913,7 +971,7 @@ mod tests {
         }
 
         fn drive(&mut self, port: usize, pin: u8, level: Option<bool>) {
-            self.0.drive(port, pin, level)
+            self.0.drive(port, pin, level, 0)
         }
 
         fn interrupts(&self) -> [u32; 8] {

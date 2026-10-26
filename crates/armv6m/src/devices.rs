@@ -78,6 +78,28 @@ impl I2cPart {
         }
     }
 
+    /// The part's name, as a datasheet has it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            I2cPart::Tmp117(_) => "TMP117",
+            I2cPart::At24(_) => "AT24C02",
+            I2cPart::Registers(_) => "registers",
+        }
+    }
+
+    /// What is in it now, for whoever is watching: a name and a value each.
+    pub fn values(&self) -> Vec<(&'static str, String)> {
+        match self {
+            I2cPart::Tmp117(p) => vec![
+                ("temperature", format!("{:.4} °C", p.celsius())),
+                ("configuration", format!("0x{:04x}", p.registers[Tmp117::CONFIGURATION])),
+                ("device ID", format!("0x{:04x}", p.registers[Tmp117::DEVICE_ID])),
+            ],
+            I2cPart::At24(p) => vec![("contents", hex(&p.memory)), ("written", format!("{} of 256 bytes", count_written(&p.memory, 0xFF)))],
+            I2cPart::Registers(p) => vec![("registers", hex(&p.registers[..64]))],
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             I2cPart::Tmp117(p) => format!("TMP117 at {:.2} °C", p.celsius()),
@@ -317,6 +339,64 @@ impl SpiPart {
         }
     }
 
+    /// The part's name, as a datasheet has it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SpiPart::Flash(_) => "W25Q80",
+            SpiPart::Rot(_) => "RoT",
+            SpiPart::Ksz8463(_) => "KSZ8463",
+            SpiPart::Fram(_) => "MB85RS64T",
+        }
+    }
+
+    /// What is in it now, for whoever is watching: a name and a value each.
+    pub fn values(&self) -> Vec<(&'static str, String)> {
+        match self {
+            SpiPart::Flash(p) => vec![
+                ("programmed", format!("{} of {} bytes", count_written(&p.memory, 0xFF), p.memory.len())),
+                ("first bytes", hex(&p.memory[..64])),
+                ("write enabled", p.write_enabled.to_string()),
+            ],
+            SpiPart::Fram(p) => vec![("first bytes", hex(&p.memory[..64])), ("as text", text(&p.memory[..64]))],
+            SpiPart::Rot(p) => vec![
+                (
+                    "state",
+                    if p.responding {
+                        "a response waits".to_string()
+                    } else if p.ready_at.is_some() {
+                        "working on a request".to_string()
+                    } else {
+                        "idle".to_string()
+                    },
+                ),
+                ("ROT_IRQ", format!("{} ({})", pin_name(p.irq), if p.responding { "low: asserted" } else { "high" })),
+                ("requests answered", p.stats[0].to_string()),
+                ("last request", p.last.to_string()),
+                ("sprot version", CURRENT_VERSION.to_string()),
+            ],
+            SpiPart::Ksz8463(p) => {
+                let port = |status: usize| if p.registers[status / 2] & 1 << 2 != 0 { "link up" } else { "link down" };
+                let vlans: Vec<String> = p
+                    .vlans
+                    .iter()
+                    .filter(|&&e| e & 1 << 19 != 0)
+                    .map(|&e| {
+                        let ports: Vec<String> = (0..3).filter(|i| e >> (16 + i) & 1 != 0).map(|i| (i + 1).to_string()).collect();
+                        format!("0x{:03x} → ports {}", e & 0xFFF, if ports.is_empty() { "none".into() } else { ports.join(", ") })
+                    })
+                    .collect();
+                vec![
+                    ("switch", if p.enabled() { "started" } else { "stopped" }.to_string()),
+                    ("chip ID", format!("0x{:04x}", p.registers[0] & !1)),
+                    ("port 1", port(0x04E).to_string()),
+                    ("port 2", port(0x05A).to_string()),
+                    ("port 1 VLAN", format!("0x{:03x}", p.port1_vid())),
+                    ("VLANs", if vlans.is_empty() { "none".into() } else { vlans.join("; ") }),
+                ]
+            }
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             SpiPart::Flash(p) => format!("W25Q80 flash, {} KiB", p.memory.len() / 1024),
@@ -344,7 +424,7 @@ pub struct NorFlash {
     command: Option<u8>,
     address: u32,
     frames: usize,
-    write_enabled: bool,
+    pub write_enabled: bool,
     busy_until: u64,
 }
 
@@ -735,6 +815,8 @@ pub struct Rot {
     responding: bool,
     /// When the response being made will be ready.
     ready_at: Option<u64>,
+    /// What the last request asked for.
+    last: &'static str,
     request: Vec<u8>,
     response: Vec<u8>,
     sent: usize,
@@ -755,6 +837,7 @@ impl Rot {
             irq,
             responding: false,
             ready_at: None,
+            last: "none yet",
             request: Vec::new(),
             response: Vec::new(),
             sent: 0,
@@ -805,9 +888,17 @@ impl Rot {
         if self.request.is_empty() || self.ready_at.is_some() {
             return;
         }
+        self.last = Self::kind_of(&self.request);
         self.response = self.answer();
         self.sent = 0;
         self.ready_at = Some(now + Self::LATENCY);
+    }
+
+    /// What a request asks for, by its `ReqBody`'s variant.
+    fn kind_of(request: &[u8]) -> &'static str {
+        const KINDS: [&str; 11] =
+            ["Status", "IoStats", "RotState", "Update", "Sprockets", "Dump", "Caboose", "Attest", "RotPage", "Swd", "State"];
+        request.get(6).and_then(|&tag| KINDS.get(tag as usize)).copied().unwrap_or("not a request")
     }
 
     /// The response to the request clocked in: a `Result<RspBody,
@@ -987,6 +1078,25 @@ pub fn caboose(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
     out
 }
 
+/// Bytes as hex, 16 to a line.
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .chunks(16)
+        .map(|line| line.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Bytes as text, with what is not printable as a dot.
+fn text(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' }).collect()
+}
+
+/// How many bytes are not `blank`.
+fn count_written(bytes: &[u8], blank: u8) -> usize {
+    bytes.iter().filter(|&&b| b != blank).count()
+}
+
 /// CRC-32C, the iSCSI polynomial, TLV-C's.
 fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
@@ -1009,6 +1119,40 @@ fn crc16(bytes: &[u8]) -> u16 {
         }
     }
     crc
+}
+
+/// A part as whoever is watching sees it: its bus, where on it (an address
+/// or a chip-select pin), what it is, the line it drives back if any, and
+/// what is in it.
+#[derive(Clone, Debug)]
+pub struct PartView {
+    pub bus: String,
+    pub at: String,
+    pub kind: &'static str,
+    pub line: Option<String>,
+    pub values: Vec<(&'static str, String)>,
+}
+
+impl PartView {
+    pub fn i2c(controller: usize, part: &I2cPart) -> PartView {
+        PartView {
+            bus: format!("I2C{}", controller + 1),
+            at: format!("0x{:02x}", part.address()),
+            kind: part.kind(),
+            line: None,
+            values: part.values(),
+        }
+    }
+
+    pub fn spi(controller: usize, cs: (usize, u8), part: &SpiPart) -> PartView {
+        PartView {
+            bus: format!("SPI{}", controller + 1),
+            at: pin_name(cs),
+            kind: part.kind(),
+            line: part.line().map(|(pin, _)| pin_name(pin)),
+            values: part.values(),
+        }
+    }
 }
 
 /// A part, and where on the board it is wired.

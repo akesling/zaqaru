@@ -21,6 +21,7 @@
 //! The targets are the parts wired to the bus ([`crate::devices`]).
 
 use crate::devices::I2cPart;
+use crate::trace::I2cEvent;
 
 // CR1.
 const PE: u32 = 1 << 0;
@@ -84,6 +85,8 @@ pub struct I2c {
     /// Picoseconds per cycle of the kernel clock.
     clock: u64,
     pub targets: Vec<I2cPart>,
+    /// What the bus carried, and when, for whoever is watching.
+    pub events: Vec<(u64, I2cEvent)>,
 }
 
 impl Default for I2c {
@@ -103,6 +106,7 @@ impl Default for I2c {
             pending: None,
             clock: crate::clock::Clocks::period(64_000_000),
             targets: Vec::new(),
+            events: Vec::new(),
         }
     }
 }
@@ -148,6 +152,7 @@ impl I2c {
             match step {
                 Step::Address => self.addressed(at),
                 Step::Sent(byte) => {
+                    self.events.push((at, I2cEvent::Byte { byte }));
                     if let Some(n) = self.with {
                         self.targets[n].write(byte);
                     }
@@ -157,11 +162,13 @@ impl I2c {
                 Step::Received => {
                     if let Some(n) = self.with {
                         self.rxdr = self.targets[n].read();
+                        self.events.push((at, I2cEvent::Byte { byte: self.rxdr }));
                         self.left -= 1;
                         self.isr |= RXNE;
                     }
                 }
                 Step::Stop => {
+                    self.events.push((at, I2cEvent::Stop));
                     self.isr |= STOPF;
                     self.busy = false;
                     if let Some(n) = self.with.take() {
@@ -254,6 +261,7 @@ impl I2c {
         let address = (self.cr2 >> 1 & 0x7F) as u8;
         let read = self.cr2 & RD_WRN != 0;
         self.with = self.targets.iter_mut().position(|t| t.address() == address && t.start(read, at));
+        self.events.push((at, I2cEvent::Start { address, read, ack: self.with.is_some() }));
         match self.with {
             None => {
                 // No acknowledge: NACKF, and the STOP that follows one.

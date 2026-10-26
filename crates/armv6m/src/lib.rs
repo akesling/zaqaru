@@ -60,6 +60,7 @@ pub mod stm32h7;
 pub mod thumb2;
 pub mod timer;
 pub mod timing;
+pub mod trace;
 pub mod usart;
 
 use std::collections::BTreeSet;
@@ -733,7 +734,10 @@ impl Machine {
                 Some(switch) => switch.to_cable(frame),
                 None => Some(frame),
             };
-            self.events.extend(frame.map(|frame| Event::Frame { time, frame }));
+            if let Some(frame) = frame {
+                soc.trace.frame(time, false, &frame);
+                self.events.push(Event::Frame { time, frame });
+            }
         }
     }
 
@@ -755,6 +759,7 @@ impl Machine {
     /// descriptor for it. False if the part has no Ethernet.
     pub fn deliver(&mut self, frame: Vec<u8>) -> bool {
         let crate::bus::Soc::H7(soc) = &mut self.bus.soc else { return false };
+        soc.trace.frame(self.time, true, &frame);
         let frame = match soc.switch() {
             Some(switch) => switch.from_cable(frame),
             None => Some(frame),
@@ -770,8 +775,17 @@ impl Machine {
     /// Something outside the chip drives a pin to a level — a button
     /// pressed, say — or lets go of it (`None`). Port 0 is A.
     pub fn drive(&mut self, port: usize, pin: u8, level: Option<bool>) {
-        self.bus.soc.drive(port, pin, level);
+        self.bus.soc.drive(port, pin, level, self.time);
         self.sample_interrupts();
+    }
+
+    /// What crosses the chip's pins and buses: see [`trace`]. Off until
+    /// turned on.
+    pub fn trace(&mut self) -> &mut trace::Trace {
+        match &mut self.bus.soc {
+            crate::bus::Soc::G0(soc) => &mut soc.trace,
+            crate::bus::Soc::H7(soc) => &mut soc.trace,
+        }
     }
 
     /// Wires a part to the board's buses: see [`devices::Wiring`].
@@ -789,6 +803,23 @@ impl Machine {
         match &mut self.bus.soc {
             crate::bus::Soc::H7(soc) => soc.i2cs.iter_mut().flat_map(|i2c| i2c.targets.iter_mut()).collect(),
             _ => Vec::new(),
+        }
+    }
+
+    /// The parts on the board's buses, as whoever is watching sees them.
+    pub fn parts(&self) -> Vec<devices::PartView> {
+        match &self.bus.soc {
+            crate::bus::Soc::H7(soc) => soc.parts(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The GPIO ports, A first: each one's input levels, output data and
+    /// MODER.
+    pub fn ports(&self) -> Vec<(u16, u16, u32)> {
+        match &self.bus.soc {
+            crate::bus::Soc::G0(soc) => soc.ports(),
+            crate::bus::Soc::H7(soc) => soc.ports(),
         }
     }
 
