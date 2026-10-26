@@ -278,6 +278,10 @@ fn upload(name: &str, bytes: &[u8]) -> String {
         return "upload: name the archive\n".into();
     }
     let path = format!("{UPLOADS}/{name}");
+    // Hubris writes its archives with bzip2, which Humility then reads
+    // again for every command; stored, it reads them in half the time.
+    let repacked = crate::zip::has_bzip2(bytes).then(|| crate::zip::repack(bytes, crate::zip::Packing::Stored)).flatten();
+    let bytes = repacked.as_deref().unwrap_or(bytes);
     match std::fs::create_dir_all(UPLOADS).and_then(|()| std::fs::write(&path, bytes)) {
         Ok(()) => format!("uploaded {name}, {} bytes — `flash {name}` puts it on the board\n", bytes.len()),
         Err(e) => format!("upload: {path}: {e}\n"),

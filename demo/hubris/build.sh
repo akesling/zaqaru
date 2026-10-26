@@ -101,6 +101,13 @@ echo "build: zaqaru and zaqaru-m0"
 linux 'cargo build --release --manifest-path "$Z/Cargo.toml" --target-dir "$T" -p zaqaru -p zaqaru-armv6m \
   && cp "$T/release/zaqaru-m0" "$W/bench/zaqaru-m0"'
 
+# Humility reads the whole archive for every command, and Hubris writes it
+# with bzip2, which under zaqaru is half of what a command costs; deflated,
+# it is not, and the archive is hardly larger.
+echo "build: the archives, deflated"
+linux 'for zip in "$W"/bench/archives/*.zip "$W/bench/hubris.zip"; do
+  "$T/release/zaqaru-m0" repack "$zip" "$zip.new" && mv "$zip.new" "$zip"; done'
+
 echo "build: the bench image"
 cp "$here/Dockerfile" "$here/board" "$work/bench/"
 retry docker build -q --platform linux/amd64 -t zaqaru-hubris-bench "$work/bench" >/dev/null

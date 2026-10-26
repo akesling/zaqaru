@@ -33,7 +33,36 @@ pub(crate) fn usage() -> ExitCode {
     eprintln!("usage: zaqaru-m0 <final.bin> [--part stm32g031|stm32g070|stm32h753|…] [--core m0+|m7] [--ms N] [--quiet] [--udp PORT:TEXT] [--ping]");
     eprintln!("       zaqaru-m0 serve <final.bin> [--part NAME] [--gdb ADDR] [--listen ADDR] [--archive ZIP] [--board FILE]");
     eprintln!("       zaqaru-m0 door [--listen ADDR] [--probe ADDR] [--archive ZIP] [--humility PATH]");
+    eprintln!("       zaqaru-m0 repack <in.zip> <out.zip> [--stored]");
     ExitCode::from(2)
+}
+
+/// `zaqaru-m0 repack IN OUT`: a Hubris archive with its entries deflated
+/// (or stored) rather than bzip2'd, which Humility reads in less than half
+/// the time under zaqaru. See `zip::repack`.
+fn repack(args: Vec<String>) -> ExitCode {
+    let (input, output, packing) = match args.as_slice() {
+        [input, output] => (input, output, zip::Packing::Deflated(9)),
+        [input, output, flag] if flag == "--stored" => (input, output, zip::Packing::Stored),
+        _ => return usage(),
+    };
+    let archive = match std::fs::read(input) {
+        Ok(archive) => archive,
+        Err(e) => {
+            eprintln!("zaqaru-m0: {input}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(repacked) = zip::repack(&archive, packing) else {
+        eprintln!("zaqaru-m0: {input}: not an archive this reads");
+        return ExitCode::FAILURE;
+    };
+    if let Err(e) = std::fs::write(output, &repacked) {
+        eprintln!("zaqaru-m0: {output}: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("{input}: {} bytes, {} repacked", archive.len(), repacked.len());
+    ExitCode::SUCCESS
 }
 
 fn main() -> ExitCode {
@@ -43,6 +72,9 @@ fn main() -> ExitCode {
     }
     if args.next_if(|a| a == "door").is_some() {
         return door::main(args.collect());
+    }
+    if args.next_if(|a| a == "repack").is_some() {
+        return repack(args.collect());
     }
     let mut image = None;
     let mut ms: u64 = 2000;
