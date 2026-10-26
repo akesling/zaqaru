@@ -18,6 +18,7 @@
 // the request came in and shows everything.
 
 import { request as requestUsb } from "./usb.js";
+import * as bench from "./bench.js";
 
 const worker = new Worker("./worker.js", { type: "module" });
 const $ = (id) => document.getElementById(id);
@@ -613,7 +614,8 @@ function buildPanels() {
   $("machine").querySelector(".grid").innerHTML = "";
   $("internals").querySelector(".grid").innerHTML = "";
   const readable = Object.entries(meta?.paths ?? {})
-    .filter(([pattern, lens]) => lens.readable && pattern !== "meta" && !pattern.startsWith("meta/"))
+    // The board's trace is the bench's to read, through its probes.
+    .filter(([pattern, lens]) => lens.readable && pattern !== "meta" && !pattern.startsWith("meta/") && !pattern.startsWith("board/"))
     .map(([pattern]) => pattern);
   // A session with the container, when the page was asked for one.
   if (terminalPort) makeTerminalPanel();
@@ -1038,24 +1040,39 @@ const renderers = {
       : "";
     // What the USARTs sent, the tail of it, as a serial console shows it.
     const serial = value.serial ? `<div class="key">serial</div><pre class="serial">${escape(value.serial.slice(-2000))}</pre>` : "";
+    panel.element.classList.add("bench-panel");
     panel.body.innerHTML = `<div class="board">
-      <div class="leds">${lamps}</div>
+      ${value.gpio ? bench.drawBoard(value, new Set(probes)) : `<div class="leds">${lamps}</div>`}
       <div><b>${escape(value.chip)}</b>${value.core ? ` (${escape(value.core)})` : ""} · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated</div>
       ${clock}
-      <div>LED${leds.length > 1 ? "s" : ""} ${lit || "none"} · ${value.faults} faults · probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
+      <div class="probes">${probesHtml(value)}</div>
+      <details class="more"><summary>LEDs, faults, the network, the core's registers</summary>
+      <div>LED${leds.length > 1 ? "s" : ""} ${lit || "none"} · ${value.faults} faults · debug probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
       ${wired}
       ${heard}
       <div class="dim">${escape(value.image)} · ${value.instructions.toLocaleString()} instructions · ${escape(value.mode)} mode, ${value.privileged ? "privileged" : "unprivileged"}</div>
       <div class="dim">${exceptions}</div>
       ${serial}
       <div class="registers">${registers}</div>
+      </details>
     </div>`;
+    const more = panel.body.querySelector("details.more");
+    more.open = moreOpen;
+    more.ontoggle = () => (moreOpen = more.open);
     const transcript = panel.body.querySelector(".serial");
     if (transcript) transcript.scrollTop = transcript.scrollHeight;
     panel.body.onclick = (event) => {
       const button = event.target.closest("[data-clock]");
-      if (button) boardControl(button.dataset.clock);
+      if (button) return boardControl(button.dataset.clock);
+      const target = event.target.closest("[data-probe], [data-part], [data-unprobe], [data-window]");
+      if (!target) return;
+      if (target.dataset.window) probeWindow = Number(target.dataset.window);
+      else toggleProbe(target.dataset.probe ?? target.dataset.part ?? target.dataset.unprobe);
+      renderers.board(value, panel);
     };
+    boardValue = value;
+    boardPanel = panel;
+    followTrace();
   },
 
   processes(value, panel, state) {
@@ -1202,6 +1219,91 @@ function render(state) {
   $("stderr").textContent = state.stderr + (state.log ? "\n" + state.log : "");
   renderEvents();
   applyFocus(state);
+}
+
+// ---- probes on the board -------------------------------------------------------
+//
+// What the board panel's probes are on — pins, buses, the serial line, the
+// cable, parts — and what each has gathered from the board's trace. The
+// trace is read a slice at a time, from the record after the last one
+// read; a probe added reads the latest few thousand first. A board whose
+// trace is behind where the page last read — the view moved back in
+// time — starts again from its latest.
+
+const probes = [];
+const probeRecords = new Map(); // channel -> records, oldest first
+let traceCursor = null;
+let traceBusy = false;
+let probeWindow = 2e9; // ns of simulated time a pin's waveform shows
+let moreOpen = false;
+let boardValue = null;
+let boardPanel = null;
+const RECORDS_KEPT = 5000;
+
+function toggleProbe(name) {
+  const at = probes.indexOf(name);
+  if (at >= 0) probes.splice(at, 1);
+  else probes.unshift(name);
+  probeRecords.clear();
+  traceCursor = null;
+}
+
+function probeChannels() {
+  return [...new Set(probes.map(bench.channelOf).filter(Boolean))];
+}
+
+function probesHtml(value) {
+  if (!probes.length) {
+    return `<div class="dim">Probe something: click a pin, a bus, a part, the Ethernet jack or the serial port on the board above.</div>`;
+  }
+  const windows = [1e6, 1e7, 1e8, 1e9, 1e10]
+    .map((w) => `<button type="button" data-window="${w}"${w === probeWindow ? ' class="on"' : ""}>${bench.fmtSpan(w)}</button>`)
+    .join("");
+  return probes
+    .map((name) => {
+      const kind = bench.probeKind(name);
+      const records = probeRecords.get(bench.channelOf(name) ?? "") ?? [];
+      const label = { pin: "pin", i2c: "I2C bus", spi: "SPI bus", usart: "serial line", eth: "Ethernet cable", part: "part" }[kind];
+      return `<div class="probe"><div class="probe-head"><b>${escape(name)}</b> <span class="dim">${label}</span>
+        ${kind === "pin" ? `<span class="controls">${windows}</span>` : ""}
+        <button type="button" class="unprobe" data-unprobe="${escape(name)}" title="take the probe off">×</button></div>
+        <div class="probe-body">${bench.probeBody(name, records, value, probeWindow)}</div></div>`;
+    })
+    .join("");
+}
+
+/// Reads what the probes' channels have carried since the last read, and
+/// shows it.
+async function followTrace() {
+  const channels = probeChannels();
+  if (!channels.length || traceBusy) return;
+  traceBusy = true;
+  try {
+    const since = traceCursor ?? -2000;
+    const answer = await read(`board/trace/${since}/${channels.join(",")}`);
+    if (answer?.error !== undefined || !answer) return;
+    if (traceCursor !== null && answer.next < traceCursor) {
+      // The view is earlier than the last read: start again from there.
+      probeRecords.clear();
+      traceCursor = null;
+      return;
+    }
+    for (const record of answer.records) {
+      if (!probeRecords.has(record.ch)) probeRecords.set(record.ch, []);
+      const list = probeRecords.get(record.ch);
+      list.push(record);
+      if (list.length > RECORDS_KEPT) list.splice(0, list.length - RECORDS_KEPT);
+    }
+    traceCursor = answer.next;
+    if (answer.records.length && boardPanel && boardValue) {
+      const box = boardPanel.body.querySelector(".probes");
+      if (box) box.innerHTML = probesHtml(boardValue);
+    }
+  } catch {
+    // Nothing to read at this instant: the board is not there yet.
+  } finally {
+    traceBusy = false;
+  }
 }
 
 // ---- focus -------------------------------------------------------------------

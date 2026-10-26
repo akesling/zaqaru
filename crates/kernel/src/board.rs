@@ -1020,15 +1020,28 @@ impl Board {
         )
     }
 
-    /// What has crossed the pins and buses, from record `since` on, on the
-    /// channels asked for (`PB0`, `I2C2`, `SPI3`, `USART1`, `ETH`; all, if
-    /// none), at most [`TRACE_SERVED`] of them, as JSON: the records, the
-    /// number of the next, and the oldest still kept. Times are in
-    /// nanoseconds of simulated time.
-    pub fn trace_json(&self, since: u64, channels: &[&str]) -> String {
+    /// What has crossed the pins and buses, from record `since` on — or,
+    /// with `since` negative, the last that many — on the channels asked
+    /// for (`PB0`, `I2C2`, `SPI3`, `USART1`, `ETH`; all, if none), at most
+    /// [`TRACE_SERVED`] of them, as JSON: the records, the number of the
+    /// next, and the oldest still kept. Times are in nanoseconds of
+    /// simulated time.
+    pub fn trace_json(&self, since: i64, channels: &[&str]) -> String {
         use crate::system::server::quoted;
         use armv6m::trace::{I2cEvent, Signal, SpiEvent};
         let first = self.trace.front().map_or(self.trace_next, |(n, _)| *n);
+        let wanted = |record: &armv6m::trace::Record| {
+            let channel = record.signal.channel();
+            channels.is_empty() || channels.iter().any(|c| c.eq_ignore_ascii_case(&channel))
+        };
+        // The last so many: from where counting back that many that match
+        // stops.
+        let since = if since < 0 {
+            let tail = since.unsigned_abs().min(TRACE_SERVED as u64) as usize;
+            self.trace.iter().rev().filter(|(_, record)| wanted(record)).take(tail).last().map_or(self.trace_next, |(n, _)| *n)
+        } else {
+            since as u64
+        };
         let mut out = Vec::new();
         let mut next = since.max(first);
         for (n, record) in self.trace.iter().skip(since.saturating_sub(first) as usize) {
@@ -1036,10 +1049,10 @@ impl Board {
                 break;
             }
             next = n + 1;
-            let channel = record.signal.channel();
-            if !channels.is_empty() && !channels.iter().any(|c| c.eq_ignore_ascii_case(&channel)) {
+            if !wanted(record) {
                 continue;
             }
+            let channel = record.signal.channel();
             let what = match &record.signal {
                 Signal::Pin { high, .. } => format!(r#""high":{high}"#),
                 Signal::I2c { event, .. } => match event {

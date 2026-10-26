@@ -133,8 +133,8 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 crate::board::Slot::Present(board) => Ok(board.json()),
                 _ => Err(Refusal::NotFound),
             },
-            // What has crossed the board's pins and buses, from a record on,
-            // on the channels asked for.
+            // What has crossed the board's pins and buses, from a record on
+            // (or the last so many, negative), on the channels asked for.
             ["board", "trace", since, channels @ ..] => {
                 let since = since.parse().ok().ok_or(Refusal::NotFound)?;
                 let channels: Vec<&str> =

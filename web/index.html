@@ -99,6 +99,20 @@
   .board .led.red.on { background: #f0483c; box-shadow: 0 0 14px #f0483c, inset 0 0 3px #fff8; }
   .board .led.yellow.on { background: #f2c230; box-shadow: 0 0 14px #f2c230, inset 0 0 3px #fff8; }
   .board .dim { opacity: .65; }
+  /* The bench: the board drawn, and the probes on it, with room for both. */
+  .panel.bench-panel { flex: 1 1 100%; max-height: 70em; }
+  .bench-board { display: block; max-width: 900px; margin: 2px 0 6px; }
+  .bench-board [data-probe]:hover, .bench-board [data-part]:hover { filter: brightness(1.25); }
+  .probes { display: grid; grid-template-columns: repeat(auto-fill, minmax(28em, 1fr)); gap: 8px; margin: 6px 0; }
+  .probe { border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; max-height: 22em; overflow: auto; }
+  .probe-head { display: flex; gap: 6px; align-items: center; position: sticky; top: 0; background: Canvas; padding-bottom: 2px; }
+  .probe-head .unprobe { margin-left: auto; font: inherit; border: none; background: none; color: inherit; cursor: pointer; opacity: .7; }
+  .probe-body .t { opacity: .55; margin-right: 6px; }
+  .probe-body .frames { margin-left: 2em; opacity: .85; word-break: break-all; }
+  .probe-body .wave { display: block; color: inherit; margin: 4px 0; }
+  .probe-body table.values td { vertical-align: top; padding: 1px 6px 1px 0; }
+  .probe-body table.values td.key { opacity: .6; white-space: nowrap; }
+  .board details.more summary { cursor: pointer; opacity: .7; margin: 4px 0; }
   .board .clock { margin: 3px 0; }
   .board .controls { display: inline-flex; flex-wrap: wrap; gap: 4px; margin-left: 6px; vertical-align: middle; }
   .board .controls button { font: inherit; font-size: 0.9em; padding: 1px 7px; border-radius: 4px; border: 1px solid #fff3; background: #fff1; color: inherit; cursor: pointer; }
