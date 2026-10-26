@@ -163,6 +163,11 @@ impl Interface {
         (BASE..END).contains(&addr)
     }
 
+    /// ACR: LATENCY, the AXI wait states, and WRHIGHFREQ.
+    pub fn acr(&self) -> u32 {
+        self.acr
+    }
+
     /// When the next operation running ends.
     pub fn due(&self) -> Option<u64> {
         self.banks.iter().filter(|bank| bank.running).map(|bank| bank.busy_until).min()

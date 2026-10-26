@@ -62,6 +62,7 @@ impl Machine {
     /// pending in ICSR, on ARMv7-M it clears SHCSR's pended bits — so it
     /// has to happen here the same way.
     pub(crate) fn enter(&mut self, n: u32) -> Result<(), Outcome> {
+        self.stall += self.timing.entry;
         let from_handler = self.cpu.mode == Mode::Handler;
         let on_psp = self.cpu.on_psp();
         let extended = self.cpu.fpca;
@@ -213,6 +214,7 @@ impl Machine {
     /// says should be one — the Cortex-M0+ returns through it regardless,
     /// so the model does too.
     pub(crate) fn exception_return(&mut self, exc_return: u32) -> Result<(), Fault> {
+        self.stall += self.timing.exit;
         let (mode, on_psp) = match exc_return & 0xF {
             0b0001 => (Mode::Handler, false),
             0b1001 => (Mode::Thread, false),

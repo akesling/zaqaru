@@ -992,6 +992,8 @@ impl Machine {
                 return Ok(Step::Next);
             }
             let value = if op1 == 0b001 { (x as i32).wrapping_div(y as i32) as u32 } else { x / y };
+            let magnitude = |v: u32| if op1 == 0b001 { (v as i32).unsigned_abs() } else { v };
+            self.stall += crate::timing::divide(magnitude(x), magnitude(y));
             self.put(d, value);
             return Ok(Step::Next);
         }

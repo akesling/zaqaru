@@ -59,6 +59,7 @@ pub mod stm32g0;
 pub mod stm32h7;
 pub mod thumb2;
 pub mod timer;
+pub mod timing;
 pub mod usart;
 
 use std::collections::BTreeSet;
@@ -178,9 +179,13 @@ pub struct Machine {
     pub time: u64,
     /// The core clock's period, in picoseconds.
     pub period: u64,
-    /// Cycles the instruction executing costs beyond its first: its bus
-    /// accesses' wait states, a taken branch's refill, a divide's.
+    /// Half cycles the instruction executing costs beyond its first: its
+    /// bus accesses' wait states, a taken branch's refill, a divide's (see
+    /// [`timing`]); and the half cycle carried from the last.
     pub(crate) stall: u64,
+    half: u64,
+    /// The buses' wait states, as the clocks and the caches have them.
+    pub(crate) timing: timing::Timing,
     pub retired: u64,
     pub events: Vec<Event>,
     /// How many times each exception has been entered.
@@ -257,6 +262,8 @@ impl Machine {
             time: 0,
             period: 1,
             stall: 0,
+            half: 0,
+            timing: timing::Timing::default(),
             retired: 0,
             events: Vec::new(),
             taken: Box::new([0; scs::exception::COUNT]),
@@ -277,6 +284,7 @@ impl Machine {
         };
         machine.period = clock::Clocks::period(machine.bus.soc.clocks().core);
         machine.reset_core()?;
+        machine.retime();
         Ok(machine)
     }
 
@@ -292,7 +300,28 @@ impl Machine {
         self.bus.now = self.time;
         self.bus.reset_soc();
         self.period = clock::Clocks::period(self.bus.soc.clocks().core);
-        self.reset_core()
+        self.reset_core()?;
+        self.retime();
+        Ok(())
+    }
+
+    /// Works the buses' wait states out again: the clocks, the flash's
+    /// latency and the caches may have changed.
+    pub(crate) fn retime(&mut self) {
+        let clocks = self.bus.soc.clocks();
+        let acr = match &self.bus.soc {
+            bus::Soc::G0(soc) => soc.flash_interface.acr(),
+            bus::Soc::H7(soc) => soc.flash_interface.acr(),
+        };
+        self.timing = timing::Timing::new(self.part.family, &clocks, acr, self.bus.scs.ccr);
+    }
+
+    /// Charges an instruction's cycle, or an exception's, and the stalls
+    /// it collected.
+    fn charge_stalls(&mut self, base: u64) {
+        let half = std::mem::take(&mut self.stall) + self.half;
+        self.half = half % 2;
+        self.charge(base + half / 2);
     }
 
     /// The processor's half of a reset.
@@ -377,8 +406,7 @@ impl Machine {
             if let Some((n, p)) = self.bus.scs.nvic.highest_pending().filter(|_| !self.debug.maskints) {
                 if p < self.priority {
                     let entered = self.enter(n);
-                    let stall = std::mem::take(&mut self.stall);
-                    self.charge(stall);
+                    self.charge_stalls(0);
                     if let Err(outcome) = entered {
                         return outcome;
                     }
@@ -422,8 +450,7 @@ impl Machine {
                 }
             }
             self.retired += 1;
-            let stall = std::mem::take(&mut self.stall);
-            self.charge(1 + stall);
+            self.charge_stalls(1);
         }
         Outcome::Budget
     }
@@ -454,8 +481,12 @@ impl Machine {
         }
         self.ticked_at = self.cycles;
         // A store to RCC may have changed the core's clock: from here on a
-        // cycle is the new clock's.
-        self.period = clock::Clocks::period(self.bus.soc.clocks().core);
+        // cycle is the new clock's, and the buses' wait states with it.
+        let period = clock::Clocks::period(self.bus.soc.clocks().core);
+        if period != self.period {
+            self.period = period;
+            self.retime();
+        }
         self.tick_due = self
             .bus
             .scs

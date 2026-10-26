@@ -140,6 +140,7 @@ impl Machine {
             self.sync_systick();
         }
         self.bus.now = self.time;
+        self.stall += self.timing.data(addr, false);
         self.bus.read(addr, size).map_err(|_| Fault::Bus { addr })
     }
 
@@ -153,7 +154,13 @@ impl Machine {
             self.sync_systick();
         }
         self.bus.now = self.time;
+        self.stall += self.timing.data(addr, true);
         self.bus.write(addr, size, value).map_err(|_| Fault::Bus { addr })?;
+        // A store to the flash interface or to CCR may change the wait
+        // states: the flash's latency, the caches.
+        if (0x4002_2000..0x4002_2400).contains(&addr) || (0x5200_2000..0x5200_2400).contains(&addr) || addr == 0xE000_ED14 {
+            self.retime();
+        }
         // The write may have started, stopped or reloaded SysTick or a
         // peripheral's timer.
         if systick || addr >= 0x4000_0000 && addr < 0xE000_0000 {
@@ -172,6 +179,7 @@ impl Machine {
 
     fn fetch(&mut self, addr: u32) -> Result<u32, Fault> {
         self.check(addr, Access::Execute)?;
+        self.stall += self.timing.fetch(addr);
         self.bus.fetch(addr).ok_or(Fault::InstructionBus { addr })
     }
 
@@ -199,6 +207,17 @@ impl Machine {
         let first = self.fetch(pc)?;
         let wide = first >> 11 >= 0b11101;
         let second = if wide { self.fetch(pc.wrapping_add(2))? } else { 0 };
+        let result = self.dispatch(first, second, wide);
+        // A taken branch — anything that left the pc elsewhere than the next
+        // instruction — refills the pipeline.
+        if matches!(result, Ok(Flow::Next)) && self.cpu.pc != pc.wrapping_add(if wide { 4 } else { 2 }) {
+            self.stall += self.timing.branch + if wide { self.timing.bl } else { 0 };
+        }
+        result
+    }
+
+    fn dispatch(&mut self, first: u32, second: u32, wide: bool) -> Result<Flow, Fault> {
+        let pc = self.cpu.pc;
         if self.core == Core::CortexM0Plus {
             return if wide { self.execute32(first, second) } else { self.execute16(first) };
         }
@@ -694,6 +713,8 @@ impl Machine {
             return Ok(Flow::Next);
         }
 
+        // MSR, MRS and the barriers take three cycles.
+        self.stall += 4;
         if first & 0xFFF0 == 0xF380 && second & 0xFF00 == 0x8800 {
             self.msr(first & 0xF, second & 0xFF);
         } else if first == 0xF3EF && second & 0xF000 == 0x8000 {

@@ -479,7 +479,8 @@ mod tests {
         set_word(&mut port, &mut m, DCRSR, 0);
         let r0 = word(&mut port, &mut m, DCRDR);
         assert_eq!(r0, m.cpu.r[0]);
-        assert!(r0 > 400, "r0 counted: {r0}");
+        // An add and a taken branch: three cycles a turn on an M0+.
+        assert_eq!(r0, 1000 / 3, "r0 counted: {r0}");
 
         // Write r0 through DCRDR, step, and the step counts from it.
         let before = m.cpu.pc;

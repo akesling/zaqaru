@@ -95,6 +95,11 @@ impl Interface {
         *self = Interface { optr, ..Interface::default() };
     }
 
+    /// ACR: the wait states, the prefetch and the instruction cache.
+    pub fn acr(&self) -> u32 {
+        self.acr
+    }
+
     pub fn contains(addr: u32) -> bool {
         (BASE..END).contains(&addr)
     }

@@ -105,7 +105,7 @@ but whether a browser lets it be claimed is untested.
 | `temperature 31.5` | what the TMP117 reads from now on |
 | `humility spi -p 1 -w 0x9f,0,0,0 -r -n 4` | the W25Q80's JEDEC ID, `ef 40 14`, through the SPI driver |
 | `humility hiffy -c SpRot.status` | sprot's status call: a request over SPI3, ROT_IRQ, and the RoT's response |
-| `humility hiffy -c Update.prep_image_update` | the update server erases flash bank 2 |
+| `humility hiffy -T 15000 -c Update.prep_image_update` | the update server erases flash bank 2: five seconds of the board's time, as the part's datasheet has it, past hiffy's default timeout |
 | `humility flash -F` | flashes the archive's image onto the board through probe-rs's own flash algorithm, then resets it |
 | `humility flash --verify` | reads the flash back and compares it with the archive |
 | `udp hello` | a datagram to udpecho's port 7, from the host on the board's Ethernet cable, and its echo |
@@ -115,6 +115,9 @@ but whether a browser lets it be claimed is untested.
 | `archives` | the Hubris builds there are to flash |
 | `flash g031` | makes the board the part the archive was built for, erased, and flashes it — `g031`, `g070`, `h753`, or one uploaded |
 | `humility -p VID:PID …` | the same, through a probe connected from the page |
+| `clock` | the board's simulated time, its speed, and the clocks RCC gives out |
+| `speed 0.1`, `speed 10`, `speed max` | run the board's time slower or faster than real time, or as fast as it can with its idle time skipped |
+| `pause`, `advance 10ms`, `advance next`, `resume` | stop the board's time, move it on by a time or to its next event, and let it go; the board panel has buttons for these, and GDB has them as `monitor` commands |
 | `board` | the board itself: running or halted, simulated time, LEDs, faults, exceptions taken, the network |
 | `exit` | end the session |
 
@@ -156,12 +159,22 @@ Outside the page, `zaqaru run web/demo/hubris.wasm -p 8080:80` and
   IPv6 on its link-local address — neighbour discovery, echo, UDP — and is
   driven by the door's `udp` and `ping`. The container's own programs have
   no IPv6 sockets to reach it with.
-- Time: one instruction is one cycle of the clock Hubris configures — 400
-  MHz on the H7, 16 MHz on a G0 — and the board runs at that rate against
-  the container's clock, which an H7 in a browser cannot keep up with: its
-  simulated time runs slower than the wall's, and the kernel gives the
-  difference up rather than racing. Exception entry, a bus access and a
-  byte on a wire cost no cycles.
+- Time: simulated time is kept in picoseconds. Each instruction costs
+  cycles of the core's clock as RCC sets it — the clock tree worked out
+  from its registers, HSI and the PLLs through the prescalers, so Hubris's
+  H7 startup takes the core from 64 to 400 MHz — and those cycles are the
+  instruction's own and its stalls: a load's or store's, a taken branch's
+  refill, a divide's, exception entry and return, and the wait states of
+  the bus an access goes to at its clocks, flash's latency and the SRAMs'
+  hidden once the M7's caches are on. The peripherals take their time at
+  their kernel clocks: a USART byte its frame at its baud, an I2C byte its
+  nine SCL periods, a SPI frame its SCK bits, an Ethernet frame its wire
+  time, a flash word or sector or bank its datasheet's programming or
+  erase time; and the parts on the buses theirs. The board runs at real
+  time against the container's clock by default, or slower or faster, or
+  as fast as it can; an H7 in a browser falls behind real time when it is
+  busy, and the kernel gives the difference up rather than racing. Not
+  modelled: the M7's dual issue and branch prediction, cache misses.
 - Not modelled: caches (they are registers that read back), the H7's
   other DMA engines, QSPI, the hash and crypto blocks, USB, and anything
   analog.

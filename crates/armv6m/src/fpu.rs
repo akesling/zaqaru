@@ -811,7 +811,11 @@ fn data_processing(m: &mut Machine, hw1: u32, hw2: u32) -> bool {
             if op { fmt.neg(product) } else { product }
         }
         0b0011 => env.binary(fmt, if op { Op::Sub } else { Op::Add }, x, y),
-        0b1000 if !op => env.binary(fmt, Op::Div, x, y),
+        // VDIV: 14 cycles single, 29 double.
+        0b1000 if !op => {
+            m.stall += if fmt == Fmt::D { 56 } else { 26 };
+            env.binary(fmt, Op::Div, x, y)
+        }
         // VFNMS, VFNMA.
         0b1001 => env.fused(fmt, fmt.neg(acc), if op { fmt.neg(x) } else { x }, y),
         // VFMA, VFMS.
@@ -861,7 +865,11 @@ fn other(m: &mut Machine, hw1: u32, hw2: u32, fmt: Fmt) -> bool {
                 (0b0000, 0b01) => value,
                 (0b0000, _) => fmt.abs(value),
                 (_, 0b01) => fmt.neg(value),
-                _ => env.sqrt(fmt, value),
+                // VSQRT: as long as a divide.
+                _ => {
+                    m.stall += if fmt == Fmt::D { 56 } else { 26 };
+                    env.sqrt(fmt, value)
+                }
             };
             m.set_fp(fmt, d, result);
         }
