@@ -70,6 +70,9 @@ use armv6m::{Event, Machine, Outcome};
 use crate::ring::End;
 use crate::socket::{Address, Endpoint, State};
 
+/// The most of the board's memory one read of it serves.
+pub const MEMORY_SERVED: u32 = 4096;
+
 /// Where an image asks for a board.
 pub const CONFIGURATION: &[u8] = b"/etc/zaqaru/board";
 
@@ -1017,6 +1020,44 @@ impl Board {
             self.trace_next,
             exceptions.join(","),
             registers.join(","),
+        )
+    }
+
+    /// Up to [`MEMORY_SERVED`] bytes of the board's memory from `address`, as
+    /// a debugger reads them: RAM, flash and the peripherals' registers,
+    /// without a read's side effects. As JSON, hex, two digits a byte and
+    /// `--` for one nothing answers at.
+    pub fn memory_json(&self, address: u32, length: u32) -> String {
+        let length = length.min(MEMORY_SERVED);
+        let mut hex = String::with_capacity(2 * length as usize);
+        for n in 0..length {
+            match self.machine.bus.peek(address.wrapping_add(n), 1) {
+                Ok(byte) => hex.push_str(&format!("{byte:02x}")),
+                Err(_) => hex.push_str("--"),
+            }
+        }
+        format!(r#"{{"address":{address},"length":{length},"hex":"{hex}"}}"#)
+    }
+
+    /// A digest of everything the board's memory holds — each RAM and the
+    /// flash, FNV-1a 64 — with where the board stands, for telling two runs
+    /// of it apart: a replay must arrive at the same digests.
+    pub fn digest_json(&self) -> String {
+        fn fnv(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| (hash ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+        }
+        let bus = &self.machine.bus;
+        let rams: Vec<String> = bus
+            .rams
+            .iter()
+            .map(|ram| format!(r#"{{"base":{},"length":{},"fnv":"{:016x}"}}"#, ram.base, ram.bytes.len(), fnv(&ram.bytes)))
+            .collect();
+        format!(
+            r#"{{"instructions":{},"time_ps":{},"flash":"{:016x}","rams":[{}]}}"#,
+            self.machine.retired,
+            self.machine.time,
+            fnv(&bus.flash),
+            rams.join(",")
         )
     }
 
