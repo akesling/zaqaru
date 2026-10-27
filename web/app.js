@@ -1092,9 +1092,19 @@ const renderers = {
   // A board on the container's bench: its LEDs drawn, and the core's state.
   board(value, panel) {
     const leds = value.leds ?? (value.led_pin ? [{ pin: value.led_pin, color: "green", state: value.led }] : []);
+    // What the core's addresses are — which task, which function or
+    // stack — as the board's archive names them.
+    const NAMED = ["pc", "lr", "sp", "msp", "psp"];
     const registers = Object.entries(value.registers ?? {})
-      .map(([name, held]) => `<div><span class="key">${escape(name)}</span>${escape(held)}</div>`)
+      .map(([name, held]) => {
+        const what = NAMED.includes(name) ? whatis(value, held) : null;
+        return `<div><span class="key">${escape(name)}</span>${escape(held)}${what ? ` <span class="dim">${escape(what.text)}</span>` : ""}</div>`;
+      })
       .join("");
+    const at = value.registers?.pc ? whatis(value, value.registers.pc) : null;
+    const where = at?.owner
+      ? `in <b>${escape(at.owner === "kernel" ? "the kernel" : at.owner)}</b>${at.symbol ? ` · ${escape(at.symbol.name)}${at.symbol.offset ? ` + 0x${at.symbol.offset.toString(16)}` : ""}` : ""}${at.owner !== "kernel" && at.task !== null ? ` <span class="dim">task ${at.task}</span>` : ""}`
+      : "";
     const exceptions = Object.entries(value.exceptions ?? {})
       .map(([name, count]) => `${escape(name)} ${count.toLocaleString()}`)
       .join(" · ");
@@ -1127,7 +1137,7 @@ const renderers = {
     // A skeleton made once, and each part of it replaced only when what it
     // shows changes: the board isn't redrawn under the pointer on every read.
     if (!panel.body.querySelector(".board > .drawing")) {
-      panel.body.innerHTML = `<div class="board"><div class="instant"></div><div class="drawing"></div><div class="status"></div><div class="clock"><span class="clock-text"></span> <span class="clock-controls"></span></div><div class="dim clock-tree"></div>
+      panel.body.innerHTML = `<div class="board"><div class="instant"></div><div class="drawing"></div><div class="status"></div><div class="where"></div><div class="clock"><span class="clock-text"></span> <span class="clock-controls"></span></div><div class="dim clock-tree"></div>
         <div class="probes"></div>
         <details class="more"><summary>LEDs, faults, the network, the core's registers</summary><div class="more-body"></div></details></div>`;
       const more = panel.body.querySelector("details.more");
@@ -1140,6 +1150,7 @@ const renderers = {
       return element;
     };
     fill(".drawing", value.gpio ? bench.drawBoard(value, new Set(probes)) : `<div class="leds">${lamps}</div>`);
+    fill(".where", where);
     fill(".status", `<b>${escape(value.chip)}</b>${value.core ? ` (${escape(value.core)})` : ""} · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated`);
     // The clock's figures change on every read; its buttons only when the
     // speed or the pause does, so a press on one isn't lost to a redraw.
@@ -1398,6 +1409,24 @@ function morph(into, from) {
     morph(old, node);
   });
   for (const old of had.slice(wanted.length)) old.remove();
+}
+
+/// What an address of the board's is (`board/whatis`), kept by image and
+/// address — an image's archive does not change under it — and asked for
+/// the first time it is wanted, the board redrawn when it is known.
+const whatisKept = new Map();
+function whatis(value, address) {
+  const key = `${value.image} ${address}`;
+  if (whatisKept.has(key)) return whatisKept.get(key);
+  whatisKept.set(key, null);
+  read(`board/whatis/${address}`)
+    .then((answer) => {
+      if (!answer?.text) return;
+      whatisKept.set(key, answer);
+      if (boardPanel && boardValue) renderers.board(boardValue, boardPanel);
+    })
+    .catch(() => {});
+  return null;
 }
 
 /// The probes' cards, one for each probe, kept from read to read: a card's

@@ -90,6 +90,25 @@ at that instant of its own (`zaqaru_stop_at_board`). `replay.mjs` checks
 that a board stood at an instant is the board the live run had there,
 to the last byte of its memory.
 
+## What the memory is
+
+The board knows its Hubris archive (`archive` in its configuration, and
+whatever `flash` puts on it), and reads it the first time anyone asks what
+its memory is — each task's ELF, linked at that task's addresses, for its
+sections and symbols; `app.toml` for the task table's order and each
+task's stack, which Hubris's build puts at the bottom of the task's RAM —
+and names the chip's memories and peripherals by the reference manual's
+map. Below the drawn board, the page says where the core is — `in idle ·
+main + 0x6`, or, stood at an I2C transaction's start, `in the kernel ·
+DefaultHandler`, taking the interrupt — and the core's pc, lr and stack
+pointers are named the same way in the panel's details.
+
+| path | answers |
+|------|---------|
+| `board/whatis/{address}` | `i2c_driver stack (AXI SRAM + 0xd100)`, `kernel .text: syscall_exit + 0x10`, `I2C2 + 0x24`: the block, the owner and part, the symbol and how far in |
+| `board/tasks` | the kernel and each task, in the task table's order: sections, stack, how many symbols |
+| `board/memory/{address}/{length}` | up to 4 KiB of RAM, flash or registers, as a debugger reads them |
+
 `build.sh` builds Hubris's `app/demo-stm32h7-nucleo/app-h753.toml`, and
 the G031 and G070 demos to flash in its place, on this host. It builds
 Humility (pinned, as released, with its default features),
