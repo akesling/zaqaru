@@ -19,6 +19,7 @@
 
 import { request as requestUsb } from "./usb.js";
 import * as bench from "./bench.js";
+import { MemoryView } from "./memory.js";
 
 const worker = new Worker("./worker.js", { type: "module" });
 const $ = (id) => document.getElementById(id);
@@ -759,6 +760,7 @@ function buildPanels() {
   // A session with the container, when the page was asked for one.
   if (terminalPort) makeTerminalPanel();
   for (const pattern of OPEN) if (readable.includes(pattern)) makePanel(pattern, pattern, $("panels"));
+  if (readable.includes("board")) makeMemoryPanel();
   // The host's side of the boundary, which is not a path of the
   // container's store but is what the page is to it: its edge, its console.
   makeEdgePanel();
@@ -768,6 +770,27 @@ function buildPanels() {
   for (const pattern of rest) makePanel(pattern, pattern, $("internals").querySelector(".grid"));
   // The path bar's suggestions: every pattern.
   $("paths").innerHTML = readable.map((pattern) => `<option value="${escape(pattern)}">`).join("");
+}
+
+// The board's memory, drawn: see `memory.js`. It reads the board's store
+// as the board panel is drawn, at the same instant.
+let memoryView = null;
+function makeMemoryPanel() {
+  const element = document.createElement("section");
+  element.className = "panel memory-panel";
+  element.id = "memory";
+  element.innerHTML = `<h2><span class="path">board memory</span> — whose it is, what is written as it runs, and by what</h2><div class="body"></div>`;
+  const board = panels.get("board")?.element;
+  if (board) board.after(element);
+  else $("panels").appendChild(element);
+  equipPanel(element);
+  memoryView = new MemoryView(element.querySelector(".body"), {
+    read,
+    stand: (ps) => seekBoard(ps),
+    escape,
+    colorOf: bench.taskColor,
+    update,
+  });
 }
 
 function makeEdgePanel() {
@@ -1340,6 +1363,7 @@ const renderers = {
     boardPanel = panel;
     if (boardTime === null && value.time_ps !== undefined) liveBoardTime = value.time_ps;
     markExample();
+    memoryView?.update(value, boardTime);
     equipTimeline(panel);
     drawTimeline();
     followTimeline();

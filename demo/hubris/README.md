@@ -169,6 +169,28 @@ pointers are named the same way in the panel's details.
 | `board/whatis/{address}` | `i2c_driver stack (AXI SRAM + 0xd100)`, `kernel .text: syscall_exit + 0x10`, `I2C2 + 0x24`: the block, the owner and part, the symbol and how far in |
 | `board/tasks` | the kernel and each task, in the task table's order: sections, stack, how many symbols |
 | `board/memory/{address}/{length}` | up to 4 KiB of RAM, flash or registers, as a debugger reads them |
+| `board/symbols/{owner}` | the statics in the kernel's or a task's RAM, by name |
+| `board/writes/{since}/{cell}` | the cells of the RAMs written since a stamp, and when each last was |
+| `board/written/{address}/{length}` | when each word was last written, and the code — or the probe, DMA, an exception's frame — that wrote it |
+
+The board panel's neighbour, **board memory**, draws it. Each RAM is a
+picture of 64-byte cells laid along a Hilbert curve, so the power-of-two
+region Hubris gives each task for the MPU is a block of its own, coloured
+as the timeline colours the task; each cell lights up when it is written
+and fades as the board's time goes on (halving every 10 ms to 10 s, as
+chosen). The emulator keeps, for every word of RAM, when it was last
+written and by what, all the time, so none of this re-executes anything.
+Under the pictures, each task with how lately it wrote and how deep its
+stack has been — the lowest word no longer holding the `0xbaddcafe` the
+kernel paints it with, as `humility stackmargin` finds it. Click a task,
+or a place in a picture, and its statics are listed, each byte lit the
+same way, with how long ago it was written and by which function; that
+time stands the board just after the write. **mark** an instant, run
+something, and the inspector can show only what was written since: mark,
+then `humility i2c -c 2 -p F -d 0x48 -r 0 -n 2`, and hiffy's list is
+`HIFFY_TEXT` written by the probe — Humility's program — then
+`HIFFY_KICK`, `HIFFY_SCRATCH` holding `0c 80` (25 °C) and `HIFFY_RSTACK`
+written by hiffy, and in i2c_driver its ring buffer of the transfer.
 
 `build.sh` builds Hubris's `app/demo-stm32h7-nucleo/app-h753.toml`, and
 the G031 and G070 demos to flash in its place, on this host. It builds

@@ -85,6 +85,7 @@
   body.opening.bench #terminal { flex: 1 1 34em; }
   body.opening.bench #panels > .panel[data-pattern="board"] { flex: 1 1 34em; max-height: none; }
   body.opening.bench #panels > .panel[data-pattern="usb"] { flex: 1 1 100%; }
+  body.opening.bench #panels > #memory { display: block; flex: 1 1 100%; }
   body.opening.bench #panels > #terminal:not(#edge), body.opening.bench #panels > .panel[data-pattern="board"]:not(#edge), body.opening.bench #panels > .panel[data-pattern="usb"]:not(#edge) { display: block; }
   .panel.terminal { max-height: none; }
   #term-out { min-height: 18em; max-height: 60vh; overflow: auto; }
@@ -133,6 +134,41 @@
   .board .controls button { font: inherit; font-size: 0.9em; padding: 1px 7px; border-radius: 4px; border: 1px solid #fff3; background: #fff1; color: inherit; cursor: pointer; }
   .board .controls button.on { background: #44d45733; border-color: #44d457aa; }
   .board .controls button:hover { background: #fff2; }
+  /* The board's memory: each RAM a picture, whose cells are lit by writes. */
+  .panel.memory-panel { flex: 1 1 100%; max-height: 80em; }
+  .memory-panel .controls { display: inline-flex; flex-wrap: wrap; gap: 4px; vertical-align: middle; }
+  .memory-panel .controls button { font: inherit; font-size: 0.9em; padding: 1px 7px; border-radius: 4px; border: 1px solid #fff3; background: #fff1; color: inherit; cursor: pointer; }
+  .memory-panel .controls button.on { background: #44d45733; border-color: #44d457aa; }
+  .memory-panel .dim { opacity: .65; }
+  .mem-head { margin: 2px 0 6px; }
+  .mem-maps { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end; }
+  .mem-ram { margin: 0; }
+  .mem-ram figcaption { font-size: 11px; margin-bottom: 2px; }
+  .mem-ram canvas { display: block; max-width: 100%; image-rendering: pixelated; cursor: crosshair; border-radius: 2px; }
+  .mem-readout { min-height: 1.4em; margin: 4px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mem-label { margin: 4px 0 3px; }
+  .mem-owner-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(24em, 1fr)); gap: 1px 12px; }
+  .mem-owner { display: flex; align-items: center; gap: 6px; padding: 1px 4px; border-radius: 3px; cursor: pointer; white-space: nowrap; overflow: hidden; }
+  .mem-owner:hover { background: var(--line); }
+  .mem-owner.on { outline: 1px solid var(--accent); }
+  .mem-owner .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+  .mem-owner .glow { width: 8px; height: 8px; border-radius: 50%; flex: none; border: 1px solid #8886; }
+  .mem-gauge { display: inline-block; width: 7em; height: 7px; border-radius: 3px; background: #8883; overflow: hidden; flex: none; margin-left: auto; }
+  .mem-gauge > span { display: block; height: 100%; }
+  .mem-gauge.tight { outline: 1px solid #f85149; }
+  .mem-inspector { margin-top: 8px; }
+  .mem-inspector-head { position: sticky; top: 1.4em; background: Canvas; padding: 2px 0; z-index: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mem-static { padding: 2px 4px; border-left: 2px solid transparent; }
+  .mem-static.near { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .mem-static.since .name { text-decoration: underline 1px rgb(80 220 255); }
+  .mem-static-head { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mem-static-head .name { font-weight: 600; }
+  .mem-static .t[data-stand] { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+  .mem-static .t[data-stand]:hover { color: var(--accent); }
+  .mem-bytes { padding-left: 1.5em; line-height: 1.5; }
+  .mem-bytes .b { padding: 0 1px; margin-right: 2px; border-radius: 2px; }
+  .mem-bytes .b.cold { opacity: .5; }
+  .mem-bytes .addr { opacity: .4; margin-left: -1.5em; display: inline-block; width: 3.6em; }
   .usb .usbbar { margin-bottom: 6px; }
   .usb .dim { opacity: .65; }
   .usb .device { margin-top: 6px; }
