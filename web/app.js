@@ -325,7 +325,7 @@ worker.onmessage = (event) => {
     takeHubris(message.hubris);
     $("slider").max = frontier;
     status(`${message.listening.length ? `listening on ${message.listening.join(", ")}` : ""}${message.idle && finished === null ? " · idle" : ""}`);
-    rebuildEvents();
+    extendEvents();
     renderEvents(true);
     drawLanes();
     // Whether the panels were following the frontier, before a finish stops the play.
@@ -452,48 +452,85 @@ function emptyPoll(e) {
   return e.op === "read" && e.text === null && e.bytes === 0 && !e.error;
 }
 
+// The events list is kept as the run grows rather than rebuilt: each report
+// adds the rows it brings, in order. Two things make that more than an
+// append. An exchange is placed at the instant of the syscall it was made
+// during, which is known only once that syscall returns; until then it is
+// drawn at the frontier, and taken back and placed again at the next report.
+// And repeats of one exchange within one syscall fold into one row, so the
+// folding goes on from where the last report left it. Should a row ever
+// arrive before the last one kept, the list is built again from the start.
+let built = null;
+
 function rebuildEvents() {
-  const filter = $("filter").value;
-  const raw = filter === "raw";
+  built = { filter: $("filter").value, timeline: 0, exchanges: 0, hubris: 0, stamp: -1, groups: new Map() };
   events = [];
-  // An exchange made during a syscall comes before the syscall's own row:
-  // the row is what the call returned, written as it returned.
-  // The board's Hubris tasks' system calls, faults, resets and halts, at
-  // the container instant the board was moved on at — after that
-  // instant's own rows, since the board ran once the processes had.
+  extendEvents();
+}
+
+function extendEvents() {
+  const filter = $("filter").value;
+  if (!built || built.filter !== filter) return rebuildEvents();
+  const raw = filter === "raw";
+  // What was drawn at the frontier for want of its syscall's instant.
+  while (events.length && events.at(-1).provisional) events.pop();
+  if (events.some((e) => e.provisional)) return rebuildEvents();
+  const fresh = [];
   if (filter === "all" || filter === "raw" || filter === "hubris") {
-    for (let i = 0; i < hubris.length; i++) events.push({ at: hubris[i].at, kind: "hubris", index: i, order: 2, count: 1 });
+    for (let i = built.hubris; i < hubris.length; i++) fresh.push({ at: hubris[i].at, kind: "hubris", index: i, order: 2, count: 1 });
   }
-  if (filter === "hubris") {
-    events.sort((a, b) => a.at - b.at || a.index - b.index);
-    return;
+  built.hubris = hubris.length;
+  if (filter !== "hubris" && filter !== "exchange") {
+    for (let i = built.timeline; i < timeline.length; i++) fresh.push({ at: timeline[i].at, kind: "syscall", index: i, order: 1, count: 1 });
   }
-  if (filter !== "exchange") for (let i = 0; i < timeline.length; i++) events.push({ at: timeline[i].at, kind: "syscall", index: i, order: 1, count: 1 });
-  if (filter !== "syscall") {
+  built.timeline = timeline.length;
+  if (filter !== "hubris" && filter !== "syscall") {
     // Folded: repeats of one path at one stamp — an idle container reads
     // the clock at every wake — become one row saying how many; polls that
     // found nothing are left out. "Everything" shows each as it was.
-    let stamp = -1;
-    let groups = new Map(); // op|path -> the row folding it, within one stamp
-    for (let i = 0; i < exchanges.length; i++) {
+    const pending = [];
+    let i = built.exchanges;
+    for (; i < exchanges.length; i++) {
       const e = exchanges[i];
+      const settled = e.syscall < timeline.length;
+      if (!settled) break;
       if (!raw && emptyPoll(e)) continue;
-      if (e.syscall !== stamp) {
-        stamp = e.syscall;
-        groups = new Map();
+      if (e.syscall !== built.stamp) {
+        built.stamp = e.syscall;
+        built.groups = new Map();
       }
       const key = `${e.op}|${e.path}`;
-      const folded = !raw && !e.error ? groups.get(key) : undefined;
+      const folded = !raw && !e.error ? built.groups.get(key) : undefined;
       if (folded) {
         folded.count++;
         continue;
       }
-      const row = { at: timeline[e.syscall]?.at ?? frontier, kind: "exchange", index: i, order: 0, count: 1 };
-      events.push(row);
-      if (!raw && !e.error) groups.set(key, row);
+      const row = { at: timeline[e.syscall].at, kind: "exchange", index: i, order: 0, count: 1 };
+      fresh.push(row);
+      if (!raw && !e.error) built.groups.set(key, row);
     }
+    built.exchanges = i;
+    // The rest wait on their syscall: drawn at the frontier for now.
+    for (; i < exchanges.length; i++) {
+      if (!raw && emptyPoll(exchanges[i])) continue;
+      pending.push({ at: frontier, kind: "exchange", index: i, order: 0, count: 1, provisional: true });
+    }
+    fresh.sort(byInstant);
+    if (fresh.length && events.length && byInstant(fresh[0], events.at(-1)) < 0) {
+      events.push(...fresh, ...pending);
+      events.sort(byInstant);
+      return;
+    }
+    events.push(...fresh, ...pending);
+    return;
   }
-  events.sort((a, b) => a.at - b.at || a.order - b.order || a.index - b.index);
+  fresh.sort(byInstant);
+  if (fresh.length && events.length && byInstant(fresh[0], events.at(-1)) < 0) return rebuildEvents();
+  events.push(...fresh);
+}
+
+function byInstant(a, b) {
+  return a.at - b.at || a.order - b.order || a.index - b.index;
 }
 
 /// The index of the last event at or before `current`.
