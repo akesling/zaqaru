@@ -420,6 +420,7 @@ impl Machine {
     /// A store as the AHB-AP makes it. False is a bus error.
     pub fn debug_store(&mut self, addr: u32, size: u32, value: u32) -> bool {
         self.bus.now = self.time;
+        self.bus.writer = crate::bus::BY_PROBE;
         if answers(self.core, addr) {
             let shift = 8 * (addr & 3);
             let mask = if size == 4 { u32::MAX } else { ((1 << (8 * size)) - 1) << shift };

@@ -92,6 +92,8 @@ impl Machine {
 
         let privileged = self.cpu.privileged();
         let mut stacked = None;
+        self.bus.now = self.time;
+        self.bus.writer = crate::bus::BY_EXCEPTION;
         for (i, &word) in values.iter().enumerate() {
             let addr = frame.wrapping_add(4 * i as u32);
             if !self.permits(addr, Access::Write, privileged) {

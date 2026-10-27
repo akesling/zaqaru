@@ -670,6 +670,7 @@ impl Machine {
     /// was refused.
     pub fn debug_write(&mut self, addr: u32, bytes: &[u8]) -> bool {
         self.bus.now = self.time;
+        self.bus.writer = bus::BY_PROBE;
         let mut at = 0;
         while at < bytes.len() {
             let a = addr.wrapping_add(at as u32);

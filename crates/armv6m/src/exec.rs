@@ -213,6 +213,7 @@ impl Machine {
         self.bus.now = self.time;
         self.stall += self.timing.data(addr, true);
         self.stores += 1;
+        self.bus.writer = self.cpu.pc;
         self.bus.write(addr, size, value).map_err(|_| Fault::Bus { addr })?;
         if self.provenance.is_some() {
             let source = self.store_source(value, size);
