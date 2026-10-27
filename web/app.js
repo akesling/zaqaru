@@ -90,9 +90,12 @@ function follow() {
 /// moves along, doesn't name such an instant: an idle container retires
 /// none while the board runs on.
 let boardTime = null;
+// The board's time where the live run has got to: an instant past it is
+// not in the recording to stand at.
+let liveBoardTime = Infinity;
 function seekBoard(time) {
   stop();
-  boardTime = Math.max(0, Math.round(time));
+  boardTime = Math.max(0, Math.min(Math.round(time), liveBoardTime));
   if (busy) {
     queued = { board: boardTime };
     return;
@@ -1200,6 +1203,7 @@ const renderers = {
     };
     boardValue = value;
     boardPanel = panel;
+    if (boardTime === null && value.time_ps !== undefined) liveBoardTime = value.time_ps;
     markExample();
     followTrace();
   },
