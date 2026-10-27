@@ -449,7 +449,7 @@ export function syscallLine({ r11, r4, r5 }, taskName = (n) => `task ${n}`) {
 export const LAYERS = {
   tasks: ["TASK"],
   syscalls: ["SYS"],
-  interrupts: ["EXC"],
+  interrupts: ["EXC", "FAULT"],
   devices: ["I2C1", "I2C2", "I2C3", "I2C4", "SPI1", "SPI2", "SPI3", "SPI4", "SPI5", "SPI6", "USART1", "USART2", "USART3", "ETH"],
 };
 
@@ -484,7 +484,8 @@ export function timelineLanes(records, layers, from, to, taskName = (n) => `task
     lanes.push({ name: "syscalls", spans: [], marks });
   }
   if (layers.interrupts) {
-    const marks = within(records.get("EXC")).map((r) => ({
+    const taken = [...within(records.get("EXC")), ...within(records.get("FAULT"))].sort((a, b) => a.t - b.t);
+    const marks = taken.map((r) => ({
       t: r.t,
       text: r.name,
       kind: FAULTS.has(r.exc) ? "fault" : r.exc === 15 ? "tick" : "irq",

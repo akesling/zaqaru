@@ -67,6 +67,7 @@ let timelineSeen = 0; // bytes of the timeline sink already reported
 let traceSeen = 0;
 let observed = null; // the mount table's exchange log
 let observedSeen = 0; // entries of it already reported
+let hubrisSeen = 0; // the board's trace records already reported (`board/trace` numbering)
 let meta = null; // the store's meta lens: { paths: { pattern: { readable, writable } } }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -88,6 +89,27 @@ function parseTimeline(textSoFar) {
     });
 }
 
+/// The board's OS-level records since last asked — its Hubris tasks'
+/// system calls, which task ran, faults, resets and halts — each stamped
+/// with the container's instant it was collected at (`at`), for the
+/// overall timeline. Empty with no board.
+const HUBRIS_CHANNELS = "SYS,TASK,FAULT,BOARD";
+function hubrisGrowth(container) {
+  const out = [];
+  try {
+    for (let reads = 0; reads < 20; reads++) {
+      const answer = container.value(`board/trace/${hubrisSeen}/${HUBRIS_CHANNELS}`);
+      out.push(...answer.records);
+      const moved = answer.next !== hubrisSeen;
+      hubrisSeen = answer.next;
+      if (!moved || answer.records.length < 5000) break;
+    }
+  } catch {
+    // No board, or none yet.
+  }
+  return out;
+}
+
 /// What the container has logged since last asked: new timeline entries,
 /// trace lines, and exchanges across the boundary.
 function growth(container) {
@@ -99,7 +121,7 @@ function growth(container) {
   traceSeen = traceText.length;
   const exchanges = observed ? observed.slice(observedSeen) : [];
   observedSeen = observed ? observed.length : 0;
-  return { timeline, trace, exchanges };
+  return { timeline, trace, exchanges, hubris: hubrisGrowth(container) };
 }
 
 function console_(container, stream) {
@@ -128,6 +150,7 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
   timelineSeen = 0;
   traceSeen = 0;
   observedSeen = 0;
+  hubrisSeen = 0;
   finished = null;
   origin = 0;
   if (tapeBytes) {
@@ -284,7 +307,7 @@ function slice(by) {
 
 /// What the page is told as the frontier moves.
 function progress(extra = {}) {
-  const { timeline, trace, exchanges } = growth(live);
+  const { timeline, trace, exchanges, hubris } = growth(live);
   const last = checkpoints.entries.at(-1);
   postMessage({
     type: "progress",
@@ -293,6 +316,7 @@ function progress(extra = {}) {
     timeline,
     trace,
     exchanges,
+    hubris,
     stdout: console_(live, "stdout"),
     listening: edge ? [...edge.listening] : [],
     checkpoints: checkpoints.length,

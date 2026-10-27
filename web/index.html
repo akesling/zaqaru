@@ -16,7 +16,7 @@
   #ckstat { opacity: .7; }
   #track { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 10em; }
   #slider { width: 100%; margin: 0; }
-  #lanes { width: 100%; height: 12px; display: block; }
+  #lanes { width: 100%; height: 20px; display: block; }
   #at { min-width: 16em; text-align: right; }
   #pinned { opacity: .8; }
   #pinned:empty { display: none; }
@@ -196,7 +196,7 @@
   <button id="play">play</button>
   <button id="forward" title="one instruction forward">+1</button>
   <button id="next" title="next event">⇥</button>
-  <span id="track"><input id="slider" type="range" min="0" max="0" value="0"><canvas id="lanes" title="which process ran when; the band underneath marks a request from sent to answered"></canvas></span>
+  <span id="track"><input id="slider" type="range" min="0" max="0" value="0"><canvas id="lanes" title="which process ran when; the band underneath marks a request from sent to answered; under it, the board's Hubris tasks' system calls, and faults, resets and halts in red"></canvas></span>
   <span id="at">0</span>
   <span id="took" style="opacity:.6;min-width:12em"></span>
   <label>step <select id="speed"><option value="10000">10k</option><option value="100000" selected>100k</option><option value="1000000">1M</option><option value="10000000">10M</option></select></label>
@@ -207,7 +207,7 @@
 <main>
   <section id="events-panel">
     <h2>timeline
-      <select id="filter" title="the idle polls that found nothing are left out, and repeats of one exchange within a syscall are folded, unless 'everything' is chosen"><option value="all">syscalls and exchanges</option><option value="syscall">syscalls</option><option value="exchange">exchanges with the host</option><option value="raw">everything, unfolded</option></select>
+      <select id="filter" title="the idle polls that found nothing are left out, and repeats of one exchange within a syscall are folded, unless 'everything' is chosen"><option value="all">syscalls, exchanges and Hubris's</option><option value="syscall">syscalls</option><option value="exchange">exchanges with the host</option><option value="hubris">the board's Hubris tasks</option><option value="raw">everything, unfolded</option></select>
     </h2>
     <div id="events"></div>
   </section>

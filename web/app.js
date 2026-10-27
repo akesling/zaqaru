@@ -34,6 +34,19 @@ let finished = null;
 let timeline = []; // { at, pid, tid, name } per syscall
 let trace = []; // the strace line for each
 let exchanges = []; // { op, path, syscall, bytes, text, error } per host exchange
+// The board's OS-level records, as the worker reports them from the live
+// run: each Hubris system call, fault, reset and halt, and which task ran
+// — `{ n, t, at, ch, ... }`, `t` in the board's nanoseconds, `at` the
+// container's instant the board was moved on at — each call and fault
+// with the task that made it.
+let hubris = [];
+let hubrisTask = null;
+function takeHubris(records) {
+  for (const record of records ?? []) {
+    if (record.ch === "TASK") hubrisTask = record.task;
+    else hubris.push({ ...record, task: hubrisTask });
+  }
+}
 let events = []; // the two merged, as the timeline shows them
 let spans = []; // { sent, answered } per request answered through the edge
 let playing = null;
@@ -234,6 +247,20 @@ function drawLanes() {
   }
   g.fillStyle = "#58a6ff";
   for (const s of spans) g.fillRect(x(s.sent), 9, Math.max(2, x(s.answered) - x(s.sent)), 3);
+  // The board's Hubris tasks: each system call at the instant the board was
+  // moved on at, in its kind's colour; faults, resets and halts taller.
+  if (hubris.length) {
+    for (const record of hubris) {
+      const at = x(record.at);
+      if (record.ch === "SYS") {
+        g.fillStyle = KIND_COLORS[bench.syscallLine(record).kind] ?? "#888";
+        g.fillRect(at, 14, 1.5, 5);
+      } else {
+        g.fillStyle = KIND_COLORS.fault;
+        g.fillRect(at, 13, 2, 7);
+      }
+    }
+  }
 }
 
 worker.onmessage = (event) => {
@@ -253,6 +280,8 @@ worker.onmessage = (event) => {
     timeline = message.timeline;
     trace = message.trace;
     exchanges = message.exchanges;
+    hubris = [];
+    hubrisTask = null;
     meta = message.meta;
     interface_ = message.interface;
     spans = [];
@@ -293,6 +322,7 @@ worker.onmessage = (event) => {
     timeline.push(...message.timeline);
     trace.push(...message.trace);
     exchanges.push(...message.exchanges);
+    takeHubris(message.hubris);
     $("slider").max = frontier;
     status(`${message.listening.length ? `listening on ${message.listening.join(", ")}` : ""}${message.idle && finished === null ? " · idle" : ""}`);
     rebuildEvents();
@@ -428,6 +458,16 @@ function rebuildEvents() {
   events = [];
   // An exchange made during a syscall comes before the syscall's own row:
   // the row is what the call returned, written as it returned.
+  // The board's Hubris tasks' system calls, faults, resets and halts, at
+  // the container instant the board was moved on at — after that
+  // instant's own rows, since the board ran once the processes had.
+  if (filter === "all" || filter === "raw" || filter === "hubris") {
+    for (let i = 0; i < hubris.length; i++) events.push({ at: hubris[i].at, kind: "hubris", index: i, order: 2, count: 1 });
+  }
+  if (filter === "hubris") {
+    events.sort((a, b) => a.at - b.at || a.index - b.index);
+    return;
+  }
   if (filter !== "exchange") for (let i = 0; i < timeline.length; i++) events.push({ at: timeline[i].at, kind: "syscall", index: i, order: 1, count: 1 });
   if (filter !== "syscall") {
     // Folded: repeats of one path at one stamp — an idle container reads
@@ -521,8 +561,23 @@ function focusOf(event) {
   return null;
 }
 
+/// A Hubris record's task and what it was: `i2c_driver`, `send → sys op 3`.
+function hubrisLine(record) {
+  const names = boardValue ? taskNames(boardValue) : [];
+  const name = (n) => names[n] ?? `task ${n}`;
+  const who = record.task === null || record.task === undefined ? "?" : name(record.task);
+  if (record.ch === "SYS") return { who, text: bench.syscallLine(record, name).text };
+  if (record.ch === "FAULT") return { who, text: `fault: ${record.name}` };
+  return { who: "board", text: record.what };
+}
+
 function rowHtml(event) {
   const at = `<span class="at">${event.at.toLocaleString().padStart(14)}</span>`;
+  if (event.kind === "hubris") {
+    const record = hubris[event.index];
+    const { who, text } = hubrisLine(record);
+    return `${at}  <span class="who" style="color:${bench.taskColor(record.task)}">${escape(who)}</span> ${escape(text)} <span class="dim">· board ${bench.fmtTime(record.t)}</span>`;
+  }
   if (event.kind === "syscall") {
     const t = timeline[event.index];
     const line = (trace[event.index] ?? t.name).replace(/^\[\d+\] /, "");
@@ -552,11 +607,12 @@ function renderEvents(force = false) {
     for (let index = from; index < to; index++) {
       const event = events[index];
       const row = document.createElement("div");
-      row.className = `event ${event.kind}${event.kind === "exchange" && exchanges[event.index].error ? " error" : ""}`;
+      row.className = `event ${event.kind}${(event.kind === "exchange" && exchanges[event.index].error) || (event.kind === "hubris" && hubris[event.index].ch !== "SYS") ? " error" : ""}`;
       row.dataset.at = event.at;
       row.dataset.index = index;
-      const pid = event.kind === "syscall" ? timeline[event.index].pid : timeline[exchanges[event.index].syscall]?.pid;
+      const pid = event.kind === "syscall" ? timeline[event.index].pid : event.kind === "exchange" ? timeline[exchanges[event.index].syscall]?.pid : undefined;
       if (pid !== undefined) row.style.borderLeftColor = colorOf(pid);
+      if (event.kind === "hubris") row.style.borderLeftColor = bench.taskColor(hubris[event.index].task);
       row.innerHTML = rowHtml(event);
       list.appendChild(row);
     }
@@ -582,6 +638,11 @@ $("events").onclick = (click) => {
   const row = click.target.closest(".event");
   if (!row) return;
   const event = events[Number(row.dataset.index)];
+  // A Hubris row names an instant of the board's own: stand it there.
+  if (event.kind === "hubris") {
+    leaveOpening();
+    return seekBoard((hubris[event.index].t + 1) * 1000);
+  }
   const link = click.target.closest("a.link");
   let focus = focusOf(event);
   if (link) focus = link.dataset.path !== undefined ? { kind: "file", path: link.dataset.path } : { kind: "fd", fd: Number(link.dataset.fd) };

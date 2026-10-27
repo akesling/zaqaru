@@ -106,6 +106,16 @@ layers switched on and off above it:
 Resets and halts are drawn across every lane. Hover the strip for what an
 event was; click it to stand the board, and every panel, there.
 
+The same system calls, faults, resets and halts are on the container's
+own timeline too, once the machine is shown: a band under the process
+lanes, and rows in the events list — with the task that made each call
+and its time in the board's — which the list's filter can narrow to the
+board's Hubris tasks alone. That timeline counts the container's
+instructions, and the board runs only where the container hands back to
+the host, so a row sits at the container instant the board was moved on
+at: an idle container's whole second of Hubris arrives at one instant,
+in order. A click on a row stands the board at the row's own instant.
+
 The core records the OS-level layers as it runs, into the same trace the
 probes read (channels `TASK`, `SYS`, `EXC` and `BOARD` of
 `board/trace/{since}/{channels}`): an `svc`'s r11, r4 and r5 as the task

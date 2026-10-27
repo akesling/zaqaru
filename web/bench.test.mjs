@@ -116,7 +116,8 @@ test("the timeline's task lane starts the window with the task that was running"
   const records = new Map([
     ["TASK", [{ t: 100, task: 19 }, { t: 1500, task: 9 }, { t: 1700, task: 19 }]],
     ["SYS", [{ t: 1510, r11: 1, r4: 0, r5: 0 }]],
-    ["EXC", [{ t: 1000, exc: 15, name: "SysTick" }, { t: 1600, exc: 4, name: "MemManage" }]],
+    ["EXC", [{ t: 1000, exc: 15, name: "SysTick" }]],
+    ["FAULT", [{ t: 1600, exc: 4, name: "MemManage" }]],
   ]);
   const { lanes } = timelineLanes(records, { tasks: true, syscalls: true, interrupts: true }, 1000, 2000, (n) => `t${n}`);
   assert.deepEqual(lanes[0].spans.map((s) => [s.from, s.to, s.label]), [[1000, 1500, "t19"], [1500, 1700, "t9"], [1700, 2000, "t19"]]);
