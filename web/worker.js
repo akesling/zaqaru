@@ -30,7 +30,8 @@
 //               { type: "advance", by }                 live: run the frontier on by `by`, and report
 //               { type: "run" } / { type: "pause" }      live: run the frontier on until paused
 //               { type: "checkpointing", every, budget } live: how far apart checkpoints are
-//               { type: "seek", at, context }           context: { pid, tid, path }
+//               { type: "seek", at, context, board }    context: { pid, tid, path }; board: { time },
+//                                                       picoseconds of the board's own time, in place of `at`
 //               { type: "read", id, path }              one path, at the instant in view
 //               { type: "request", id, port, request }  live: through the edge
 //               { type: "open", id, port }               live: a connection that stays open
@@ -136,7 +137,7 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
     observed = mounts.observe();
     const first = await Container.instantiate(module, mounts);
     first.step(0);
-    checkpoints.add(0, first);
+    keep(0, first);
     let target = checkpointEvery;
     let total = 0;
     let diffing = 0;
@@ -148,7 +149,7 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
         break;
       }
       const began = performance.now();
-      checkpoints.add(total, first);
+      keep(total, first);
       diffing += performance.now() - began;
       target = total + checkpointEvery;
     }
@@ -205,7 +206,7 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
   }
   const statistics = live.value("statistics");
   if (statistics.retired !== origin) throw `the container stands at ${statistics.retired}, not the snapshot's ${origin}`;
-  checkpoints.add(origin, live);
+  keep(origin, live);
   frontier = origin;
   viewer = live;
   growth(live); // the boot's logs, if any were kept, are not the timeline
@@ -243,8 +244,22 @@ function checkpointDue() {
   return budget >= 1 || cost <= (budget / (1 - budget)) * ranSinceCheckpoint;
 }
 
+/// A checkpoint, with where the container's board stood at it, in
+/// picoseconds of the board's time — null with no board — which is what a
+/// seek in the board's time picks its checkpoint by.
+function keep(at, container) {
+  const index = checkpoints.add(at, container);
+  let board = null;
+  try {
+    board = container.value("board").time_ps ?? null;
+  } catch {
+    // No board.
+  }
+  checkpoints.entries[index].board = board;
+}
+
 function checkpoint() {
-  checkpoints.add(frontier, live);
+  keep(frontier, live);
   ranSinceCheckpoint = 0;
 }
 
@@ -405,7 +420,8 @@ function instantiate(pattern, fill) {
 
 /// Stands a container at `at`: the frontier itself when asked for the
 /// frontier, or for null, which is wherever the frontier is now; otherwise a restored checkpoint run exactly to the instant.
-async function stand(at) {
+async function stand(at, board = null) {
+  if (board) return standBoard(board);
   if (live && at === null) at = frontier;
   if (at < origin) at = origin;
   if (live && at >= frontier) {
@@ -419,11 +435,27 @@ async function stand(at) {
   return performance.now() - began;
 }
 
+/// The container standing where its board stands at `time` picoseconds of
+/// the board's own time: from the last checkpoint before the board got
+/// there, run on until it does. A count of the container's instructions
+/// doesn't name such an instant — an idle container retires none while its
+/// board runs on — so it is a seek of its own.
+async function standBoard({ time }) {
+  const began = performance.now();
+  let index = 0;
+  checkpoints.entries.forEach((entry, n) => {
+    if (entry.board !== null && entry.board !== undefined && entry.board < time) index = n;
+  });
+  viewer = await Container.fromSnapshot(module, checkpoints.snapshot(index));
+  viewer.stopAtBoard({ time }, live ? frontier : -1);
+  return performance.now() - began;
+}
+
 /// The machine at `at`, as every path of its store the instant can fill.
 /// `context` says which process and thread the page is looking at (the
 /// running ones when it says nothing) and where it is browsing the files.
-async function seek(at, context = {}) {
-  const restored = await stand(at);
+async function seek(at, context = {}, board = null) {
+  const restored = await stand(at, board);
   const values = {};
   const statistics = read(viewer, "statistics", "statistics");
   const processes = read(viewer, "processes", "processes");
@@ -510,7 +542,7 @@ onmessage = async (event) => {
       if (message.every !== undefined) checkpointEvery = message.every;
       if (message.budget !== undefined) budget = message.budget;
     }
-    else if (message.type === "seek") await seek(message.at, message.context);
+    else if (message.type === "seek") await seek(message.at, message.context, message.board);
     else if (message.type === "read") readOne(message.id, message.path);
     else if (message.type === "request") request(message.id, message.port, message.request);
     else if (message.type === "open") openStream(message.id, message.port);

@@ -115,6 +115,9 @@
   .probe-body table.values td.key { opacity: .6; white-space: nowrap; }
   .board details.more summary { cursor: pointer; opacity: .7; margin: 4px 0; }
   .board .clock { margin: 3px 0; }
+  .board .instant:not(:empty) { margin: 2px 0 6px; padding: 4px 8px; border: 1px solid var(--accent); border-radius: 4px; background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .board .t[data-board-time] { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+  .board .t[data-board-time]:hover { color: var(--accent); }
   .board .controls { display: inline-flex; flex-wrap: wrap; gap: 4px; margin-left: 6px; vertical-align: middle; }
   .board .controls button { font: inherit; font-size: 0.9em; padding: 1px 7px; border-radius: 4px; border: 1px solid #fff3; background: #fff1; color: inherit; cursor: pointer; }
   .board .controls button.on { background: #44d45733; border-color: #44d457aa; }

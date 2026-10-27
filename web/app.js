@@ -63,6 +63,7 @@ function clamp(at) {
 
 function seek(at) {
   at = clamp(at);
+  boardTime = null;
   if (busy) {
     queued = { seek: at };
     return;
@@ -75,12 +76,36 @@ function seek(at) {
 /// worker reads them — never an instant behind it, which would be a
 /// restore and a re-execution for a view that is stale on arrival.
 function follow() {
+  boardTime = null;
   if (busy) {
     queued = { follow: true };
     return;
   }
   busy = true;
   worker.postMessage({ type: "seek", at: null, context });
+}
+
+/// The board as it was at `time` picoseconds of its own time — and every
+/// panel with it. The container's count of instructions, which the slider
+/// moves along, doesn't name such an instant: an idle container retires
+/// none while the board runs on.
+let boardTime = null;
+function seekBoard(time) {
+  stop();
+  boardTime = Math.max(0, Math.round(time));
+  if (busy) {
+    queued = { board: boardTime };
+    return;
+  }
+  busy = true;
+  worker.postMessage({ type: "seek", at: null, context, board: { time: boardTime } });
+}
+
+/// Back from an instant of the board's to the live run.
+function backToLive() {
+  boardTime = null;
+  if (!playing && finished === null) $("play").click();
+  else follow();
 }
 
 function advance(by) {
@@ -97,6 +122,7 @@ function drain() {
   const next = queued;
   queued = null;
   if (next.seek !== undefined) seek(next.seek);
+  else if (next.board !== undefined) seekBoard(next.board);
   else if (next.follow) follow();
   else advance(next.advance);
   return true;
@@ -1101,7 +1127,7 @@ const renderers = {
     // A skeleton made once, and each part of it replaced only when what it
     // shows changes: the board isn't redrawn under the pointer on every read.
     if (!panel.body.querySelector(".board > .drawing")) {
-      panel.body.innerHTML = `<div class="board"><div class="drawing"></div><div class="status"></div><div class="clock"><span class="clock-text"></span> <span class="clock-controls"></span></div><div class="dim clock-tree"></div>
+      panel.body.innerHTML = `<div class="board"><div class="instant"></div><div class="drawing"></div><div class="status"></div><div class="clock"><span class="clock-text"></span> <span class="clock-controls"></span></div><div class="dim clock-tree"></div>
         <div class="probes"></div>
         <details class="more"><summary>LEDs, faults, the network, the core's registers</summary><div class="more-body"></div></details></div>`;
       const more = panel.body.querySelector("details.more");
@@ -1117,8 +1143,24 @@ const renderers = {
     fill(".status", `<b>${escape(value.chip)}</b>${value.core ? ` (${escape(value.core)})` : ""} · <b>${escape(value.state)}</b> · ${(value.simulated_ms / 1000).toFixed(3)} s simulated`);
     // The clock's figures change on every read; its buttons only when the
     // speed or the pause does, so a press on one isn't lost to a redraw.
+    // Standing at an instant of the board's: where, and steps in its time.
+    // The clock's controls are the live board's, so they wait till then.
+    const steps = [
+      [-1e8, "−100 µs"],
+      [1e7, "+10 µs"],
+      [1e8, "+100 µs"],
+      [1e9, "+1 ms"],
+    ]
+      .map(([by, label]) => `<button type="button" data-board-step="${by}">${label}</button>`)
+      .join("");
+    fill(
+      ".instant",
+      boardTime === null
+        ? ""
+        : `<b>standing at ${bench.fmtTime(value.time_ps / 1000)}</b> of the board's time, every panel as it was then <span class="controls">${steps}<button type="button" data-board-live class="on">back to live</button></span>`,
+    );
     fill(".clock-text", clockText);
-    fill(".clock-controls", value.speed ? controls : "");
+    fill(".clock-controls", value.speed && boardTime === null ? controls : "");
     fill(".clock-tree", value.speed ? clocks : "");
     showProbes(panel.body.querySelector(".probes"), value);
     const transcript = fill(".more-body", `<div>LED${leds.length > 1 ? "s" : ""} ${lit || "none"} · ${value.faults} faults · debug probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
@@ -1132,6 +1174,13 @@ const renderers = {
     panel.body.onclick = (event) => {
       const button = event.target.closest("[data-clock]");
       if (button) return boardControl(button.dataset.clock);
+      const at = event.target.closest("[data-board-time]");
+      // Just after the record: its time is whole nanoseconds, the board's
+      // picoseconds.
+      if (at) return seekBoard((Number(at.dataset.boardTime) + 1) * 1000);
+      const step = event.target.closest("[data-board-step]");
+      if (step) return seekBoard((boardTime ?? value.time_ps) + Number(step.dataset.boardStep));
+      if (event.target.closest("[data-board-live]")) return backToLive();
       const target = event.target.closest("[data-probe], [data-part], [data-unprobe], [data-window]");
       if (!target) return;
       if (target.dataset.window) probeWindow = Number(target.dataset.window);
@@ -1394,14 +1443,19 @@ async function followTrace() {
   const channels = probeChannels();
   if (!channels.length || traceBusy) return;
   traceBusy = true;
+  let again = false;
   try {
     const since = traceCursor ?? -2000;
     const answer = await read(`board/trace/${since}/${channels.join(",")}`);
     if (answer?.error !== undefined || !answer) return;
     if (traceCursor !== null && answer.next < traceCursor) {
-      // The view is earlier than the last read: start again from there.
+      // The view is earlier than the last read — a seek into the past, or
+      // to an instant of the board's — so what the probes hold is partly
+      // its future: start again from there, now, since a view standing
+      // still asks for nothing more.
       probeRecords.clear();
       traceCursor = null;
+      again = true;
       return;
     }
     for (const record of answer.records) {
@@ -1410,8 +1464,9 @@ async function followTrace() {
       list.push(record);
       if (list.length > RECORDS_KEPT) list.splice(0, list.length - RECORDS_KEPT);
     }
+    const reread = since < 0;
     traceCursor = answer.next;
-    if (answer.records.length && boardPanel && boardValue) {
+    if ((answer.records.length || reread) && boardPanel && boardValue) {
       const box = boardPanel.body.querySelector(".probes");
       if (box) showProbes(box, boardValue);
     }
@@ -1419,6 +1474,7 @@ async function followTrace() {
     // Nothing to read at this instant: the board is not there yet.
   } finally {
     traceBusy = false;
+    if (again) followTrace();
   }
 }
 

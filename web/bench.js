@@ -211,6 +211,12 @@ export function fmtTime(ns) {
   return `${(ns / 1e9).toFixed(6)} s`;
 }
 
+/// A record's time, as a handle on that instant: the page stands the
+/// board there when it is clicked (`data-board-time`, nanoseconds).
+export function stamp(ns) {
+  return `<span class="t" data-board-time="${ns}" title="stand the board here: every panel as it was at this instant">${fmtTime(ns)}</span>`;
+}
+
 /// A span of time, as a person reads it.
 export function fmtSpan(ns) {
   if (ns >= 1e9) return `${+(ns / 1e9).toFixed(3)} s`;
@@ -357,11 +363,11 @@ export function probeBody(name, records, value, window) {
   if (kind === "pin") {
     const state = pinState(value, name);
     const role = pinRoles(value).get(name);
-    const edges = newest(records, 8).map((r) => `<div><span class="t">${fmtTime(r.t)}</span> ${r.high ? "↑ high" : "↓ low"}</div>`).join("");
+    const edges = newest(records, 8).map((r) => `<div>${stamp(r.t)} ${r.high ? "↑ high" : "↓ low"}</div>`).join("");
     return `<div class="dim">${state ? `${state.mode}, now ${state.high ? "high" : "low"}` : ""}${role ? ` — ${esc(role)}` : ""} · ${records.length} edges seen</div>${waveform(records, now, window, state?.high)}<div class="edges">${edges || '<div class="dim">no edges yet</div>'}</div>`;
   }
   if (kind === "i2c") {
-    const rows = newest(i2cTransactions(records)).map((t) => `<div><span class="t">${fmtTime(t.t)}</span> ${esc(i2cLine(t))}${t.open ? " …" : ""}</div>`);
+    const rows = newest(i2cTransactions(records)).map((t) => `<div>${stamp(t.t)} ${esc(i2cLine(t))}${t.open ? " …" : ""}</div>`);
     return rows.join("") || `<div class="dim">no transactions yet</div>`;
   }
   if (kind === "spi") {
@@ -369,7 +375,7 @@ export function probeBody(name, records, value, window) {
     const rows = newest(spiTransactions(records)).map((t) => {
       const who = t.cs ? `${t.cs}${parts.get(t.cs) ? ` ${parts.get(t.cs)}` : ""}` : "—";
       const cut = (bytes) => bytes.slice(0, 24).map(hex2).join(" ") + (bytes.length > 24 ? ` … (${bytes.length})` : "");
-      return `<div><span class="t">${fmtTime(t.t)}</span> <b>${esc(who)}</b><div class="frames">→ ${cut(t.mosi) || "—"}<br>← ${cut(t.miso) || "—"}</div></div>`;
+      return `<div>${stamp(t.t)} <b>${esc(who)}</b><div class="frames">→ ${cut(t.mosi) || "—"}<br>← ${cut(t.miso) || "—"}</div></div>`;
     });
     return rows.join("") || `<div class="dim">no transfers yet</div>`;
   }
@@ -379,7 +385,7 @@ export function probeBody(name, records, value, window) {
     return `<div class="dim">sent</div><pre class="serial">${esc(sent) || "—"}</pre><div class="dim">received</div><pre class="serial">${esc(got) || "—"}</pre>`;
   }
   if (kind === "eth") {
-    const rows = newest(records).map((r) => `<div><span class="t">${fmtTime(r.t)}</span> ${r.rx ? "⇠ in " : "⇢ out"} ${r.len} B · ${esc(ethLine(r))}</div>`);
+    const rows = newest(records).map((r) => `<div>${stamp(r.t)} ${r.rx ? "⇠ in " : "⇢ out"} ${r.len} B · ${esc(ethLine(r))}</div>`);
     return rows.join("") || `<div class="dim">no frames yet</div>`;
   }
   const part = (value.parts ?? []).find((p) => partKey(p) === name);

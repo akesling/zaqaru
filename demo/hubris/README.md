@@ -79,6 +79,17 @@ on by a millisecond (`pause`, `advance 1ms`, or the panel's buttons) holds
 a transaction still to read. A Gimletlet or a PSC flashed onto the bench is
 drawn as itself, with its own LEDs and parts.
 
+Every record's time is a handle on that instant: click it, and the page
+stands there, with the board, its registers, the probes and every other
+panel as they were just after it happened. A transaction's start shows
+`0x48 W …`, the rest of it still to come. The bar above the board
+steps in the board's time (−100 µs, +10 µs, +100 µs, +1 ms), and **back to
+live** returns. Standing there is exact: the kernel restores the checkpoint
+before it and re-executes against the run's recording, holding the board
+at that instant of its own (`zaqaru_stop_at_board`). `replay.mjs` checks
+that a board stood at an instant is the board the live run had there,
+to the last byte of its memory.
+
 `build.sh` builds Hubris's `app/demo-stm32h7-nucleo/app-h753.toml`, and
 the G031 and G070 demos to flash in its place, on this host. It builds
 Humility (pinned, as released, with its default features),
