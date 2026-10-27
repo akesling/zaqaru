@@ -1149,23 +1149,7 @@ impl Board {
         use crate::system::server::quoted;
         let block = armv6m::names::block(&self.machine.bus.soc, address);
         let place = map.and_then(|m| m.as_ref().ok()).and_then(|image| image.whatis(address));
-        let mut text = String::new();
-        if let Some(place) = &place {
-            text += &format!("{} {}", place.owner.name, place.part);
-            if let Some((symbol, offset)) = place.symbol {
-                text += &format!(": {}", symbol.name);
-                if offset > 0 {
-                    text += &format!(" + {offset:#x}");
-                }
-            }
-        }
-        if let Some((name, base)) = block {
-            let at = if address > base { format!("{name} + {:#x}", address - base) } else { name.to_string() };
-            text = if text.is_empty() { at } else { format!("{text} ({at})") };
-        }
-        if text.is_empty() {
-            text = format!("{address:#010x}: nothing the chip or the archive names");
-        }
+        let text = self.describe(address, map);
         let block = block.map_or("null".into(), |(name, base)| {
             format!(r#"{{"name":{},"base":{base},"offset":{}}}"#, quoted(name), address - base)
         });
@@ -1194,6 +1178,179 @@ impl Board {
             r#"{{"address":{address},"text":{},"block":{block},"owner":{owner},"task":{task},"part":{part},"symbol":{symbol},"error":{error}}}"#,
             quoted(&text)
         )
+    }
+
+    /// What `address` is, as a line a person reads:
+    /// `i2c_driver .bss: drv_stm32xx_i2c_server::BUF + 0x4 (AXI SRAM + 0xd41c)`.
+    pub fn describe(&self, address: u32, map: Option<&Result<armv6m::hubris::Image, String>>) -> String {
+        let block = armv6m::names::block(&self.machine.bus.soc, address);
+        let place = map.and_then(|m| m.as_ref().ok()).and_then(|image| image.whatis(address));
+        let mut text = String::new();
+        if let Some(place) = &place {
+            text += &format!("{} {}", place.owner.name, place.part);
+            if let Some((symbol, offset)) = place.symbol {
+                text += &format!(": {}", symbol.name);
+                if offset > 0 {
+                    text += &format!(" + {offset:#x}");
+                }
+            }
+        }
+        if let Some((name, base)) = block {
+            let at = if address > base { format!("{name} + {:#x}", address - base) } else { name.to_string() };
+            text = if text.is_empty() { at } else { format!("{text} ({at})") };
+        }
+        if text.is_empty() {
+            text = format!("{address:#010x}: nothing the chip or the archive names");
+        }
+        text
+    }
+
+    /// Where the code at `pc` is: its owner, and the function and how far
+    /// in — `i2c_driver: drv_stm32xx_i2c::I2cController::read + 0x12`.
+    fn code_at(&self, pc: u32, map: Option<&Result<armv6m::hubris::Image, String>>) -> String {
+        let place = map.and_then(|m| m.as_ref().ok()).and_then(|image| image.whatis(pc));
+        match place {
+            Some(place) => match place.symbol {
+                Some((symbol, 0)) => format!("{}: {}", place.owner.name, symbol.name),
+                Some((symbol, offset)) => format!("{}: {} + {offset:#x}", place.owner.name, symbol.name),
+                None => format!("{} {}", place.owner.name, place.part),
+            },
+            None => format!("{pc:#010x}"),
+        }
+    }
+
+    /// Follows where values go from now on, or stops: see
+    /// `armv6m::provenance`. Answers since when it is following.
+    pub fn follow_values(&mut self, on: bool) -> String {
+        self.machine.follow_values(on);
+        match &self.machine.provenance {
+            Some(p) => format!(r#"{{"following":true,"since_ns":{}}}"#, p.since / 1000),
+            None => r#"{"following":false}"#.to_string(),
+        }
+    }
+
+    /// Where the value at `address` came from, as JSON: newest first, each
+    /// step what it was — a store, where to and by which code; a merge of
+    /// two values, the other's history beside it; a read of a peripheral's
+    /// data register, and the trace record of the byte it gave — with its
+    /// time in the board's nanoseconds. Empty when nothing is being
+    /// followed, or the byte came from nowhere followed.
+    pub fn why_json(&self, address: u32, map: Option<&Result<armv6m::hubris::Image, String>>) -> String {
+        use crate::system::server::quoted;
+        let Some(p) = &self.machine.provenance else {
+            return r#"{"following":false,"steps":[]}"#.to_string();
+        };
+        let tag = p.memory.get(&address).copied().unwrap_or(0);
+        let steps = self.why_steps(p, tag, map, 24);
+        format!(
+            r#"{{"following":true,"since_ns":{},"address":{address},"what":{},"steps":[{}]}}"#,
+            p.since / 1000,
+            quoted(&self.describe(address, map)),
+            steps.join(",")
+        )
+    }
+
+    /// What of the board's memory holds values that came in from outside
+    /// since following began, as JSON: runs of bytes with the same history,
+    /// each with where it is, what it holds, and the read it came from — at
+    /// most `limit` runs, by address.
+    pub fn tagged_json(&self, limit: usize, map: Option<&Result<armv6m::hubris::Image, String>>) -> String {
+        use crate::system::server::quoted;
+        use armv6m::provenance::What;
+        let Some(p) = &self.machine.provenance else {
+            return r#"{"following":false,"runs":[]}"#.to_string();
+        };
+        let mut bytes: Vec<(u32, u32)> = p.memory.iter().map(|(&a, &t)| (a, t)).collect();
+        bytes.sort_unstable();
+        let mut runs: Vec<(u32, u32, u32)> = Vec::new(); // (start, length, tag)
+        for (addr, tag) in bytes {
+            match runs.last_mut() {
+                Some((start, length, last)) if *last == tag && *start + *length == addr => *length += 1,
+                _ => runs.push((addr, 1, tag)),
+            }
+        }
+        let total = runs.len();
+        let out: Vec<String> = runs
+            .into_iter()
+            .take(limit)
+            .map(|(start, length, tag)| {
+                let origin = p.history(tag, 64).last().map(|&(_, node)| node.clone());
+                let origin = match origin {
+                    Some(node) => match node.what {
+                        What::Read { addr, value } => format!(
+                            r#"{{"register":{},"value":{value},"t":{}}}"#,
+                            quoted(&armv6m::names::data_register(&self.machine.bus.soc, addr).unwrap_or_default()),
+                            node.time / 1000
+                        ),
+                        _ => "null".into(),
+                    },
+                    None => "null".into(),
+                };
+                let held: Vec<String> = (0..length.min(16))
+                    .map(|i| self.machine.bus.peek(start + i, 1).map_or("--".into(), |b| format!("{b:02x}")))
+                    .collect();
+                format!(
+                    r#"{{"addr":{start},"length":{length},"hex":"{}","where":{},"origin":{origin}}}"#,
+                    held.join(""),
+                    quoted(&self.describe(start, map))
+                )
+            })
+            .collect();
+        format!(r#"{{"following":true,"since_ns":{},"runs":{total},"shown":[{}]}}"#, p.since / 1000, out.join(","))
+    }
+
+    fn why_steps(
+        &self,
+        p: &armv6m::provenance::Provenance,
+        tag: armv6m::provenance::Tag,
+        map: Option<&Result<armv6m::hubris::Image, String>>,
+        depth: usize,
+    ) -> Vec<String> {
+        use crate::system::server::quoted;
+        use armv6m::provenance::What;
+        let mut out = Vec::new();
+        for (_, node) in p.history(tag, depth) {
+            let common = format!(r#""t":{},"pc":{},"code":{}"#, node.time / 1000, node.pc, quoted(&self.code_at(node.pc, map)));
+            out.push(match node.what {
+                What::Store { addr, size, value } => format!(
+                    r#"{{"what":"store","addr":{addr},"size":{size},"value":{value},"where":{},{common}}}"#,
+                    quoted(&self.describe(addr, map))
+                ),
+                What::Read { addr, value } => {
+                    let register = armv6m::names::data_register(&self.machine.bus.soc, addr).unwrap_or_default();
+                    let record = self.record_of(&register, value, node.time);
+                    format!(
+                        r#"{{"what":"read","addr":{addr},"value":{value},"register":{},"record":{},{common}}}"#,
+                        quoted(&register),
+                        record.map_or("null".into(), |(n, t)| format!(r#"{{"n":{n},"t":{}}}"#, t / 1000))
+                    )
+                }
+                What::Merge => {
+                    let other = self.why_steps(p, node.parents[1], map, depth / 2);
+                    format!(r#"{{"what":"merge","other":[{}],{common}}}"#, other.join(","))
+                }
+            });
+        }
+        out
+    }
+
+    /// The trace record that brought the byte a read of `register` — `I2C2
+    /// RXDR` — gave: the last of its channel's at or before `time` that
+    /// carried `value`. Its number, and its time.
+    fn record_of(&self, register: &str, value: u32, time: u64) -> Option<(u64, u64)> {
+        use armv6m::trace::{I2cEvent, Signal, SpiEvent};
+        let channel = register.split(' ').next()?;
+        self.trace
+            .iter()
+            .rev()
+            .filter(|(_, record, _)| record.time <= time && record.signal.channel() == channel)
+            .find(|(_, record, _)| match &record.signal {
+                Signal::I2c { event: I2cEvent::Byte { byte }, .. } => u32::from(*byte) == value & 0xFF,
+                Signal::Usart { received: true, byte, .. } => u32::from(*byte) == value & 0xFF,
+                Signal::Spi { event: SpiEvent::Frame { miso, .. }, .. } => u32::from(*miso) == value & 0xFF,
+                _ => false,
+            })
+            .map(|(n, record, _)| (*n, record.time))
     }
 
     /// Up to [`MEMORY_SERVED`] bytes of the board's memory from `address`, as
