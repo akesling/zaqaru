@@ -143,6 +143,14 @@
   .mem-head { margin: 2px 0 6px; }
   .mem-maps { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end; }
   .mem-ram { margin: 0; }
+  .mem-crumbs { margin: 2px 0 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mem-crumbs a { color: var(--accent); cursor: pointer; }
+  .mem-crumbs a:hover { text-decoration: underline; }
+  .mem-crumbs a.here { color: inherit; font-weight: 600; cursor: default; text-decoration: none; }
+  .mem-crumbs .sep { opacity: .5; margin: 0 6px; }
+  .mem-crumbs .hint { margin-left: 10px; }
+  .mem-frame { position: relative; line-height: 0; user-select: none; }
+  .mem-drag { display: none; position: absolute; border: 1px solid var(--accent); background: color-mix(in srgb, var(--accent) 18%, transparent); pointer-events: none; }
   .mem-ram figcaption { font-size: 11px; margin-bottom: 2px; }
   .mem-ram canvas { display: block; max-width: 100%; image-rendering: pixelated; cursor: crosshair; border-radius: 2px; }
   .mem-readout { min-height: 1.4em; margin: 4px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

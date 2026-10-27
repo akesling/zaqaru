@@ -1,7 +1,7 @@
 // Checks `memory.js` under Node: node --test web/memory.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cellOwners, heat, hilbert, layout, owners, shortName, tiles } from "./memory.js";
+import { cellOwners, heat, hilbert, layout, owners, rounded, shortName, tiles } from "./memory.js";
 
 test("a Hilbert curve visits every point of its square once, each next to the last", () => {
   const seen = new Set();
@@ -68,4 +68,16 @@ test("a static's name is shortened to its last two parts, generics folded", () =
   assert.equal(shortName("drv_stm32xx_i2c_server::__RINGBUF"), "drv_stm32xx_i2c_server::__RINGBUF");
   assert.equal(shortName("a::b::c::D"), "c::D");
   assert.equal(shortName("<x::Y<u8> as z::W>::F"), "<…>::F");
+});
+
+test("a zoom is rounded out to the aligned block that holds it, within reason", () => {
+  // hiffy's 32 KiB, less its first cell: the whole of it.
+  assert.deepEqual(rounded(0x24010040, 0x7fc0), { base: 0x24010000, length: 0x8000 });
+  // Across a 64 KiB boundary: the aligned block would be far larger, so a
+  // power of two from where it starts.
+  assert.deepEqual(rounded(0x2400f000, 0x2000), { base: 0x2400f000, length: 0x2000 });
+  // Not past the end of its RAM.
+  const ram = { base: 0x38800000, length: 4096 };
+  assert.deepEqual(rounded(0x38800f00, 0x100, ram), { base: 0x38800f00, length: 0x100 });
+  assert.deepEqual(rounded(0x38800e00, 0x180, ram), { base: 0x38800e00, length: 0x200 });
 });

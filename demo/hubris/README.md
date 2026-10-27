@@ -171,6 +171,7 @@ pointers are named the same way in the panel's details.
 | `board/memory/{address}/{length}` | up to 4 KiB of RAM, flash or registers, as a debugger reads them |
 | `board/symbols/{owner}` | the statics in the kernel's or a task's RAM, by name |
 | `board/writes/{since}/{cell}` | the cells of the RAMs written since a stamp, and when each last was |
+| `board/writes/{since}/{cell}/{address}/{length}` | the same for part of one RAM, its cells numbered from the address |
 | `board/written/{address}/{length}` | when each word was last written, and the code — or the probe, DMA, an exception's frame — that wrote it |
 
 The board panel's neighbour, **board memory**, draws it. Each RAM is a
@@ -178,7 +179,11 @@ picture of 64-byte cells laid along a Hilbert curve, so the power-of-two
 region Hubris gives each task for the MPU is a block of its own, coloured
 as the timeline colours the task; each cell lights up when it is written
 and fades as the board's time goes on (halving every 10 ms to 10 s, as
-chosen). The emulator keeps, for every word of RAM, when it was last
+chosen). Drag a box over a picture to zoom in on the memory in it — on a
+Hilbert curve a box is, mostly, one run of addresses — rounded out to the
+aligned power-of-two block that holds it, drawn again as finely as a cell
+a word, with each static outlined and named; the crumbs above it go back
+up the way you came. The emulator keeps, for every word of RAM, when it was last
 written and by what, all the time, so none of this re-executes anything.
 Under the pictures, each task with how lately it wrote and how deep its
 stack has been — the lowest word no longer holding the `0xbaddcafe` the
