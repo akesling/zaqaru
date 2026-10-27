@@ -143,12 +143,62 @@ impl Machine {
         self.stall += self.timing.data(addr, false);
         // A load a busy wait may not make: one that pops a FIFO, or reads a
         // counter that runs by itself — SysTick's, the DWT's, a timer's.
+        let pops = addr >= 0x4000_0000 && addr < 0xE000_0000 && self.bus.soc.impure(addr);
         if addr >= 0x4000_0000
-            && (self.bus.soc.impure(addr) || (0xE000_E018..0xE000_E01C).contains(&addr) || (0xE000_1000..0xE000_2000).contains(&addr))
+            && (pops || (0xE000_E018..0xE000_E01C).contains(&addr) || (0xE000_1000..0xE000_2000).contains(&addr))
         {
             self.spin.clean = false;
         }
-        self.bus.read(addr, size).map_err(|_| Fault::Bus { addr })
+        let value = self.bus.read(addr, size).map_err(|_| Fault::Bus { addr })?;
+        // A pop may have started something timed — an I2C controller
+        // reading its next byte once RXDR is read — so what is due next is
+        // worked out again, as after a store; a busy wait polling for it
+        // would otherwise be skipped past it, to whatever was due before.
+        if pops {
+            self.sync_systick();
+        }
+        if self.provenance.is_some() {
+            let data_register = addr >= 0x4000_0000 && crate::names::data_register(&self.bus.soc, addr).is_some();
+            let (pc, time) = (self.cpu.pc, self.time);
+            if let Some(provenance) = &mut self.provenance {
+                provenance.loaded(addr, size, value, data_register, pc, time);
+            }
+        }
+        Ok(value)
+    }
+
+    /// Where values went in the instruction just executed: each register
+    /// it wrote takes its tag (see [`crate::provenance`]).
+    fn settle_provenance(&mut self, pc: u32) {
+        let mut values = [0; 16];
+        values[..13].copy_from_slice(&self.cpu.r[..13]);
+        values[13] = self.cpu.sp();
+        values[14] = self.cpu.r[14];
+        values[15] = self.cpu.pc;
+        let (written, read, time) = (self.cpu.watch.written, self.cpu.watch.reads.get(), self.time);
+        if let Some(provenance) = &mut self.provenance {
+            provenance.settle(written, read, &values, pc, time);
+        }
+    }
+
+    /// The register a store's `value` came from: the last one the
+    /// instruction read, if it holds it, or another it read that does.
+    fn store_source(&self, value: u32, size: u32) -> Option<usize> {
+        let mask = if size >= 4 { u32::MAX } else { (1 << (8 * size)) - 1 };
+        let holds = |n: usize| {
+            let held = match n {
+                13 => self.cpu.sp(),
+                15 => self.cpu.pc,
+                n => self.cpu.r[n],
+            };
+            held & mask == value & mask
+        };
+        let last = self.cpu.watch.last.get() as usize;
+        let read = self.cpu.watch.reads.get();
+        if read & 1 << last != 0 && holds(last) {
+            return Some(last);
+        }
+        (0..16).find(|&n| read & 1 << n != 0 && holds(n))
     }
 
     pub(crate) fn store(&mut self, addr: u32, size: u32, value: u32) -> Result<(), Fault> {
@@ -164,6 +214,13 @@ impl Machine {
         self.stall += self.timing.data(addr, true);
         self.stores += 1;
         self.bus.write(addr, size, value).map_err(|_| Fault::Bus { addr })?;
+        if self.provenance.is_some() {
+            let source = self.store_source(value, size);
+            let (read, pc, time) = (self.cpu.watch.reads.get(), self.cpu.pc, self.time);
+            if let Some(provenance) = &mut self.provenance {
+                provenance.stored(addr, size, value, source, read, pc, time);
+            }
+        }
         // A store to the flash interface or to CCR may change the wait
         // states: the flash's latency, the caches.
         if (0x4002_2000..0x4002_2400).contains(&addr) || (0x5200_2000..0x5200_2400).contains(&addr) || addr == 0xE000_ED14 {
@@ -215,7 +272,15 @@ impl Machine {
         let first = self.fetch(pc)?;
         let wide = first >> 11 >= 0b11101;
         let second = if wide { self.fetch(pc.wrapping_add(2))? } else { 0 };
+        if let Some(provenance) = &mut self.provenance {
+            provenance.begin();
+            self.cpu.watch.reads.set(0);
+            self.cpu.watch.written = 0;
+        }
         let result = self.dispatch(first, second, wide);
+        if self.provenance.is_some() {
+            self.settle_provenance(pc);
+        }
         // A taken branch — anything that left the pc elsewhere than the next
         // instruction — refills the pipeline.
         if matches!(result, Ok(Flow::Next)) && self.cpu.pc != pc.wrapping_add(if wide { 4 } else { 2 }) {
@@ -448,7 +513,7 @@ impl Machine {
                     _ => {
                         let target = self.r(m);
                         if i & 1 << 7 != 0 {
-                            self.cpu.r[14] = next | 1;
+                            self.cpu.set_reg(14, next | 1);
                         }
                         self.bx(target)?;
                         return Ok(Flow::Next);
@@ -521,9 +586,9 @@ impl Machine {
                     if list & 1 << reg != 0 {
                         if loading {
                             let value = self.load(addr, 4)?;
-                            self.cpu.r[reg] = value;
+                            self.cpu.set_reg(reg, value);
                         } else {
-                            self.store(addr, 4, self.cpu.r[reg])?;
+                            self.store(addr, 4, self.cpu.reg(reg))?;
                         }
                         addr = addr.wrapping_add(4);
                     }
@@ -612,12 +677,12 @@ impl Machine {
                 let mut addr = base;
                 for reg in 0..8 {
                     if list & 1 << reg != 0 {
-                        self.store(addr, 4, self.cpu.r[reg])?;
+                        self.store(addr, 4, self.cpu.reg(reg))?;
                         addr = addr.wrapping_add(4);
                     }
                 }
                 if lr {
-                    self.store(addr, 4, self.cpu.r[14])?;
+                    self.store(addr, 4, self.cpu.reg(14))?;
                 }
                 self.cpu.set_sp(base);
             }
@@ -672,7 +737,7 @@ impl Machine {
                 for reg in 0..8 {
                     if list & 1 << reg != 0 {
                         let value = self.load(addr, 4)?;
-                        self.cpu.r[reg] = value;
+                        self.cpu.set_reg(reg, value);
                         addr = addr.wrapping_add(4);
                     }
                 }
@@ -721,7 +786,7 @@ impl Machine {
             let i1 = !(second >> 13 ^ s) & 1;
             let i2 = !(second >> 11 ^ s) & 1;
             let imm = s << 24 | i1 << 23 | i2 << 22 | (first & 0x3FF) << 12 | (second & 0x7FF) << 1;
-            self.cpu.r[14] = next | 1;
+            self.cpu.set_reg(14, next | 1);
             self.cpu.pc = next.wrapping_add(((imm << 7) as i32 >> 7) as u32);
             return Ok(Flow::Next);
         }

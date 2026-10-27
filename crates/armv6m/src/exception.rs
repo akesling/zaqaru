@@ -148,6 +148,22 @@ impl Machine {
             exc_return &= !EXC_RETURN_BASIC;
         }
         self.cpu.r[14] = exc_return;
+        // The frame carries the tags of the registers it saved.
+        if let Some(provenance) = &mut self.provenance {
+            for (slot, reg) in [0, 1, 2, 3, 12, 14].into_iter().enumerate() {
+                let tag = provenance.regs[reg];
+                for i in 0..4 {
+                    let byte = frame.wrapping_add(4 * slot as u32 + i);
+                    if tag == 0 {
+                        provenance.memory.remove(&byte);
+                    } else {
+                        provenance.memory.insert(byte, tag);
+                    }
+                }
+            }
+            // lr now holds EXC_RETURN, which carries nothing.
+            provenance.regs[14] = 0;
+        }
         let time = self.time;
         let signal = match n {
             SVCALL => crate::trace::Signal::Syscall { r11: asked.0, r4: asked.1, r5: asked.2 },
@@ -290,6 +306,15 @@ impl Machine {
             self.cpu.faultmask = faultmask;
             self.update_priority();
             return Err(Fault::InvPc);
+        }
+        // And the registers it restores, the tags it carried.
+        if self.provenance.is_some() {
+            let (pc, time) = (self.cpu.pc, self.time);
+            if let Some(provenance) = &mut self.provenance {
+                for (slot, reg) in [0, 1, 2, 3, 12, 14].into_iter().enumerate() {
+                    provenance.regs[reg] = provenance.of_memory(sp.wrapping_add(4 * slot as u32), 4, pc, time);
+                }
+            }
         }
         self.cpu.r[0] = frame[0];
         self.cpu.r[1] = frame[1];

@@ -54,6 +54,7 @@ pub mod i2c;
 pub mod names;
 pub mod net;
 pub mod part;
+pub mod provenance;
 pub mod scs;
 pub mod spi_h7;
 pub mod state;
@@ -221,6 +222,9 @@ pub struct Machine {
     /// Where the machine stops and will not run past, whoever asks it to
     /// run: see [`Horizon`].
     pub horizon: Horizon,
+    /// Where each value came from, while someone is following: see
+    /// [`provenance`]. `None` otherwise, which costs a test an instruction.
+    pub provenance: Option<Box<provenance::Provenance>>,
     pub events: Vec<Event>,
     /// How many times each exception has been entered.
     pub taken: Box<[u64; scs::exception::COUNT]>,
@@ -323,6 +327,7 @@ impl Machine {
             skipped: 0,
             retired: 0,
             horizon: Horizon::NONE,
+            provenance: None,
             events: Vec::new(),
             taken: Box::new([0; scs::exception::COUNT]),
             priority: scs::BASE_PRIORITY,
@@ -518,6 +523,13 @@ impl Machine {
             }
         }
         Outcome::Budget
+    }
+
+    /// Follows where values go from now on — or stops — keeping a tag on
+    /// every register and byte of memory: see [`provenance`].
+    pub fn follow_values(&mut self, on: bool) {
+        self.provenance = on.then(|| Box::new(provenance::Provenance::new(self.time)));
+        self.cpu.watch.on = on;
     }
 
     /// Whether the machine stands at its [`Horizon`], and will run no further.

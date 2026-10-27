@@ -437,7 +437,7 @@ impl Machine {
                     return Err(undefined);
                 }
                 if bit(hw2, 14) {
-                    self.cpu.r[14] = next | 1;
+                    self.cpu.set_reg(14, next | 1);
                 }
                 self.cpu.pc = target;
                 Ok(Flow::Next)
@@ -483,7 +483,7 @@ impl Machine {
                 } else if reg == 13 {
                     self.cpu.set_sp(value);
                 } else {
-                    self.cpu.r[reg] = value;
+                    self.cpu.set_reg(reg, value);
                 }
             } else {
                 self.store(addr, 4, self.r(reg as u32))?;

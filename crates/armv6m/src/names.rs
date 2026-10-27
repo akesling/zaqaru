@@ -24,6 +24,25 @@ pub fn block(soc: &Soc, address: u32) -> Option<(&'static str, u32)> {
         .map(|&(name, base, _)| (name, base))
 }
 
+/// The data register `address` is, if it is one — what a peripheral hands
+/// the core a byte from the outside through: `I2C2 RXDR`, `SPI1 RXDR`,
+/// `USART3 RDR`. A read of one is where a value comes in.
+pub fn data_register(soc: &Soc, address: u32) -> Option<String> {
+    let (name, base) = block(soc, address)?;
+    let offset = address - base;
+    let h7 = matches!(soc, Soc::H7(_));
+    let register = if name.starts_with("I2C") && offset == 0x24 {
+        "RXDR"
+    } else if name.starts_with("SPI") && offset == if h7 { 0x30 } else { 0x0C } {
+        if h7 { "RXDR" } else { "DR" }
+    } else if (name.starts_with("USART") || name.starts_with("UART") || name.starts_with("LPUART")) && offset == 0x24 {
+        "RDR"
+    } else {
+        return None;
+    };
+    Some(format!("{name} {register}"))
+}
+
 const K: u32 = 1024;
 
 /// The Cortex-M core's own: the System Control Space, by block.

@@ -75,10 +75,35 @@ pub struct Cpu {
     /// The FPU's registers, s0–s31 (d0–d15 in pairs).
     pub s: [u32; 32],
     pub fpscr: u32,
+    /// Which registers an instruction read and wrote, while someone is
+    /// following where values go (see [`crate::provenance`]).
+    pub watch: Watch,
     /// CONTROL.FPCA: the current context has used the FPU, so an
     /// exception stacks its FP state too.
     pub fpca: bool,
 }
+
+/// Which registers the instruction executing has read and written, kept
+/// only while `on`. Not part of the machine's state: two machines that
+/// differ only here are the same machine, which is what the busy-wait
+/// detector's comparison asks.
+#[derive(Clone, Debug, Default)]
+pub struct Watch {
+    pub on: bool,
+    /// Registers read, a bit each; and the last one read.
+    pub reads: std::cell::Cell<u16>,
+    pub last: std::cell::Cell<u8>,
+    /// Registers written, a bit each.
+    pub written: u16,
+}
+
+impl PartialEq for Watch {
+    fn eq(&self, _: &Watch) -> bool {
+        true
+    }
+}
+
+impl Eq for Watch {}
 
 impl Cpu {
     pub fn privileged(&self) -> bool {
@@ -106,6 +131,10 @@ impl Cpu {
 
     /// Register `n` as an operand.
     pub fn reg(&self, n: usize) -> u32 {
+        if self.watch.on {
+            self.watch.reads.set(self.watch.reads.get() | 1 << n);
+            self.watch.last.set(n as u8);
+        }
         match n {
             13 => self.sp(),
             15 => self.pc.wrapping_add(4),
@@ -118,6 +147,9 @@ impl Cpu {
     /// itself and never asks this for one.
     pub fn set_reg(&mut self, n: usize, value: u32) {
         debug_assert!(n != 15, "a pc write is a branch");
+        if self.watch.on {
+            self.watch.written |= 1 << n;
+        }
         if n == 13 {
             self.set_sp(value);
         } else {
