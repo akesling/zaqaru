@@ -43,7 +43,20 @@ const live = await Container.instantiate(module, mounts);
 live.step(0);
 
 const checkpoints = new Checkpoints();
-checkpoints.add(0, live);
+// Where the board stood at each checkpoint, in picoseconds of its time:
+// what a seek in the board's time picks its checkpoint by.
+const boardAt = [];
+const checkpoint = (at) => {
+  checkpoints.add(at, live);
+  let time = null;
+  try {
+    time = live.value("board/digest/memory").time_ps;
+  } catch {
+    // No board yet.
+  }
+  boardAt.push(time);
+};
+checkpoint(0);
 let retired = 0;
 let screen = "";
 const session = edge.open(80, { received: (data) => (screen += text(data)), ended: () => {} });
@@ -76,7 +89,7 @@ async function runUntil(done, limit, midway = null) {
 }
 
 if (!(await runUntil(() => screen.endsWith("$ "), 60000))) throw "no prompt";
-checkpoints.add(retired, live);
+checkpoint(retired);
 console.error(`replay: checkpoint at the prompt, ${retired.toLocaleString()} instructions`);
 for (const line of lines) {
   const mark = screen.length;
@@ -84,7 +97,7 @@ for (const line of lines) {
   const midway = {
     after: 6,
     then: () => {
-      checkpoints.add(retired, live);
+      checkpoint(retired);
       console.error(`replay: checkpoint mid-command, ${retired.toLocaleString()} instructions`);
     },
   };
@@ -142,11 +155,48 @@ for (let index = 0; index < checkpoints.length; index++) {
 // And what a seek by the container's count gives: the first of the board's
 // instants at that count, which is behind the live run's by whatever the
 // board ran while the container idled there. Said, not checked.
-const index = checkpoints.length - 1;
-const viewer = await Container.fromSnapshot(module, checkpoints.snapshot(index));
-viewer.stopAt(at);
-const stood = viewer.value("board");
-console.error(
-  `replay: a seek to ${at.toLocaleString()} container instructions stands the board at ${stood.simulated_ms} ms, the live run read it at ${want.simulated_ms} ms`,
-);
+{
+  const viewer = await Container.fromSnapshot(module, checkpoints.snapshot(checkpoints.length - 1));
+  viewer.stopAt(at);
+  console.error(
+    `replay: a seek to ${at.toLocaleString()} container instructions stands the board at ${viewer.value("board").simulated_ms} ms; the live run read it at ${want.simulated_ms} ms`,
+  );
+}
+
+// A seek in the board's own time does name the instant: for a spread of
+// what the live run read — the last few while the container idled — the
+// board stood at that time, from the checkpoint before it, must be the
+// board the live run read, to the last byte of its memory.
+const samples = [...seen.values()].map((json) => JSON.parse(json)).sort((a, b) => a.memory.time_ps - b.memory.time_ps);
+const picked = [...Array(9).keys()].map((n) => samples[Math.floor((n * (samples.length - 4)) / 8)]).concat(samples.slice(-3));
+let landed = 0;
+for (const want of picked) {
+  const time = want.memory.time_ps;
+  let index = 0;
+  boardAt.forEach((t, n) => {
+    if (t !== null && t < time) index = n;
+  });
+  const began = performance.now();
+  const viewer = await Container.fromSnapshot(module, checkpoints.snapshot(index));
+  viewer.stopAtBoard({ time });
+  const got = { ...viewer.value("board"), memory: viewer.value("board/digest/memory") };
+  const diff = differences(want, got);
+  const seconds = ((performance.now() - began) / 1000).toFixed(1);
+  console.error(`replay: the board stood at ${(time / 1e9).toFixed(6)} ms from checkpoint ${index}: ${diff.length ? `${diff.length} differences` : "the board the live run read"}, ${seconds} s`);
+  for (const d of diff.slice(0, 8)) console.error(`    ${d}`);
+  if (!diff.length) landed++;
+  ok &&= diff.length === 0;
+}
+// And by its instruction count: just after that instruction, exactly.
+{
+  const want = picked[4];
+  const target = want.instructions - 12345;
+  const viewer = await Container.fromSnapshot(module, checkpoints.snapshot(0));
+  viewer.stopAtBoard({ instructions: target });
+  const got = viewer.value("board");
+  const exact = got.instructions === target && got.simulated_ms <= want.simulated_ms;
+  console.error(`replay: the board stood at instruction ${target.toLocaleString()}: ${exact ? "exactly there" : `at ${got.instructions}`}, ${got.simulated_ms} ms`);
+  ok &&= exact;
+}
+console.error(`replay: ${landed} of ${picked.length} board instants landed on exactly`);
 process.exit(ok ? 0 : 1);
