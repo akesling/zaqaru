@@ -114,8 +114,12 @@ function seekBoard(time) {
     return;
   }
   busy = true;
-  worker.postMessage({ type: "seek", at: null, context, board: { time: boardTime } });
+  worker.postMessage({ type: "seek", at: null, context, board: { time: boardTime, follow: followValues } });
 }
+
+/// Whether a stand in the board's time follows where its values go on the
+/// way there: what the values section and its `why`s are made of.
+let followValues = false;
 
 /// Back from an instant of the board's to the live run.
 function backToLive() {
@@ -1240,7 +1244,7 @@ const renderers = {
     if (!panel.body.querySelector(".board > .drawing")) {
       panel.body.innerHTML = `<div class="board"><div class="instant"></div><div class="drawing"></div><div class="status"></div><div class="where"></div><div class="clock"><span class="clock-text"></span> <span class="clock-controls"></span></div><div class="dim clock-tree"></div>
         <div class="timeline"><div class="timeline-head"></div><canvas class="timeline-canvas"></canvas><div class="timeline-readout dim">&nbsp;</div></div>
-        <div class="probes"></div>
+        <div class="values"></div><div class="probes"></div>
         <details class="more"><summary>LEDs, faults, the network, the core's registers</summary><div class="more-body"></div></details></div>`;
       const more = panel.body.querySelector("details.more");
       more.open = moreOpen;
@@ -1265,13 +1269,15 @@ const renderers = {
       [1e9, "+1 ms"],
     ]
       .map(([by, label]) => `<button type="button" data-board-step="${by}">${label}</button>`)
-      .join("");
+      .join("") +
+      `<button type="button" data-follow${followValues ? ' class="on"' : ""} title="stand here again, following where the board's values go on the way: what in memory came in from outside, and why">follow values</button>`;
     fill(
       ".instant",
       boardTime === null
         ? ""
         : `<b>standing at ${bench.fmtTime(value.time_ps / 1000)}</b> of the board's time, every panel as it was then <span class="controls">${steps}<button type="button" data-board-live class="on">back to live</button></span>`,
     );
+    showValues(panel, value);
     fill(".clock-text", clockText);
     fill(".clock-controls", value.speed && boardTime === null ? controls : "");
     fill(".clock-tree", value.speed ? clocks : "");
@@ -1301,6 +1307,15 @@ const renderers = {
       const step = event.target.closest("[data-board-step]");
       if (step) return seekBoard((boardTime ?? value.time_ps) + Number(step.dataset.boardStep));
       if (event.target.closest("[data-board-live]")) return backToLive();
+      if (event.target.closest("[data-follow]")) {
+        followValues = !followValues;
+        return seekBoard(boardTime ?? value.time_ps);
+      }
+      const why = event.target.closest("[data-why]");
+      if (why) {
+        valuesWhy = valuesWhy === why.dataset.why ? null : why.dataset.why;
+        return showValues(panel, value);
+      }
       const layer = event.target.closest("[data-layer]");
       if (layer) {
         timelineLayers[layer.dataset.layer] = !timelineLayers[layer.dataset.layer];
@@ -1746,6 +1761,76 @@ function equipTimeline(panel) {
     const at = hit ? hit.t + 1 : t;
     if (at !== null && at > 0) seekBoard(at * 1000);
   };
+}
+
+// ---- where values came from -------------------------------------------------------
+//
+// Standing at an instant with values followed, the board panel lists what
+// of its memory came in from outside — runs of bytes, where each is, and
+// the read of a peripheral's data register it traces back to — and, for
+// the one asked about, why: each copy back to the byte on the wire, every
+// step's time a handle on that instant.
+
+let valuesKept = { at: null, tagged: null, why: new Map() };
+let valuesWhy = null;
+
+function showValues(panel, value) {
+  const box = panel.body.querySelector(".values");
+  if (!box) return;
+  if (boardTime === null || !followValues) return update(box, "");
+  if (valuesKept.at !== boardTime) {
+    valuesKept = { at: boardTime, tagged: null, why: new Map() };
+    read("board/tagged")
+      .then((tagged) => {
+        if (valuesKept.at === boardTime) valuesKept.tagged = tagged;
+        showValues(panel, boardValue ?? value);
+      })
+      .catch(() => {});
+  }
+  if (valuesWhy && !valuesKept.why.has(valuesWhy)) {
+    const asked = valuesWhy;
+    valuesKept.why.set(asked, null);
+    read(`board/why/${asked}`)
+      .then((why) => {
+        valuesKept.why.set(asked, why);
+        showValues(panel, boardValue ?? value);
+      })
+      .catch(() => {});
+  }
+  const tagged = valuesKept.tagged;
+  if (!tagged) return update(box, `<div class="dim">following where values go, on the way here…</div>`);
+  if (!tagged.following) return update(box, `<div class="dim">not following: no board at the checkpoint this was stood from</div>`);
+  const rows = tagged.shown
+    .map((run) => {
+      const origin = run.origin ? `← ${escape(run.origin.register)} 0x${run.origin.value.toString(16)} at ${bench.stamp(run.origin.t)}` : "";
+      const open = valuesWhy === String(run.addr);
+      const chain = open ? whyHtml(valuesKept.why.get(String(run.addr))) : "";
+      return `<div class="run${open ? " open" : ""}"><button type="button" data-why="${run.addr}">${open ? "hide" : "why"}</button> <code>${run.hex}</code>${run.length > 16 ? "…" : ""} ${escape(run.where)} <span class="dim">${origin}</span>${chain}</div>`;
+    })
+    .join("");
+  update(
+    box,
+    `<div class="values-head"><b>values from outside</b> <span class="dim">— ${tagged.runs} run${tagged.runs === 1 ? "" : "s"} of memory hold what came in through a peripheral since ${bench.fmtTime(tagged.since_ns)}</span></div>${rows || `<div class="dim">nothing from outside is in memory now</div>`}`,
+  );
+}
+
+/// A `why` as a chain: newest first, each step a handle on its instant.
+function whyHtml(why) {
+  if (!why) return `<div class="why dim">asking…</div>`;
+  const steps = (list) =>
+    list
+      .map((step) => {
+        const what =
+          step.what === "store"
+            ? `stored <code>0x${step.value.toString(16)}</code> at ${escape(step.where)}`
+            : step.what === "read"
+              ? `read <code>0x${step.value.toString(16)}</code> from <b>${escape(step.register)}</b>${step.record ? ` — the byte on the wire at ${bench.stamp(step.record.t)}` : ""}`
+              : "merged with";
+        const other = step.other?.length ? `<div class="why-other">${steps(step.other)}</div>` : "";
+        return `<div class="why-step">${bench.stamp(step.t)} ${what} <span class="dim">by ${escape(step.code)}</span>${other}</div>`;
+      })
+      .join("");
+  return `<div class="why">${steps(why.steps) || `<div class="dim">came from nowhere followed</div>`}</div>`;
 }
 
 /// The probes' cards, one for each probe, kept from read to read: a card's

@@ -122,6 +122,35 @@ probes read (channels `TASK`, `SYS`, `EXC` and `BOARD` of
 left them; an exception's number; and, on each return to a task, which
 task, by the stacks the board's archive says the tasks have.
 
+## Where a value came from
+
+Stood at an instant, **follow values** stands there again with the board
+re-executed from two seconds of its time before, a tag on every register
+and every byte of memory saying what put it there. The board panel then
+lists what of memory came in from outside — through a peripheral's data
+register — and where each run of it is; **why** gives a run's history,
+each copy back to the byte on the wire. After `humility i2c -c 2 -p F -d
+0x48 -r 0 -n 2`:
+
+```
+19.752138 s  stored 0x80 at hiffy .bss: task_hiffy::HIFFY_SCRATCH + 0x1   by kernel: compiler_builtins::mem::memcpy + 0xec
+19.752136 s  stored 0x80 at i2c_driver stack                              by i2c_driver: main + 0x80e
+19.752136 s  read 0x80 from I2C2 RXDR — the byte on the wire at 19.752132 s  by i2c_driver: main + 0x7ec
+```
+
+— the I2C driver task reading RXDR; Hubris's kernel copying the byte into
+hiffy's lease, an IPC copy followed as the loads and stores it is; hiffy's
+result stack, which Humility reads through the probe. Every time is a
+handle: a click stands the board there.
+
+Tags follow values: an instruction's result takes the tag of what it
+loaded, or of the registers it read, so a byte shifted and merged with
+another is still both of theirs; an exception's frame carries its
+registers' tags. Not followed: control flow, the FPU's registers, and
+DMA. The store's `board/provenance` turns it on in a container a seek
+re-executes — never the live one, which pays nothing for it — and
+`board/tagged` and `board/why/{address}` answer from it.
+
 ## What the memory is
 
 The board knows its Hubris archive (`archive` in its configuration, and

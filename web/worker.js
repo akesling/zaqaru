@@ -30,8 +30,9 @@
 //               { type: "advance", by }                 live: run the frontier on by `by`, and report
 //               { type: "run" } / { type: "pause" }      live: run the frontier on until paused
 //               { type: "checkpointing", every, budget } live: how far apart checkpoints are
-//               { type: "seek", at, context, board }    context: { pid, tid, path }; board: { time },
-//                                                       picoseconds of the board's own time, in place of `at`
+//               { type: "seek", at, context, board }    context: { pid, tid, path }; board: { time, follow },
+//                                                       picoseconds of the board's own time, in place of `at`;
+//                                                       `follow`: where its values go followed on the way
 //               { type: "read", id, path }              one path, at the instant in view
 //               { type: "request", id, port, request }  live: through the edge
 //               { type: "open", id, port }               live: a connection that stays open
@@ -464,13 +465,28 @@ async function stand(at, board = null) {
 /// there, run on until it does. A count of the container's instructions
 /// doesn't name such an instant — an idle container retires none while its
 /// board runs on — so it is a seek of its own.
-async function standBoard({ time }) {
+///
+/// With `follow`, where values go is followed on the way (`board/provenance`),
+/// from a checkpoint far enough back — `FOLLOW_BACK` of the board's time —
+/// that what arrived shortly before the instant is caught too, and never
+/// one from before there was a board to follow.
+const FOLLOW_BACK = 2e12;
+async function standBoard({ time, follow = false }) {
   const began = performance.now();
-  let index = 0;
-  checkpoints.entries.forEach((entry, n) => {
-    if (entry.board !== null && entry.board !== undefined && entry.board < time) index = n;
-  });
+  const from = follow ? time - FOLLOW_BACK : time;
+  const boarded = (entry) => entry.board !== null && entry.board !== undefined;
+  // The last checkpoint before `from`; following, failing that, the first
+  // with a board at all.
+  let index = checkpoints.entries.findLastIndex((entry) => boarded(entry) && entry.board < from);
+  if (index < 0) index = follow ? Math.max(0, checkpoints.entries.findIndex((entry) => boarded(entry) && entry.board < time)) : 0;
   viewer = await Container.fromSnapshot(module, checkpoints.snapshot(index));
+  if (follow) {
+    try {
+      viewer.put("board/provenance", "on");
+    } catch {
+      // No board at that checkpoint: nothing to follow.
+    }
+  }
   viewer.stopAtBoard({ time }, live ? frontier : -1);
   return performance.now() - began;
 }
