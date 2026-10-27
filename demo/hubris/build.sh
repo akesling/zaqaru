@@ -122,7 +122,19 @@ mv "$work/hubris.wasm" "$out/hubris.wasm"
 rm -f "$work/bench.tar"
 
 # And that what was written answers: Humility, through the kernel's probe,
-# listing Hubris's tasks.
+# listing Hubris's tasks; that the board replays — a checkpoint restored
+# and run again finds the board the live run had, to the last byte of its
+# memory, which seeking and standing the board at an instant stand on; and
+# that a bench left alone keeps running.
+echo "build: checking the module"
 node "$here/check.mjs" "$out/hubris.wasm" >/dev/null
+node "$here/replay.mjs" "$out/hubris.wasm" >/dev/null 2>&1 || {
+  echo "build: the board does not replay: node $here/replay.mjs $out/hubris.wasm" >&2
+  exit 1
+}
+node "$here/idle.mjs" "$out/hubris.wasm" 300000 >/dev/null 2>&1 || {
+  echo "build: the bench does not survive being left alone: node $here/idle.mjs $out/hubris.wasm" >&2
+  exit 1
+}
 echo "bench in $out/hubris.wasm"
 echo "serve the repository and open web/?module=$(basename "$out")/hubris.wasm&live=80&terminal=80"
