@@ -164,20 +164,18 @@ export function age(us) {
   return `${+(us / 1e6).toFixed(2)} s`;
 }
 
-/// `[base, base + length)` grown to the power-of-two block, aligned to
-/// its size, that holds it — one Hilbert square, or two, in which an
-/// aligned region inside is a block too — so long as that is at most
-/// four times as much and stays within the RAM `within`; otherwise to a
-/// power of two from `base`, or as it is.
+/// The aligned block of memory `[base, base + length)` rounds out to: the
+/// smallest power-of-two block, aligned to its size, that holds it — one
+/// Hilbert square, or two, in a RAM's picture — so long as that stays
+/// within the RAM `within`; or, failing that, the run as it is.
 export function rounded(base, length, within = null) {
   const fits = (b, n) => !within || (b >= within.base && b + n <= within.base + within.length);
   let n = 4;
   while (n < length) n *= 2;
-  for (let grown = n; grown <= 4 * n; grown *= 2) {
-    const aligned = base - (base % grown);
-    if (aligned + grown >= base + length && fits(aligned, grown)) return { base: aligned, length: grown };
+  for (; n <= 2 ** 31; n *= 2) {
+    const aligned = base - (base % n);
+    if (aligned + n >= base + length) return fits(aligned, n) ? { base: aligned, length: n } : { base, length };
   }
-  if (fits(base, n)) return { base, length: n };
   return { base, length };
 }
 
@@ -206,7 +204,7 @@ const HALVES = [
 const SCALE = 3; // pixels a cell
 const POLL_MS = 200;
 const TASKS_MS = 1000;
-const ZOOM_CELLS = 16384; // the most cells a zoomed picture has
+const ZOOM_CELLS = 65536; // the most cells a zoomed picture is drawn with
 const SERVED = 4096; // bytes a read of memory answers with
 const INSPECTED = 65536; // the most of an owner's statics the inspector reads
 const BACKGROUND = [22, 25, 30];
@@ -227,7 +225,8 @@ export class MemoryView {
     this.focus = null; // an address the inspector shows
     this.sort = "address";
     this.open = new Set(); // the statics shown whole
-    this.zooms = []; // the way down: each { base, length, cell, name }
+    this.zooms = []; // the way down: each a rectangle of a RAM's picture, and what it reads
+    this.layouts = new Map(); // pictures' layouts, by RAM length and cell
     this.reset();
     this.image = null;
     this.owners = [];
@@ -293,11 +292,12 @@ export class MemoryView {
     } else this.poll(false);
   }
 
-  /// A picture of `[base, base + length)` at `cell` bytes a cell, from a
-  /// first `board/writes` answer's RAM.
-  picture(ram, cell) {
-    const view = layout(ram.length, cell);
-    return { ...ram, cell, view, stamps: new Uint32Array(view.cells), ...cellOwners(ram.base, view, this.owners), statics: null };
+  /// A picture of a RAM — `board/writes`'s — at `cell` bytes a cell,
+  /// showing `rect` of its grid, all of it if none.
+  picture(ram, cell, rect = null) {
+    const view = this.layoutOf(ram, cell);
+    rect ??= { x: 0, y: 0, w: view.width, h: view.height };
+    return { ...ram, cell, view, rect, stamps: new Uint32Array(view.cells), ...cellOwners(ram.base, view, this.owners), statics: null };
   }
 
   async poll(force) {
@@ -324,13 +324,14 @@ export class MemoryView {
       const cells = answer.cells;
       for (let i = 0; i < cells.length; i += 3) this.rams[cells[i]].stamps[cells[i + 1]] = cells[i + 2];
       // The zoom may have changed while this was read: only the one asked
-      // for is kept.
-      if (detail?.rams && zoom === this.zooms.at(-1)) {
+      // for is kept. Its cells are numbered from the start of what was
+      // read, which is cell `first` of the RAM's.
+      if (detail?.cells && zoom === this.zooms.at(-1)) {
         if (!this.detail) {
-          this.detail = this.picture({ ...detail.rams[0], name: zoom.name }, detail.cell);
+          this.detail = this.picture(this.rams[zoom.ram], zoom.cell, zoom.rect);
           this.nameStatics(this.detail);
         }
-        for (let i = 0; i < detail.cells.length; i += 3) this.detail.stamps[detail.cells[i + 1]] = detail.cells[i + 2];
+        for (let i = 0; i < detail.cells.length; i += 3) this.detail.stamps[zoom.first + detail.cells[i + 1]] = detail.cells[i + 2];
       }
       this.now = answer.now;
       this.draw();
@@ -351,7 +352,8 @@ export class MemoryView {
   /// statics of the owners it shows are known: their outlines and names,
   /// drawn on it.
   async nameStatics(picture) {
-    const shown = new Set([...picture.owner].filter((n) => n >= 0));
+    const shown = new Set();
+    this.eachCell(picture, (c) => picture.owner[c] >= 0 && shown.add(picture.owner[c]));
     const all = [];
     for (const n of shown) {
       const owner = this.owners[n];
@@ -381,6 +383,17 @@ export class MemoryView {
     picture.names = all.map((s) => shortName(s.name));
     picture.fullNames = all.map((s) => s.name);
     if (picture === this.detail) this.drawMaps();
+  }
+
+  /// `f(cell, x, y)` for each cell in a picture's rectangle, `x` and `y`
+  /// from its corner.
+  eachCell(picture, f) {
+    const { view, rect } = picture;
+    for (let y = 0; y < rect.h; y++)
+      for (let x = 0; x < rect.w; x++) {
+        const c = view.at[(rect.y + y) * view.width + rect.x + x];
+        if (c >= 0) f(c, x, y);
+      }
   }
 
   /// The last write to anything in `[base, end)` that the picture knows
@@ -416,23 +429,22 @@ export class MemoryView {
     const crumbs = [`<a data-crumb="0"${this.zooms.length ? "" : ' class="here"'}>all RAM</a>`];
     this.zooms.forEach((zoom, n) => {
       const here = n === this.zooms.length - 1;
-      crumbs.push(`<a data-crumb="${n + 1}"${here ? ' class="here"' : ""} title="${this.escape(zoom.name)}">${this.escape(zoom.name)} <span class="dim">0x${zoom.base.toString(16)}–0x${(zoom.base + zoom.length).toString(16)} · ${size(zoom.length)}${here ? ` · ${zoom.cell} B a cell` : ""}</span></a>`);
+      crumbs.push(`<a data-crumb="${n + 1}"${here ? ' class="here"' : ""} title="${this.escape(zoom.name)}">${this.escape(zoom.name)} <span class="dim">0x${zoom.base.toString(16)}–0x${(zoom.base + zoom.length).toString(16)}${here ? ` · ${zoom.cell} B a cell` : ""}</span></a>`);
     });
-    set(this.element.querySelector(".mem-crumbs"), `${crumbs.join(`<span class="sep">›</span>`)} <span class="dim hint">${this.zooms.length ? "drag a box to zoom further; a crumb goes back" : "drag a box over a picture to zoom in on it"}</span>`);
+    // From a box to the whole of the memory it is part of.
+    const zoom = this.zooms.at(-1);
+    const block = zoom?.block
+      ? ` <span class="controls"><button type="button" data-block title="the box shows only some of the memory from its first cell to its last: zoom out to the aligned block that run rounds out to, all of it">⤢ whole block 0x${zoom.block.base.toString(16)}–0x${(zoom.block.base + zoom.block.length).toString(16)} · ${size(zoom.block.length)}</button></span>`
+      : "";
+    const hint = this.zooms.length ? "drag a box to zoom further (Shift: its aligned block); a crumb goes back" : "drag a box to zoom in on it (Shift: the aligned block its memory rounds out to); a click shows what is there";
+    set(this.element.querySelector(".mem-crumbs"), `${crumbs.join(`<span class="sep">›</span>`)}${block} <span class="dim hint">${hint}</span>`);
   }
 
-  /// Zoom in on `[base, base + length)` of `ram` — or back out to the
-  /// `depth`th crumb.
+  /// Back out to the `depth`th crumb, and then in on `into`, if given: a
+  /// rectangle of a RAM's picture, as finely as it can be drawn.
   zoom(depth, into = null) {
     this.zooms.length = depth;
-    if (into) {
-      const { base, length } = rounded(into.base, into.length, into.within);
-      let cell = 4;
-      while (length / cell > ZOOM_CELLS) cell *= 2;
-      const parent = this.zooms.at(-1)?.name.split(" · ")[0] ?? into.name;
-      const owners = [...new Set(this.owners.filter((o) => o.ranges.some((r) => r.base < base + length && r.end > base)).map((o) => o.name))];
-      this.zooms.push({ base, length, cell, name: `${parent}${owners.length && owners.length <= 3 ? ` · ${owners.join(", ")}` : ""}` });
-    }
+    if (into) this.zooms.push(into);
     this.detail = null;
     this.drawCrumbs();
     this.element.querySelector(".mem-maps").replaceChildren();
@@ -441,7 +453,7 @@ export class MemoryView {
     this.poll(true);
   }
 
-  /// The pictures shown: the RAMs, or the zoomed part of one.
+  /// The pictures shown: the RAMs, or the part of one zoomed in on.
   shown() {
     if (this.zooms.length) return this.detail ? [this.detail] : [];
     return this.rams ?? [];
@@ -455,15 +467,15 @@ export class MemoryView {
     if (box.childElementCount !== pictures.length || box.zoomed !== zoomed) {
       box.zoomed = zoomed;
       box.innerHTML = pictures
-        .map((p, n) => `<figure class="mem-ram"><figcaption>${zoomed ? "" : `<b>${this.escape(p.name)}</b> `}<span class="dim">${size(p.length)} · 0x${p.base.toString(16).padStart(8, "0")}</span></figcaption><div class="mem-frame"><canvas data-picture="${n}"></canvas><div class="mem-drag"></div></div></figure>`)
+        .map((p, n) => `<figure class="mem-ram"><figcaption>${zoomed ? "" : `<b>${this.escape(p.name)}</b> <span class="dim">${size(p.length)} · 0x${p.base.toString(16).padStart(8, "0")}</span>`}</figcaption><div class="mem-frame"><canvas data-picture="${n}"></canvas><div class="mem-run"></div><div class="mem-drag"></div></div></figure>`)
         .join("");
       for (const canvas of box.querySelectorAll("canvas")) this.equip(canvas);
     }
-    // A zoomed picture as large as the panel lets it be.
+    // A zoomed rectangle as large as the panel lets it be, its shape kept.
     const fit = (p) => {
       if (!zoomed) return SCALE;
-      const wide = Math.min(1100, (box.clientWidth || 900) - 4);
-      return Math.max(1, Math.floor(Math.min(wide / p.view.width, 560 / p.view.height)));
+      const wide = Math.min(1200, (box.clientWidth || 900) - 4);
+      return Math.max(1, Math.min(wide / p.rect.w, 600 / p.rect.h));
     };
     pictures.forEach((p, n) => this.paint(box.querySelector(`canvas[data-picture="${n}"]`), p, fit(p)));
   }
@@ -471,14 +483,16 @@ export class MemoryView {
   paint(canvas, picture, scale) {
     const chosen = this.owners.findIndex((o) => o.name === this.selected);
     const colors = this.owners.map((o) => rgbOf(o.color));
-    const { view } = picture;
-    canvas.scale = scale;
-    const w = view.width * scale;
-    const h = view.height * scale;
+    const { view, rect } = picture;
+    // Whole pixels a cell, at least one; the canvas stretched to the rest.
+    const s = Math.max(1, Math.floor(scale));
+    const w = rect.w * s;
+    const h = rect.h * s;
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
       canvas.height = h;
     }
+    canvas.style.width = `${Math.round(rect.w * scale)}px`;
     const g = canvas.getContext("2d");
     const image = g.createImageData(w, h);
     const px = image.data;
@@ -490,7 +504,17 @@ export class MemoryView {
       px[i + 3] = 255;
     };
     const statics = picture.statics;
-    for (let c = 0; c < view.cells; c++) {
+    const at = (x, y) => (x < 0 || y < 0 || x >= rect.w || y >= rect.h ? -1 : view.at[(rect.y + y) * view.width + rect.x + x]);
+    // Where one owner's memory meets another's, a line; where one static
+    // meets another, a fainter one.
+    const edge = (a, b) => {
+      if (b < 0) return null;
+      if (picture.owner[a] !== picture.owner[b]) return [0, 0, 0];
+      if (statics && statics[a] !== statics[b]) return [90, 96, 108];
+      return null;
+    };
+    const lines = s >= 3;
+    this.eachCell(picture, (c, x, y) => {
       const owner = picture.owner[c];
       const stamp = picture.stamps[c];
       let rgb = BACKGROUND;
@@ -502,56 +526,45 @@ export class MemoryView {
         if (hh > 0.02) rgb = mix(rgb, hot(hh), Math.min(1, 0.25 + hh));
       }
       if (chosen >= 0 && owner !== chosen) rgb = mix(BACKGROUND, rgb, 0.35);
-      const x0 = view.place[2 * c] * scale;
-      const y0 = view.place[2 * c + 1] * scale;
       const marked = this.mark !== null && stamp > this.mark;
-      for (let dy = 0; dy < scale; dy++)
-        for (let dx = 0; dx < scale; dx++) put(x0 + dx, y0 + dy, marked && (dx === 0 || dy === 0) ? [80, 220, 255] : rgb);
-    }
-    // Where one owner's memory meets another's, a line; where one static
-    // meets another, a fainter one.
-    const edge = (a, b) => {
-      if (picture.owner[a] !== picture.owner[b]) return [0, 0, 0];
-      if (statics && statics[a] !== statics[b]) return [90, 96, 108];
-      return null;
-    };
-    for (let y = 0; y < view.height; y++)
-      for (let x = 0; x < view.width; x++) {
-        const c = view.at[y * view.width + x];
-        if (c < 0) continue;
-        const right = x + 1 < view.width ? view.at[y * view.width + x + 1] : -1;
-        const below = y + 1 < view.height ? view.at[(y + 1) * view.width + x] : -1;
-        const r = right >= 0 && edge(c, right);
-        if (r) for (let d = 0; d < scale; d++) put(x * scale + scale - 1, y * scale + d, r);
-        const b = below >= 0 && edge(c, below);
-        if (b) for (let d = 0; d < scale; d++) put(x * scale + d, y * scale + scale - 1, b);
-      }
+      const right = edge(c, at(x + 1, y));
+      const below = edge(c, at(x, y + 1));
+      for (let dy = 0; dy < s; dy++)
+        for (let dx = 0; dx < s; dx++) {
+          let colour = rgb;
+          if (marked && (dx === 0 || dy === 0)) colour = [80, 220, 255];
+          else if (right && dx === s - 1 && (lines || right[0] === 0)) colour = right;
+          else if (below && dy === s - 1 && (lines || below[0] === 0)) colour = below;
+          put(x * s + dx, y * s + dy, colour);
+        }
+    });
     g.putImageData(image, 0, 0);
     // Names where most of what they name is: each owner's, and zoomed in
-    // far enough, each static's.
+    // far enough, each static's — in the canvas's pixels, which the page
+    // may stretch by `scale / s`.
     const label = (of, names, least, font) => {
       const sums = new Map();
-      for (let c = 0; c < view.cells; c++) {
+      this.eachCell(picture, (c, x, y) => {
         const n = of[c];
-        if (n < 0) continue;
-        const s = sums.get(n) ?? { x: 0, y: 0, n: 0 };
-        s.x += view.place[2 * c];
-        s.y += view.place[2 * c + 1];
-        s.n++;
-        sums.set(n, s);
-      }
+        if (n < 0) return;
+        const sum = sums.get(n) ?? { x: 0, y: 0, n: 0 };
+        sum.x += x;
+        sum.y += y;
+        sum.n++;
+        sums.set(n, sum);
+      });
       g.font = font;
       g.textAlign = "center";
       g.textBaseline = "middle";
       g.lineWidth = 3;
       g.strokeStyle = "#000c";
       g.fillStyle = "#fff";
-      for (const [n, s] of sums) {
+      for (const [n, sum] of sums) {
         const name = names[n];
-        const area = s.n * scale * scale;
+        const area = sum.n * s * s;
         if (area < least || g.measureText(name).width > Math.sqrt(area) * 2.2) continue;
-        const x = (s.x / s.n + 0.5) * scale;
-        const y = (s.y / s.n + 0.5) * scale;
+        const x = (sum.x / sum.n + 0.5) * s;
+        const y = (sum.y / sum.n + 0.5) * s;
         g.strokeText(name, x, y);
         g.fillText(name, x, y);
       }
@@ -560,30 +573,35 @@ export class MemoryView {
     label(picture.owner, this.owners.map((o) => o.name), 900, statics ? "bold 12px ui-monospace, monospace" : "10px ui-monospace, monospace");
   }
 
-  /// The cell of a picture at a point of the page, or the nearest one in
-  /// it with `clamp`.
+  /// Where a point of the page is in a picture's grid — the whole grid's
+  /// coordinates — and the cell there, if any; the nearest place in the
+  /// rectangle with `clamp`.
   cellAt(canvas, x, y, clamp = false) {
     const picture = this.shown()[Number(canvas.dataset.picture)];
     if (!picture) return null;
+    const { rect, view } = picture;
     const box = canvas.getBoundingClientRect();
-    let gx = Math.floor(((x - box.left) / box.width) * picture.view.width);
-    let gy = Math.floor(((y - box.top) / box.height) * picture.view.height);
+    let gx = Math.floor(((x - box.left) / box.width) * rect.w);
+    let gy = Math.floor(((y - box.top) / box.height) * rect.h);
     if (clamp) {
-      gx = Math.max(0, Math.min(picture.view.width - 1, gx));
-      gy = Math.max(0, Math.min(picture.view.height - 1, gy));
+      gx = Math.max(0, Math.min(rect.w - 1, gx));
+      gy = Math.max(0, Math.min(rect.h - 1, gy));
     }
-    if (gx < 0 || gy < 0 || gx >= picture.view.width || gy >= picture.view.height) return null;
-    const c = picture.view.at[gy * picture.view.width + gx];
-    return c < 0 ? null : { picture, c, gx, gy, address: picture.base + c * picture.cell };
+    if (gx < 0 || gy < 0 || gx >= rect.w || gy >= rect.h) return null;
+    gx += rect.x;
+    gy += rect.y;
+    const c = view.at[gy * view.width + gx];
+    return { picture, c, gx, gy, address: c < 0 ? null : picture.base + c * picture.cell };
   }
 
   equip(canvas) {
     const readout = () => this.element.querySelector(".mem-readout");
     const drag = canvas.parentElement.querySelector(".mem-drag");
+    const run = canvas.parentElement.querySelector(".mem-run");
     canvas.onmousemove = (event) => {
       if (this.dragging) return;
       const hit = this.cellAt(canvas, event.clientX, event.clientY);
-      if (!hit) return (readout().textContent = " ");
+      if (!hit || hit.c < 0) return (readout().textContent = "\u00a0");
       const { picture, c, address } = hit;
       const owner = this.owners[picture.owner[c]];
       const stamp = picture.stamps[c];
@@ -592,9 +610,9 @@ export class MemoryView {
       const inside = picture.statics && picture.statics[c] >= 0 ? picture.fullNames[picture.statics[c]] : null;
       readout().textContent = `0x${address.toString(16).padStart(8, "0")}–0x${(address + picture.cell - 1).toString(16)} · ${what ?? inside ?? (owner ? owner.name : picture.name)} · ${written}`;
     };
-    canvas.onmouseleave = () => this.dragging || (readout().textContent = " ");
+    canvas.onmouseleave = () => this.dragging || (readout().textContent = "\u00a0");
     // A press and a release in place is a click: what is there, to the
-    // inspector. Dragged, a box: the part of memory in it, zoomed in on.
+    // inspector. Dragged, a box: just that rectangle, zoomed in on.
     canvas.onmousedown = (event) => {
       if (event.button !== 0) return;
       event.preventDefault();
@@ -608,56 +626,156 @@ export class MemoryView {
         const y1 = Math.min(frame.bottom, Math.max(start.y, e.clientY));
         return { x0, x1, y0, y1 };
       };
-      const moved = (e) => {
-        const b = box(e);
-        Object.assign(drag.style, { display: "block", left: `${b.x0 - frame.left}px`, top: `${b.y0 - frame.top}px`, width: `${b.x1 - b.x0}px`, height: `${b.y1 - b.y0}px` });
-        readout().textContent = `${this.boxed(canvas, b)?.text ?? "nothing there"} — let go to zoom in`;
+      // What a release would zoom on: the box, or with Shift held, the
+      // aligned block its memory rounds out to, the box snapped to it. The
+      // block is outlined, dashed, either way: where Shift would take it.
+      let last = null;
+      const place = (element, at) => {
+        if (!at) return (element.style.display = "none");
+        Object.assign(element.style, { display: "block", left: `${at.left}px`, top: `${at.top}px`, width: `${at.width}px`, height: `${at.height}px` });
       };
+      const show = (e) => {
+        const b = box(e);
+        const boxed = this.boxed(canvas, b);
+        const block = boxed && this.blockZoom(boxed);
+        const snapped = !!(e.shiftKey && block);
+        last = { clientX: e.clientX, clientY: e.clientY };
+        drag.classList.toggle("snapped", snapped);
+        place(drag, snapped ? this.onCanvas(canvas, block.rect, block.cell) : { left: b.x0 - frame.left, top: b.y0 - frame.top, width: b.x1 - b.x0, height: b.y1 - b.y0 });
+        place(run, block ? this.onCanvas(canvas, block.rect, block.cell) : null);
+        if (!boxed) return (readout().textContent = "nothing there");
+        const rounded = block ? `0x${block.base.toString(16)}–0x${(block.base + block.length).toString(16)}, ${size(block.length)}` : "";
+        readout().textContent = snapped
+          ? `the aligned block ${rounded} — let go to zoom on it; let go of Shift for just the box`
+          : `${boxed.text} — let go to zoom on the box${block ? `; hold Shift for the aligned block it rounds out to, ${rounded} (dashed)` : ""}`;
+      };
+      const moved = (e) => show(e);
+      const keyed = (e) => e.key === "Shift" && last && show({ ...last, shiftKey: e.type === "keydown" });
       const released = (e) => {
         window.removeEventListener("mousemove", moved);
         window.removeEventListener("mouseup", released);
+        window.removeEventListener("keydown", keyed);
+        window.removeEventListener("keyup", keyed);
         this.dragging = false;
         drag.style.display = "none";
+        run.style.display = "none";
+        drag.classList.remove("snapped");
         readout().textContent = "\u00a0";
         const far = Math.abs(e.clientX - start.x) > 4 || Math.abs(e.clientY - start.y) > 4;
         if (!far) return this.pick(canvas, e);
         const boxed = this.boxed(canvas, box(e));
-        if (boxed && boxed.length > 4) this.zoom(this.zooms.length, boxed);
+        const block = e.shiftKey && boxed && this.blockZoom(boxed);
+        if (block || boxed) this.zoom(this.zooms.length, block || boxed);
       };
       window.addEventListener("mousemove", moved);
       window.addEventListener("mouseup", released);
+      window.addEventListener("keydown", keyed);
+      window.addEventListener("keyup", keyed);
     };
   }
 
-  /// The part of memory a box on a picture takes in: from its first cell
-  /// to its last. On a Hilbert curve a box's cells are, mostly, a run.
+  /// A box on a picture as a zoom: the same rectangle of the RAM's
+  /// picture.
   boxed(canvas, { x0, x1, y0, y1 }) {
-    const picture = this.shown()[Number(canvas.dataset.picture)];
-    if (!picture) return null;
-    const frame = canvas.getBoundingClientRect();
-    const { width, height } = picture.view;
-    const grid = (v, from, extent, n) => Math.max(0, Math.min(n - 1, Math.floor(((v - from) / extent) * n)));
-    const [gx0, gx1] = [grid(x0, frame.left, frame.width, width), grid(x1 - 1, frame.left, frame.width, width)];
-    const [gy0, gy1] = [grid(y0, frame.top, frame.height, height), grid(y1 - 1, frame.top, frame.height, height)];
+    const a = this.cellAt(canvas, x0, y0, true);
+    const b = this.cellAt(canvas, x1 - 1, y1 - 1, true);
+    if (!a || !b) return null;
+    const ram = this.rams.findIndex((r) => r.base === a.picture.base);
+    const rect = { x: Math.min(a.gx, b.gx), y: Math.min(a.gy, b.gy), w: Math.abs(b.gx - a.gx) + 1, h: Math.abs(b.gy - a.gy) + 1 };
+    return this.zoomFor(ram, rect, a.picture.cell);
+  }
+
+  /// A RAM's layout at `cell` bytes a cell.
+  layoutOf(ram, cell) {
+    const key = `${ram.length}/${cell}`;
+    if (!this.layouts.has(key)) this.layouts.set(key, layout(ram.length, cell));
+    return this.layouts.get(key);
+  }
+
+  /// A zoom on `rect` of the `ram`th RAM's picture at `cell` bytes a cell:
+  /// drawn as finely as it can be with no more than [`ZOOM_CELLS`] — a
+  /// cell of `n` bytes is a square of four of `n / 4`, in its place, down
+  /// to a word a cell — with the run of memory its cells take in, to
+  /// read, and the aligned block that run rounds out to.
+  zoomFor(ram, rect, cell) {
+    const picture = this.rams?.[ram];
+    if (!picture || rect.w < 1 || rect.h < 1) return null;
+    while (cell > 4 && rect.w * rect.h * 4 <= ZOOM_CELLS) {
+      cell /= 4;
+      rect = { x: rect.x * 2, y: rect.y * 2, w: rect.w * 2, h: rect.h * 2 };
+    }
+    while (rect.w * rect.h > ZOOM_CELLS && cell < CELL) {
+      cell *= 4;
+      const x = Math.floor(rect.x / 2);
+      const y = Math.floor(rect.y / 2);
+      rect = { x, y, w: Math.ceil((rect.x + rect.w) / 2) - x, h: Math.ceil((rect.y + rect.h) / 2) - y };
+    }
+    const view = this.layoutOf(picture, cell);
     let first = Infinity;
     let last = -1;
-    for (let gy = gy0; gy <= gy1; gy++)
-      for (let gx = gx0; gx <= gx1; gx++) {
-        const c = picture.view.at[gy * picture.view.width + gx];
+    for (let y = rect.y; y < rect.y + rect.h; y++)
+      for (let x = rect.x; x < rect.x + rect.w; x++) {
+        const c = view.at[y * view.width + x];
         if (c < 0) continue;
         first = Math.min(first, c);
         last = Math.max(last, c);
       }
     if (last < 0) return null;
-    const base = picture.base + first * picture.cell;
-    const length = (last - first + 1) * picture.cell;
-    const within = this.rams?.find((ram) => base >= ram.base && base < ram.base + ram.length);
-    return { base, length, within, name: picture.name, text: `0x${base.toString(16)}–0x${(base + length).toString(16)} · ${size(length)}` };
+    const base = picture.base + first * cell;
+    const length = (last - first + 1) * cell;
+    const owners = [...new Set(this.owners.filter((o) => o.ranges.some((r) => r.base < base + length && r.end > base)).map((o) => o.name))];
+    const name = `${picture.name}${owners.length && owners.length <= 3 ? ` · ${owners.join(", ")}` : ""}`;
+    const block = rounded(base, length, picture);
+    // The box is its block already when it takes in the whole of it.
+    const whole = block.length === length && block.base === base && (last - first + 1) === countIn(view, rect);
+    return { ram, cell, rect, first, base, length, name, block: whole ? null : block, text: `${rect.w}×${rect.h} cells of ${cell} B, within 0x${base.toString(16)}–0x${(base + length).toString(16)}` };
+  }
+
+  /// The zoom on the aligned block a zoom's run rounds out to: the
+  /// rectangle around its cells.
+  blockZoom(zoom) {
+    const picture = this.rams?.[zoom.ram];
+    if (!picture || !zoom.block) return null;
+    const view = this.layoutOf(picture, 4);
+    const from = (zoom.block.base - picture.base) / 4;
+    const to = from + zoom.block.length / 4;
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -1;
+    let y1 = -1;
+    for (let c = from; c < to; c++) {
+      const x = view.place[2 * c];
+      const y = view.place[2 * c + 1];
+      x0 = Math.min(x0, x);
+      y0 = Math.min(y0, y);
+      x1 = Math.max(x1, x);
+      y1 = Math.max(y1, y);
+    }
+    return this.zoomFor(zoom.ram, { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 }, 4);
+  }
+
+  /// Where `rect`, of a RAM's picture at `cell` bytes a cell, is on
+  /// `canvas`, in its pixels from its corner: a rectangle drawn at one
+  /// grain stands where it would at another, a cell's side halving as its
+  /// bytes quarter.
+  onCanvas(canvas, rect, cell) {
+    const picture = this.shown()[Number(canvas.dataset.picture)];
+    if (!picture) return null;
+    const f = Math.sqrt(cell / picture.cell);
+    const box = canvas.getBoundingClientRect();
+    const px = box.width / picture.rect.w;
+    const py = box.height / picture.rect.h;
+    const left = Math.max(0, (rect.x * f - picture.rect.x) * px);
+    const top = Math.max(0, (rect.y * f - picture.rect.y) * py);
+    const right = Math.min(box.width, ((rect.x + rect.w) * f - picture.rect.x) * px);
+    const bottom = Math.min(box.height, ((rect.y + rect.h) * f - picture.rect.y) * py);
+    if (right <= left || bottom <= top) return null;
+    return { left, top, width: right - left, height: bottom - top };
   }
 
   pick(canvas, event) {
     const hit = this.cellAt(canvas, event.clientX, event.clientY);
-    if (!hit) return;
+    if (!hit || hit.c < 0) return;
     const owner = this.owners[hit.picture.owner[hit.c]];
     this.selected = owner?.name ?? null;
     this.focus = hit.address;
@@ -825,6 +943,11 @@ export class MemoryView {
     const t = (selector) => event.target.closest(selector);
     const crumb = t("[data-crumb]");
     if (crumb) return this.zoom(Number(crumb.dataset.crumb));
+    if (t("[data-block]")) {
+      const block = this.blockZoom(this.zooms.at(-1));
+      if (block) this.zoom(this.zooms.length, block);
+      return;
+    }
     if (t("[data-half]")) {
       this.half = Number(t("[data-half]").dataset.half);
       this.draw();
@@ -864,6 +987,13 @@ export class MemoryView {
       return this.drawInspector();
     }
   }
+}
+
+/// How many cells of `view` are in `rect`.
+function countIn(view, rect) {
+  let n = 0;
+  for (let y = rect.y; y < rect.y + rect.h; y++) for (let x = rect.x; x < rect.x + rect.w; x++) if (view.at[y * view.width + x] >= 0) n++;
+  return n;
 }
 
 function mix(a, b, f) {

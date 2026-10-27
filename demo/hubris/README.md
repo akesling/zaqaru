@@ -179,11 +179,15 @@ picture of 64-byte cells laid along a Hilbert curve, so the power-of-two
 region Hubris gives each task for the MPU is a block of its own, coloured
 as the timeline colours the task; each cell lights up when it is written
 and fades as the board's time goes on (halving every 10 ms to 10 s, as
-chosen). Drag a box over a picture to zoom in on the memory in it — on a
-Hilbert curve a box is, mostly, one run of addresses — rounded out to the
-aligned power-of-two block that holds it, drawn again as finely as a cell
-a word, with each static outlined and named; the crumbs above it go back
-up the way you came. The emulator keeps, for every word of RAM, when it was last
+chosen). Drag a box over a picture to zoom in on just that rectangle,
+drawn again finer — on a Hilbert curve a cell is a square of four cells of
+a quarter its bytes, in its place, so the picture keeps its shape down to
+a cell a word — with each static outlined and named; the crumbs above it
+go back up the way you came. While you drag, the aligned power-of-two
+block the box's memory rounds out to is outlined, dashed; hold Shift and
+the box snaps to it, and a zoom on part of a block has a **whole block**
+button for the rest. A click, not a drag, shows what is there in the
+inspector. The emulator keeps, for every word of RAM, when it was last
 written and by what, all the time, so none of this re-executes anything.
 Under the pictures, each task with how lately it wrote and how deep its
 stack has been — the lowest word no longer holding the `0xbaddcafe` the

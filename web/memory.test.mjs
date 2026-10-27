@@ -70,14 +70,28 @@ test("a static's name is shortened to its last two parts, generics folded", () =
   assert.equal(shortName("<x::Y<u8> as z::W>::F"), "<…>::F");
 });
 
-test("a zoom is rounded out to the aligned block that holds it, within reason", () => {
+test("a finer picture is the coarser one refined: each cell a block of the finer's in its place", () => {
+  // 288 KiB — two tiles — at 64, 16 and 4 bytes a cell.
+  for (const [coarse, fine, f] of [[64, 16, 2], [16, 4, 2], [64, 4, 4]]) {
+    const a = layout(288 * 1024, coarse);
+    const b = layout(288 * 1024, fine);
+    assert.equal(b.width, a.width * f);
+    assert.equal(b.height, a.height * f);
+    for (let c = 0; c < b.cells; c += 7) {
+      const parent = Math.floor((c * fine) / coarse);
+      assert.equal(Math.floor(b.place[2 * c] / f), a.place[2 * parent]);
+      assert.equal(Math.floor(b.place[2 * c + 1] / f), a.place[2 * parent + 1]);
+    }
+  }
+});
+
+test("a run rounds out to the aligned block that holds it, within its RAM", () => {
   // hiffy's 32 KiB, less its first cell: the whole of it.
   assert.deepEqual(rounded(0x24010040, 0x7fc0), { base: 0x24010000, length: 0x8000 });
-  // Across a 64 KiB boundary: the aligned block would be far larger, so a
-  // power of two from where it starts.
-  assert.deepEqual(rounded(0x2400f000, 0x2000), { base: 0x2400f000, length: 0x2000 });
-  // Not past the end of its RAM.
+  // Across a 64 KiB boundary: the block that holds both sides.
+  assert.deepEqual(rounded(0x2400f000, 0x2000), { base: 0x24000000, length: 0x20000 });
+  // A block past the end of the RAM is no block: the run as it is.
   const ram = { base: 0x38800000, length: 4096 };
-  assert.deepEqual(rounded(0x38800f00, 0x100, ram), { base: 0x38800f00, length: 0x100 });
   assert.deepEqual(rounded(0x38800e00, 0x180, ram), { base: 0x38800e00, length: 0x200 });
+  assert.deepEqual(rounded(0x387fff00, 0x200, ram), { base: 0x387fff00, length: 0x200 });
 });
