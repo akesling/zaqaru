@@ -73,6 +73,7 @@ pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
     // SAFETY: one instance, one thread of execution, and the host makes one
     // call at a time.
     let slot = unsafe { &mut *(&raw mut SYSTEM) };
+    crate::abi::between_turns();
     if let Some(status) = unsafe { FINISHED } {
         // A finished container still describes itself.
         if let Some(system) = slot {
@@ -97,6 +98,7 @@ pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
             system.serve();
             return KIND_RUNNING;
         }
+        crate::abi::between_turns();
         match system.turn() {
             // A plain turn never stops on an instruction.
             Turn::Ran | Turn::Stopped => {}
@@ -148,6 +150,7 @@ pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zaqaru_stop_at(target: i64) -> i32 {
     let slot = unsafe { &mut *(&raw mut SYSTEM) };
+    crate::abi::between_turns();
     if let Some(status) = unsafe { FINISHED } {
         if let Some(system) = slot {
             system.serve();
@@ -166,6 +169,7 @@ pub unsafe extern "C" fn zaqaru_stop_at(target: i64) -> i32 {
     };
     let target = target.max(0) as u64;
     loop {
+        crate::abi::between_turns();
         match system.turn_toward(Some(target)) {
             Turn::Ran | Turn::Idle => {}
             Turn::Stopped => {
@@ -216,6 +220,7 @@ pub unsafe extern "C" fn zaqaru_stop_at(target: i64) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zaqaru_stop_at_board(kind: i32, target: i64, bound: i64) -> i32 {
     let slot = unsafe { &mut *(&raw mut SYSTEM) };
+    crate::abi::between_turns();
     if let Some(status) = unsafe { FINISHED } {
         if let Some(system) = slot {
             system.serve();
@@ -246,6 +251,7 @@ pub unsafe extern "C" fn zaqaru_stop_at_board(kind: i32, target: i64, bound: i64
             system.serve();
             return KIND_STOPPED;
         }
+        crate::abi::between_turns();
         match system.turn_toward(None) {
             Turn::Ran | Turn::Idle | Turn::Stopped => {}
             Turn::Finished(outcome) => {

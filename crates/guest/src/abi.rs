@@ -155,6 +155,18 @@ mod arena {
     }
 }
 
+/// Drops whatever the host placed in guest memory, between turns and on
+/// entry to each call from the host: the kernel reads the host outside
+/// syscalls too — the clock, at every crossing that moves the board on;
+/// the store's requests, when it serves them — and a container whose
+/// processes are all parked makes no syscalls to reset at, so without this
+/// it fills the arena a clock reading at a time (about 340,000 idle turns:
+/// half an hour of a bench left alone) and fails. Nothing placed outlives
+/// the read that placed it, which is what makes any of these points safe.
+pub(crate) fn between_turns() {
+    arena::reset();
+}
+
 /// The allocator the host reaches back through when it returns a list.
 ///
 /// This is the canonical ABI's `cabi_realloc`, narrowed to what this boundary
