@@ -1458,6 +1458,22 @@ impl Board {
         )
     }
 
+    /// As [`Board::writes_json`], for `[base, base + length)` of one RAM
+    /// alone, cells numbered from `base`: what a picture zoomed in on part
+    /// of a RAM reads, at a finer grain.
+    pub fn writes_in_json(&self, since: u32, cell: u32, base: u32, length: u32) -> String {
+        let cell = cell.clamp(4, 1 << 20) & !3;
+        let base = base & !3;
+        let bus = &self.machine.bus;
+        let name = armv6m::names::block(&bus.soc, base).map_or("RAM", |(name, _)| name);
+        let cells: Vec<String> = bus.written_in(since, cell, base, length).into_iter().map(|(n, stamp)| format!("0,{n},{stamp}")).collect();
+        format!(
+            r#"{{"now":{},"cell":{cell},"rams":[{{"base":{base},"length":{length},"name":"{name}"}}],"cells":[{}]}}"#,
+            armv6m::bus::write_stamp(self.machine.time),
+            cells.join(",")
+        )
+    }
+
     /// Up to [`MEMORY_SERVED`] bytes of the board's memory from `address`, as
     /// a debugger reads them: RAM, flash and the peripherals' registers,
     /// without a read's side effects. As JSON, hex, two digits a byte and

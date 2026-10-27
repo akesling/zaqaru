@@ -51,3 +51,13 @@ fn cells_written_since_a_stamp_are_found_and_no_others() {
     assert_eq!(m.bus.written_since(0, 64), [(SRAM_BASE, 0x100 / 64, stamp)]);
     assert!(m.bus.written_since(stamp, 64).is_empty());
 }
+
+#[test]
+fn cells_of_part_of_a_ram_are_numbered_from_its_start() {
+    let mut m = storing();
+    m.run_until(u64::MAX, 100);
+    let (stamp, _) = m.bus.last_write(SRAM_BASE + 0x100).unwrap();
+    // From 0xF0, 8-byte cells: 0x100 is the third.
+    assert_eq!(m.bus.written_in(0, 8, SRAM_BASE + 0xF0, 0x40), [(2, stamp)]);
+    assert!(m.bus.written_in(0, 8, SRAM_BASE + 0x108, 0x40).is_empty());
+}

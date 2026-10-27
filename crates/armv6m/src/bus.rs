@@ -230,6 +230,26 @@ impl Bus {
         out
     }
 
+    /// The cells of `cell` bytes (a multiple of 4) of `[base, base +
+    /// length)`, within one RAM, written after the stamp `since`: each
+    /// cell's number from `base`, and when it was last written.
+    pub fn written_in(&self, since: u32, cell: u32, base: u32, length: u32) -> Vec<(u32, u32)> {
+        let Some(ram) = self.rams.iter().find(|ram| base >= ram.base && ((base - ram.base) as usize) < ram.bytes.len()) else {
+            return Vec::new();
+        };
+        let from = (base - ram.base) as usize / 4;
+        let to = ((base - ram.base) as usize + length as usize).div_ceil(4).min(ram.written.len());
+        let words = (cell / 4).max(1) as usize;
+        let mut out = Vec::new();
+        for (n, stamps) in ram.written[from..to].chunks(words).enumerate() {
+            let last = stamps.iter().copied().max().unwrap_or(0);
+            if last > since {
+                out.push((n as u32, last));
+            }
+        }
+        out
+    }
+
     fn decode(&self, addr: u32) -> Option<Target> {
         let within = |base: u32, size: usize| {
             addr.checked_sub(base).filter(|&o| (o as usize) < size).map(|o| o as usize)
