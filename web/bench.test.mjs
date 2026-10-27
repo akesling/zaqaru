@@ -99,3 +99,27 @@ test("each probe shows something, edges or not", () => {
   }
   assert.match(probeBody("I2C2 0x48", [], board, 1e9), /25\.0000 °C/);
 });
+
+test("a Hubris system call reads as what it asks", async () => {
+  const { syscallLine } = await import("./bench.js");
+  const names = (n) => ["jefe", "sys", "i2c_driver"][n] ?? `task ${n}`;
+  assert.equal(syscallLine({ r11: 0, r4: (2 << 16) | 1, r5: 0 }, names).text, "send → i2c_driver op 1");
+  assert.equal(syscallLine({ r11: 0, r4: (0xffff << 16) | 2, r5: 0 }, names).text, "kipc reinit_task");
+  assert.equal(syscallLine({ r11: 0, r4: (0xffff << 16) | 2, r5: 0 }, names).kind, "kernel");
+  assert.equal(syscallLine({ r11: 2, r4: (3 << 10) | 1, r5: 0 }, names).text, "reply → sys");
+  assert.equal(syscallLine({ r11: 1, r4: 0x2400_0000, r5: 24 }, names).text, "recv");
+  assert.equal(syscallLine({ r11: 8, r4: 0, r5: 0 }, names).kind, "fault");
+});
+
+test("the timeline's task lane starts the window with the task that was running", async () => {
+  const { timelineLanes } = await import("./bench.js");
+  const records = new Map([
+    ["TASK", [{ t: 100, task: 19 }, { t: 1500, task: 9 }, { t: 1700, task: 19 }]],
+    ["SYS", [{ t: 1510, r11: 1, r4: 0, r5: 0 }]],
+    ["EXC", [{ t: 1000, exc: 15, name: "SysTick" }, { t: 1600, exc: 4, name: "MemManage" }]],
+  ]);
+  const { lanes } = timelineLanes(records, { tasks: true, syscalls: true, interrupts: true }, 1000, 2000, (n) => `t${n}`);
+  assert.deepEqual(lanes[0].spans.map((s) => [s.from, s.to, s.label]), [[1000, 1500, "t19"], [1500, 1700, "t9"], [1700, 2000, "t19"]]);
+  assert.deepEqual(lanes[1].marks.map((m) => m.text), ["recv"]);
+  assert.deepEqual(lanes[2].marks.map((m) => m.kind), ["tick", "fault"]);
+});

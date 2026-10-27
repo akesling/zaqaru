@@ -1141,6 +1141,7 @@ const renderers = {
     // shows changes: the board isn't redrawn under the pointer on every read.
     if (!panel.body.querySelector(".board > .drawing")) {
       panel.body.innerHTML = `<div class="board"><div class="instant"></div><div class="drawing"></div><div class="status"></div><div class="where"></div><div class="clock"><span class="clock-text"></span> <span class="clock-controls"></span></div><div class="dim clock-tree"></div>
+        <div class="timeline"><div class="timeline-head"></div><canvas class="timeline-canvas"></canvas><div class="timeline-readout dim">&nbsp;</div></div>
         <div class="probes"></div>
         <details class="more"><summary>LEDs, faults, the network, the core's registers</summary><div class="more-body"></div></details></div>`;
       const more = panel.body.querySelector("details.more");
@@ -1176,6 +1177,13 @@ const renderers = {
     fill(".clock-text", clockText);
     fill(".clock-controls", value.speed && boardTime === null ? controls : "");
     fill(".clock-tree", value.speed ? clocks : "");
+    const layerButtons = Object.keys(bench.LAYERS)
+      .map((layer) => `<button type="button" data-layer="${layer}"${timelineLayers[layer] ? ' class="on"' : ""}>${layer}</button>`)
+      .join("");
+    const spanButtons = [1e6, 1e7, 1e8, 1e9]
+      .map((span) => `<button type="button" data-span="${span}"${span === timelineSpan ? ' class="on"' : ""}>${bench.fmtSpan(span)}</button>`)
+      .join("");
+    fill(".timeline-head", `<b>timeline</b> <span class="dim">in the board's time</span> <span class="controls">${layerButtons}</span> <span class="controls">${spanButtons}</span>`);
     showProbes(panel.body.querySelector(".probes"), value);
     const transcript = fill(".more-body", `<div>LED${leds.length > 1 ? "s" : ""} ${lit || "none"} · ${value.faults} faults · debug probes: USB CMSIS-DAP, GDB on ${escape(value.probe)}${value.debugger ? " (attached)" : ""}</div>
       ${wired}
@@ -1195,6 +1203,20 @@ const renderers = {
       const step = event.target.closest("[data-board-step]");
       if (step) return seekBoard((boardTime ?? value.time_ps) + Number(step.dataset.boardStep));
       if (event.target.closest("[data-board-live]")) return backToLive();
+      const layer = event.target.closest("[data-layer]");
+      if (layer) {
+        timelineLayers[layer.dataset.layer] = !timelineLayers[layer.dataset.layer];
+        saveTimeline();
+        timelineRecords.clear();
+        timelineCursor = null;
+        return renderers.board(value, panel);
+      }
+      const span = event.target.closest("[data-span]");
+      if (span) {
+        timelineSpan = Number(span.dataset.span);
+        saveTimeline();
+        return renderers.board(value, panel);
+      }
       const target = event.target.closest("[data-probe], [data-part], [data-unprobe], [data-window]");
       if (!target) return;
       if (target.dataset.window) probeWindow = Number(target.dataset.window);
@@ -1205,6 +1227,9 @@ const renderers = {
     boardPanel = panel;
     if (boardTime === null && value.time_ps !== undefined) liveBoardTime = value.time_ps;
     markExample();
+    equipTimeline(panel);
+    drawTimeline();
+    followTimeline();
     followTrace();
   },
 
@@ -1431,6 +1456,198 @@ function whatis(value, address) {
     })
     .catch(() => {});
   return null;
+}
+
+// ---- the board's timeline ------------------------------------------------------
+//
+// A strip in the board's own time, ending where the board stands: which
+// Hubris task ran, what it asked the kernel, the exceptions taken, the
+// buses' and the cable's traffic; each layer switched on or off. Hovering
+// says what an event was; a click stands every panel there.
+
+let timelineLayers = { tasks: true, syscalls: true, interrupts: false, devices: true };
+let timelineSpan = 1e7;
+try {
+  const kept = JSON.parse(localStorage.getItem("zaqaru.timeline") ?? "null");
+  if (kept?.layers) timelineLayers = { ...timelineLayers, ...kept.layers };
+  if (kept?.span) timelineSpan = kept.span;
+} catch {
+  // A browser that keeps nothing: the defaults.
+}
+function saveTimeline() {
+  try {
+    localStorage.setItem("zaqaru.timeline", JSON.stringify({ layers: timelineLayers, span: timelineSpan }));
+  } catch {
+    // Not kept, then.
+  }
+}
+const timelineRecords = new Map();
+const TIMELINE_KEPT = 40000;
+let timelineCursor = null;
+let timelineBusy = false;
+
+/// The channels the layers that are on are made of, and the board's own.
+function timelineChannels() {
+  return [...Object.entries(bench.LAYERS).filter(([layer]) => timelineLayers[layer]).flatMap(([, channels]) => channels), "BOARD"];
+}
+
+/// The task table's names, by index, from `board/tasks`: asked for once an
+/// image, and the timeline redrawn when they come.
+const tasksKept = new Map();
+function taskNames(value) {
+  if (tasksKept.has(value.image)) return tasksKept.get(value.image);
+  tasksKept.set(value.image, []);
+  read("board/tasks")
+    .then((answer) => {
+      tasksKept.set(value.image, (answer?.tasks ?? []).map((task) => task.name));
+      drawTimeline();
+    })
+    .catch(() => {});
+  return [];
+}
+
+/// Reads what the timeline's channels have carried since the last read,
+/// as the probes do: from the last so many, then on from there, and from
+/// scratch when the view has moved earlier.
+async function followTimeline() {
+  if (timelineBusy || !boardPanel) return;
+  timelineBusy = true;
+  let again = false;
+  try {
+    const since = timelineCursor ?? -5000;
+    const answer = await read(`board/trace/${since}/${timelineChannels().join(",")}`);
+    if (!answer || answer.error !== undefined) return;
+    if (timelineCursor !== null && answer.next < timelineCursor) {
+      timelineRecords.clear();
+      timelineCursor = null;
+      again = true;
+      return;
+    }
+    for (const record of answer.records) {
+      if (!timelineRecords.has(record.ch)) timelineRecords.set(record.ch, []);
+      const list = timelineRecords.get(record.ch);
+      list.push(record);
+      if (list.length > TIMELINE_KEPT) list.splice(0, list.length - TIMELINE_KEPT);
+    }
+    timelineCursor = answer.next;
+    if (answer.records.length || since < 0) drawTimeline();
+  } catch {
+    // Nothing to read at this instant.
+  } finally {
+    timelineBusy = false;
+    if (again) followTimeline();
+  }
+}
+
+const KIND_COLORS = {
+  send: "#58a6ff", kernel: "#f0a020", reply: "#3fb950", recv: "#8b949e", fault: "#ff5d5d", other: "#bc8cff",
+  tick: "#8888", irq: "#d29922", device: "#39c5cf", board: "#ff5d5d",
+};
+const LANE = 15;
+const LABELS = 76;
+
+/// Draws the strip: the window ending where the board stands, its lanes,
+/// and what the pointer can find in them.
+function drawTimeline() {
+  const canvas = boardPanel?.body.querySelector(".timeline-canvas");
+  if (!canvas || !boardValue) return;
+  const names = taskNames(boardValue);
+  const name = (n) => names[n] ?? `task ${n}`;
+  const end = (boardTime ?? boardValue.time_ps ?? 0) / 1000;
+  const from = end - timelineSpan;
+  const { lanes, board } = bench.timelineLanes(timelineRecords, timelineLayers, from, end + 1, name);
+  const width = canvas.clientWidth || 600;
+  const height = Math.max(1, lanes.length) * LANE + 14;
+  const scale = window.devicePixelRatio || 1;
+  canvas.style.height = `${height}px`;
+  if (canvas.width !== Math.round(width * scale) || canvas.height !== Math.round(height * scale)) {
+    canvas.width = Math.round(width * scale);
+    canvas.height = Math.round(height * scale);
+  }
+  const g = canvas.getContext("2d");
+  g.setTransform(scale, 0, 0, scale, 0, 0);
+  g.clearRect(0, 0, width, height);
+  const plot = width - LABELS;
+  const x = (t) => LABELS + ((t - from) / timelineSpan) * plot;
+  const hits = [];
+  g.font = "10px ui-monospace, monospace";
+  g.textBaseline = "middle";
+  lanes.forEach((lane, i) => {
+    const y = i * LANE;
+    g.fillStyle = "#8881";
+    g.fillRect(LABELS, y + 1, plot, LANE - 2);
+    g.fillStyle = "#888";
+    g.fillText(lane.name, 2, y + LANE / 2);
+    for (const span of lane.spans) {
+      const a = Math.max(LABELS, x(span.from));
+      const b = Math.min(width, x(span.to));
+      if (b <= a) continue;
+      g.fillStyle = span.color;
+      g.fillRect(a, y + 2, Math.max(1, b - a), LANE - 4);
+      if (b - a > 34) {
+        g.save();
+        g.beginPath();
+        g.rect(a, y, b - a - 2, LANE);
+        g.clip();
+        g.fillStyle = "#fff";
+        g.fillText(span.label, a + 3, y + LANE / 2);
+        g.restore();
+      }
+      hits.push({ lane: i, a, b, t: span.from, text: `${span.label} runs` });
+    }
+    for (const mark of lane.marks) {
+      const at = x(mark.t);
+      g.fillStyle = KIND_COLORS[mark.kind] ?? "#888";
+      const tall = mark.kind === "fault" || mark.kind === "kernel";
+      g.fillRect(at, y + (tall ? 1 : 3), 1.5, LANE - (tall ? 2 : 6));
+      hits.push({ lane: i, a: at - 3, b: at + 3, t: mark.t, text: mark.text, mark: true });
+    }
+  });
+  for (const mark of board) {
+    g.fillStyle = KIND_COLORS.board;
+    g.fillRect(x(mark.t), 0, 2, lanes.length * LANE);
+    hits.push({ lane: -1, a: x(mark.t) - 3, b: x(mark.t) + 3, t: mark.t, text: mark.text, mark: true });
+  }
+  g.fillStyle = "#888";
+  const axis = lanes.length * LANE + 7;
+  g.fillText(`−${bench.fmtSpan(timelineSpan)}`, LABELS, axis);
+  const here = boardTime === null ? "now" : "here";
+  g.fillText(`${bench.fmtTime(end)} ${here}`, Math.max(LABELS, width - 150), axis);
+  if (!lanes.length) {
+    g.fillText("no layer on", LABELS + 4, LANE / 2);
+  }
+  canvas.hits = hits;
+  canvas.window = { from, plot };
+}
+
+/// The pointer on the strip: says what is under it; a click stands the
+/// board there — at the event, if one is under it, or at that time.
+function equipTimeline(panel) {
+  const canvas = panel.body.querySelector(".timeline-canvas");
+  if (!canvas || canvas.equipped) return;
+  canvas.equipped = true;
+  const found = (event) => {
+    const box = canvas.getBoundingClientRect();
+    const px = event.clientX - box.left;
+    const lane = Math.floor((event.clientY - box.top) / LANE);
+    const under = (canvas.hits ?? []).filter((h) => (h.lane === lane || h.lane === -1) && px >= h.a && px <= h.b);
+    // A mark before a span: it is the narrower thing to have aimed at.
+    const hit = under.find((h) => h.mark) ?? under[0];
+    const t = canvas.window ? canvas.window.from + ((px - LABELS) / canvas.window.plot) * timelineSpan : null;
+    return { hit, t };
+  };
+  const readout = () => panel.body.querySelector(".timeline-readout");
+  canvas.onmousemove = (event) => {
+    const { hit, t } = found(event);
+    const line = hit ? `${bench.fmtTime(hit.t)}  ${hit.text}` : t !== null && t > 0 ? `${bench.fmtTime(t)}` : "";
+    readout().textContent = line || "\u00a0";
+  };
+  canvas.onmouseleave = () => (readout().textContent = "\u00a0");
+  canvas.onclick = (event) => {
+    const { hit, t } = found(event);
+    const at = hit ? hit.t + 1 : t;
+    if (at !== null && at > 0) seekBoard(at * 1000);
+  };
 }
 
 /// The probes' cards, one for each probe, kept from read to read: a card's

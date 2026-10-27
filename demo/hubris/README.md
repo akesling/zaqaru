@@ -90,6 +90,28 @@ at that instant of its own (`zaqaru_stop_at_board`). `replay.mjs` checks
 that a board stood at an instant is the board the live run had there,
 to the last byte of its memory.
 
+## The board's timeline
+
+Under the board's clock, a strip in the board's own time, ending where the
+board stands — now, or the instant it is stood at — over 1 ms to 1 s, its
+layers switched on and off above it:
+
+| layer | shows |
+|-------|-------|
+| tasks | which Hubris task the core returned to, by the stack it returned with: idle, jefe, i2c_driver… |
+| syscalls | each supervisor call, read as Hubris's ABI has it: `send → i2c_driver op 1`, `recv`, `reply → hiffy`, `set_timer`, and a send to the kernel as the kernel IPC it is — `kipc reinit_task`, jefe restarting a task |
+| interrupts | the exceptions taken: SysTick, each IRQ (I2C2's is IRQ33), and the faults, drawn tall in red |
+| devices | each bus's and the cable's traffic: an I2C START and its bytes, SPI frames, frames on the wire |
+
+Resets and halts are drawn across every lane. Hover the strip for what an
+event was; click it to stand the board, and every panel, there.
+
+The core records the OS-level layers as it runs, into the same trace the
+probes read (channels `TASK`, `SYS`, `EXC` and `BOARD` of
+`board/trace/{since}/{channels}`): an `svc`'s r11, r4 and r5 as the task
+left them; an exception's number; and, on each return to a task, which
+task, by the stacks the board's archive says the tasks have.
+
 ## What the memory is
 
 The board knows its Hubris archive (`archive` in its configuration, and

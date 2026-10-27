@@ -393,3 +393,125 @@ export function probeBody(name, records, value, window) {
   const rows = Object.entries(part.values).map(([k, v]) => `<tr><td class="key">${esc(k)}</td><td>${v.includes("\n") ? `<pre>${esc(v)}</pre>` : esc(v)}</td></tr>`);
   return `<div class="dim">${esc(part.kind)} on ${esc(part.bus)} at ${esc(part.at)}${part.line ? `, its interrupt on ${esc(part.line)}` : ""}</div><table class="values">${rows.join("")}</table>`;
 }
+
+// ---- the board's timeline ---------------------------------------------------
+//
+// What the core did and what crossed the buses, in the board's own time, as
+// lanes: which Hubris task ran, what it asked the kernel (each supervisor
+// call), the exceptions taken (SysTick, interrupts, faults), and each bus's
+// and the cable's traffic; the board's resets and halts across them all.
+
+/// Hubris's system calls, by the number a task puts in r11
+/// (`sys/abi/src/lib.rs`, `Sysnum`).
+export const SYSCALLS = [
+  "send", "recv", "reply", "set_timer", "borrow_read", "borrow_write", "borrow_info",
+  "irq_control", "panic", "get_timer", "refresh_task_id", "post", "reply_fault", "irq_status",
+];
+
+/// What a send to the kernel asks of it, by operation (`Kipcnum`).
+export const KIPC = {
+  1: "read_task_status", 2: "reinit_task", 3: "fault_task", 4: "read_image_id", 5: "reset",
+  6: "get_task_dump_region", 7: "read_task_dump_region", 8: "software_irq", 9: "find_faulted_task",
+  10: "read_panic_message",
+};
+
+/// The kernel's task id: all ones.
+const KERNEL_ID = 0xffff;
+const INDEX_MASK = 0x3ff;
+
+/// A system call as a line: `send → i2c_driver op 1`, `kipc reinit_task`,
+/// `recv`, with a `kind` to colour it by. `taskName(index)` names a task.
+export function syscallLine({ r11, r4, r5 }, taskName = (n) => `task ${n}`) {
+  const name = SYSCALLS[r11] ?? `syscall ${r11}`;
+  const target = (id) => (id === KERNEL_ID ? "the kernel" : taskName(id & INDEX_MASK));
+  switch (name) {
+    case "send": {
+      const to = r4 >>> 16;
+      const op = r4 & 0xffff;
+      if (to === KERNEL_ID) return { name, kind: "kernel", text: `kipc ${KIPC[op] ?? `op ${op}`}` };
+      return { name, kind: "send", text: `send → ${target(to)} op ${op}` };
+    }
+    case "reply":
+    case "reply_fault":
+      return { name, kind: "reply", text: `${name} → ${target(r4 & 0xffff)}` };
+    case "post":
+      return { name, kind: "send", text: `post → ${target(r4 & 0xffff)} bits 0x${(r5 >>> 0).toString(16)}` };
+    case "panic":
+      return { name, kind: "fault", text: "panic" };
+    case "recv":
+      return { name, kind: "recv", text: "recv" };
+    default:
+      return { name, kind: "other", text: name };
+  }
+}
+
+/// The timeline's layers, each one a set of the trace's channels.
+export const LAYERS = {
+  tasks: ["TASK"],
+  syscalls: ["SYS"],
+  interrupts: ["EXC"],
+  devices: ["I2C1", "I2C2", "I2C3", "I2C4", "SPI1", "SPI2", "SPI3", "SPI4", "SPI5", "SPI6", "USART1", "USART2", "USART3", "ETH"],
+};
+
+const FAULTS = new Set([3, 4, 5, 6]);
+
+/// A window of records — `[from, to)`, nanoseconds — as lanes to draw:
+/// `{ name, spans: [{ from, to, label, color }], marks: [{ t, text, kind }] }`.
+/// `records` is every record kept, by channel — a task lane starts the
+/// window with the task the last change before it named — and `layers`
+/// says which are on.
+export function timelineLanes(records, layers, from, to, taskName = (n) => `task ${n}`) {
+  const within = (list) => (list ?? []).filter((r) => r.t >= from && r.t < to);
+  const lanes = [];
+  if (layers.tasks) {
+    const all = records.get("TASK") ?? [];
+    const before = all.filter((r) => r.t < from).at(-1);
+    const changes = [...(before ? [{ ...before, t: from }] : []), ...within(all)];
+    const spans = changes.map((r, i) => ({
+      from: r.t,
+      to: i + 1 < changes.length ? changes[i + 1].t : to,
+      task: r.task,
+      label: r.task === null ? "?" : taskName(r.task),
+      color: taskColor(r.task),
+    }));
+    lanes.push({ name: "tasks", spans, marks: [] });
+  }
+  if (layers.syscalls) {
+    const marks = within(records.get("SYS")).map((r) => {
+      const line = syscallLine(r, taskName);
+      return { t: r.t, text: line.text, kind: line.kind };
+    });
+    lanes.push({ name: "syscalls", spans: [], marks });
+  }
+  if (layers.interrupts) {
+    const marks = within(records.get("EXC")).map((r) => ({
+      t: r.t,
+      text: r.name,
+      kind: FAULTS.has(r.exc) ? "fault" : r.exc === 15 ? "tick" : "irq",
+    }));
+    lanes.push({ name: "interrupts", spans: [], marks });
+  }
+  if (layers.devices) {
+    for (const channel of LAYERS.devices) {
+      const list = within(records.get(channel));
+      if (!list.length && !(records.get(channel) ?? []).length) continue;
+      const marks = list.map((r) => ({ t: r.t, text: deviceText(channel, r), kind: "device" }));
+      lanes.push({ name: channel, spans: [], marks });
+    }
+  }
+  const board = within(records.get("BOARD")).map((r) => ({ t: r.t, text: r.what, kind: "board" }));
+  return { lanes, board };
+}
+
+function deviceText(channel, r) {
+  if (channel.startsWith("I2C")) return r.ev === "start" ? `START 0x${r.addr.toString(16)} ${r.read ? "R" : "W"}${r.ack ? "" : " NAK"}` : r.ev === "byte" ? `byte ${hex2(r.b)}` : "STOP";
+  if (channel.startsWith("SPI")) return r.ev === "frame" ? `${hex2(r.mosi)} → ← ${hex2(r.miso)}` : `${r.ev} ${r.cs}`;
+  if (channel === "ETH") return `${r.rx ? "in" : "out"} ${r.len} B · ${ethLine(r)}`;
+  return `${r.rx ? "in" : "out"} ${hex2(r.b)}`;
+}
+
+/// A task's colour: its own hue, the same everywhere.
+export function taskColor(index) {
+  if (index === null || index === undefined) return "#666";
+  return `hsl(${(index * 47) % 360} 55% 52%)`;
+}
