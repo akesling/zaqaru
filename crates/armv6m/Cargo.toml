@@ -13,12 +13,14 @@ name = "zaqaru-m0"
 path = "src/bin/m0/main.rs"
 
 [dependencies]
-# For the door's reading of a Hubris archive: one file out of a zip.
+# For reading a Hubris archive (`zip`, `hubris`): one file out of a zip,
+# and the symbols in its ELFs, demangled.
 bzip2-rs = "0.1.2"
 miniz_oxide = "0.8.9"
 # IEEE 754 in software, for the FPU: every rounding mode and exception
 # flag, and NaNs whose bits do not depend on the host.
 rustc_apfloat = "0.2.3"
+rustc-demangle = "0.1.24"
 
 [dev-dependencies]
 # The ISA tests assemble their programs with clang and read the labels back

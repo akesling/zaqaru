@@ -16,13 +16,13 @@
 //! something else runs — zaqaru's kernel, chiefly. See [`door`].
 
 mod door;
-mod zip;
 mod serve;
 
 use std::process::ExitCode;
 use std::time::Instant;
 
 use armv6m::scs::exception;
+use armv6m::zip;
 use armv6m::stm32g0::Edge;
 use armv6m::{Event, Machine, Outcome};
 

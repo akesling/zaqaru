@@ -49,7 +49,9 @@ pub mod flash_h7;
 pub mod fpu;
 pub mod gdb;
 pub mod gpio;
+pub mod hubris;
 pub mod i2c;
+pub mod names;
 pub mod net;
 pub mod part;
 pub mod scs;
@@ -62,6 +64,7 @@ pub mod timer;
 pub mod timing;
 pub mod trace;
 pub mod usart;
+pub mod zip;
 
 use std::collections::BTreeSet;
 

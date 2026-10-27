@@ -1889,6 +1889,7 @@ dependencies = [
  "bzip2-rs",
  "miniz_oxide",
  "object 0.40.0",
+ "rustc-demangle",
  "rustc_apfloat",
 ]
 

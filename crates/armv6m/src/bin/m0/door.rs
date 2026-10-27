@@ -281,7 +281,7 @@ fn upload(name: &str, bytes: &[u8]) -> String {
     let path = format!("{UPLOADS}/{name}");
     // Hubris writes its archives with bzip2, which Humility then reads
     // again for every command; stored, it reads them in half the time.
-    let repacked = crate::zip::has_bzip2(bytes).then(|| crate::zip::repack(bytes, crate::zip::Packing::Stored)).flatten();
+    let repacked = armv6m::zip::has_bzip2(bytes).then(|| armv6m::zip::repack(bytes, armv6m::zip::Packing::Stored)).flatten();
     let bytes = repacked.as_deref().unwrap_or(bytes);
     match std::fs::create_dir_all(UPLOADS).and_then(|()| std::fs::write(&path, bytes)) {
         Ok(()) => format!("uploaded {name}, {} bytes — `flash {name}` puts it on the board\n", bytes.len()),
@@ -364,7 +364,7 @@ impl FrontDoor {
             for name in names.iter().filter(|n| n.ends_with(".zip")) {
                 // What it is, from its own `app.toml`: the app, and the board.
                 let bytes = std::fs::read(format!("{directory}/{name}")).unwrap_or_default();
-                let app_toml = crate::zip::entry(&bytes, "app.toml")
+                let app_toml = armv6m::zip::entry(&bytes, "app.toml")
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
                     .unwrap_or_default();
                 let (app, board) = (app_of(&app_toml).unwrap_or("-"), board_of(&app_toml).unwrap_or("-"));
@@ -443,7 +443,7 @@ impl FrontDoor {
         // `app.toml` the board.
         let bytes = std::fs::read(&archive).unwrap_or_default();
         let text = |name: &str| {
-            crate::zip::entry(&bytes, name).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
+            armv6m::zip::entry(&bytes, name).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
         };
         let (flash_ron, app_toml) = (text("img/flash.ron"), text("app.toml"));
         let Some(part) = part_of(&flash_ron) else {
