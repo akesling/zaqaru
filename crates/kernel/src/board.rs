@@ -73,6 +73,9 @@ use crate::socket::{Address, Endpoint, State};
 /// The most of the board's memory one read of it serves.
 pub const MEMORY_SERVED: u32 = 4096;
 
+/// What Hubris's kernel fills a task's stack with when it starts the task.
+const STACK_PAINT: u32 = 0xbadd_cafe;
+
 /// Where an image asks for a board.
 pub const CONFIGURATION: &[u8] = b"/etc/zaqaru/board";
 
@@ -1122,7 +1125,22 @@ impl Board {
                     )
                 })
                 .collect();
-            let stack = o.stack.map_or("null".into(), |(base, size)| format!(r#"{{"base":{base},"size":{size}}}"#));
+            let stack = o.stack.map_or("null".into(), |(base, size)| {
+                // How deep it has ever gone: where the kernel painted a
+                // task's stack when it started it, as `humility
+                // stackmargin` finds it, the lowest word no longer holding
+                // the paint; elsewhere, the lowest word ever written.
+                let bus = &self.machine.bus;
+                let words = || (base..base + size).step_by(4);
+                let painted = words().any(|a| bus.peek(a, 4) == Ok(STACK_PAINT));
+                let deepest = if painted {
+                    words().find(|&a| bus.peek(a, 4) != Ok(STACK_PAINT))
+                } else {
+                    words().find(|&a| bus.last_write(a).is_some())
+                };
+                let deepest = deepest.map_or("null".into(), |a| a.to_string());
+                format!(r#"{{"base":{base},"size":{size},"deepest":{deepest}}}"#)
+            });
             let index = o.index.map_or("null".into(), |n| n.to_string());
             format!(
                 r#"{{"name":{},"index":{index},"stack":{stack},"sections":[{}],"symbols":{}}}"#,
@@ -1351,6 +1369,93 @@ impl Board {
                 _ => false,
             })
             .map(|(n, record, _)| (*n, record.time))
+    }
+
+    /// The statics in `owner`'s RAM — the kernel's, or a task's by name —
+    /// as JSON, by address: each one's name, address and size.
+    pub fn symbols_json(&self, owner: &str, map: Option<&Result<armv6m::hubris::Image, String>>) -> Option<String> {
+        use crate::system::server::quoted;
+        let image = map?.as_ref().ok()?;
+        let owner = if owner == "kernel" { &image.kernel } else { image.owner(owner)? };
+        let in_ram = |base: u32| owner.sections.iter().any(|s| s.writable && base >= s.base && base < s.base + s.size);
+        let mut statics: Vec<&armv6m::hubris::Symbol> = owner.symbols.iter().filter(|s| !s.function && in_ram(s.base)).collect();
+        statics.sort_by_key(|s| (s.base, std::cmp::Reverse(s.size)));
+        let out: Vec<String> = statics
+            .iter()
+            .map(|s| format!(r#"{{"name":{},"base":{},"size":{}}}"#, quoted(&s.name), s.base, s.size))
+            .collect();
+        Some(format!(r#"{{"owner":{},"statics":[{}]}}"#, quoted(&owner.name), out.join(",")))
+    }
+
+    /// When each word of RAM from `address`, `length` bytes, was last
+    /// written and what wrote it, as JSON: the board's time now, in the
+    /// same units — microseconds, plus one — and for each word its stamp
+    /// (0: never) and the writer's number in `writers`, which says each
+    /// one's code — `i2c_driver: main + 0x80e` — or `probe`, `dma` or
+    /// `exception` for what wrote without an instruction.
+    pub fn written_json(&self, address: u32, length: u32, map: Option<&Result<armv6m::hubris::Image, String>>) -> String {
+        use crate::system::server::quoted;
+        use armv6m::bus::{BY_DMA, BY_EXCEPTION, BY_PROBE};
+        let address = address & !3;
+        let words = length.min(MEMORY_SERVED).div_ceil(4);
+        let mut writers: Vec<u32> = Vec::new();
+        let mut out = Vec::with_capacity(words as usize);
+        for n in 0..words {
+            match self.machine.bus.last_write(address.wrapping_add(4 * n)) {
+                None => out.push("0,-1".to_string()),
+                Some((stamp, by)) => {
+                    let index = writers.iter().position(|&w| w == by).unwrap_or_else(|| {
+                        writers.push(by);
+                        writers.len() - 1
+                    });
+                    out.push(format!("{stamp},{index}"));
+                }
+            }
+        }
+        let writers: Vec<String> = writers
+            .iter()
+            .map(|&by| match by {
+                BY_PROBE => r#"{"code":"the probe"}"#.into(),
+                BY_DMA => r#"{"code":"DMA"}"#.into(),
+                BY_EXCEPTION => r#"{"code":"the core, stacking an exception"}"#.into(),
+                pc => format!(r#"{{"pc":{pc},"code":{}}}"#, quoted(&self.code_at(pc, map))),
+            })
+            .collect();
+        format!(
+            r#"{{"address":{address},"now":{},"words":[{}],"writers":[{}]}}"#,
+            armv6m::bus::write_stamp(self.machine.time),
+            out.join(","),
+            writers.join(",")
+        )
+    }
+
+    /// Which cells of `cell` bytes of the board's RAMs were written after
+    /// the stamp `since` (see [`Board::written_json`]), as JSON: the RAMs,
+    /// the board's time now, and each cell's RAM, number and last stamp,
+    /// flat, three numbers a cell — what a picture of memory lit by its
+    /// writes reads, again and again, for what changed.
+    pub fn writes_json(&self, since: u32, cell: u32) -> String {
+        let cell = cell.clamp(4, 1 << 20) & !3;
+        let bus = &self.machine.bus;
+        let rams: Vec<String> = bus
+            .rams
+            .iter()
+            .map(|ram| {
+                let name = armv6m::names::block(&bus.soc, ram.base).map_or("RAM", |(name, _)| name);
+                format!(r#"{{"base":{},"length":{},"name":"{name}"}}"#, ram.base, ram.bytes.len())
+            })
+            .collect();
+        let mut cells = Vec::new();
+        for (base, n, stamp) in bus.written_since(since, cell) {
+            let ram = bus.rams.iter().position(|r| r.base == base).unwrap_or(0);
+            cells.push(format!("{ram},{n},{stamp}"));
+        }
+        format!(
+            r#"{{"now":{},"cell":{cell},"rams":[{}],"cells":[{}]}}"#,
+            armv6m::bus::write_stamp(self.machine.time),
+            rams.join(","),
+            cells.join(",")
+        )
     }
 
     /// Up to [`MEMORY_SERVED`] bytes of the board's memory from `address`, as
