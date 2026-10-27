@@ -22,6 +22,9 @@ pub const GUEST_ARCHIVE: &str = "libguest.a";
 /// The exports a container module has, and that the host calls.
 pub const RUN_EXPORT: &str = "zaqaru_run";
 pub const STOP_EXPORT: &str = "zaqaru_stop_at";
+/// The container run until its board stands at an instant of the board's
+/// own, and held there.
+pub const BOARD_STOP_EXPORT: &str = "zaqaru_stop_at_board";
 pub const MANIFEST_EXPORT: &str = "manifest";
 /// The pages of the guest block written since the host last asked, for a
 /// debugger's checkpoints.
@@ -131,6 +134,7 @@ pub fn link(image: &image::Image, guest: &Guest, output: &Path) -> Result<()> {
         ])
         .arg(format!("--export={RUN_EXPORT}"))
         .arg(format!("--export={STOP_EXPORT}"))
+        .arg(format!("--export={BOARD_STOP_EXPORT}"))
         .arg(format!("--export={MANIFEST_EXPORT}"))
         .arg(format!("--export={WRITTEN_EXPORT}"))
         .arg(format!("--export={STACK_POINTER_EXPORT}"))

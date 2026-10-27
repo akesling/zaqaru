@@ -39,6 +39,9 @@ const MEMORY_EXPORT: &str = "memory";
 pub const RUN_EXPORT: &str = "zaqaru_run";
 /// The same machine, run to an exact instruction and held there.
 pub const STOP_EXPORT: &str = "zaqaru_stop_at";
+/// The same machine, run until its board stands at an instant of the
+/// board's own and held there.
+pub const BOARD_STOP_EXPORT: &str = "zaqaru_stop_at_board";
 
 /// What one call of the run export did. The guest packs the kind into the
 /// low byte and, when finished, the exit status into the byte above.
@@ -264,6 +267,20 @@ impl Container {
     /// continuing; a debugger restores a checkpoint instead.
     pub fn stop_at(&mut self, target: i64) -> Result<Turn> {
         Turn::decode(self.call::<i64, i32>(STOP_EXPORT, target)?)
+    }
+
+    /// Runs the container until its board stands just after its
+    /// `instructions`th instruction, or, with `time` (picoseconds), at the
+    /// first instruction boundary at or after that instant of its
+    /// simulated time — not past `bound` of the container's instructions
+    /// (negative: no bound) — and holds it there, for reading.
+    pub fn stop_at_board(&mut self, instructions: Option<u64>, time: Option<u64>, bound: i64) -> Result<Turn> {
+        let (kind, target) = match (instructions, time) {
+            (Some(n), _) => (0, n as i64),
+            (None, Some(t)) => (1, t as i64),
+            (None, None) => bail!("stand the board where: at an instruction count or a time"),
+        };
+        Turn::decode(self.call::<(i32, i64, i64), i32>(BOARD_STOP_EXPORT, (kind, target, bound))?)
     }
 
     /// Reads a path of the container's own store — the isotope Server

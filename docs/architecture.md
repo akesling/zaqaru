@@ -20,7 +20,11 @@ the whole host interface. It exports `zaqaru_run(until)`, which boots on
 its first call and runs the container until it has retired `until`
 instructions, finished, or idled once (a negative target runs to
 completion); `zaqaru_stop_at(target)`, which runs to exactly that
-instruction and holds the machine there for reading; `cabi_realloc`,
+instruction and holds the machine there for reading;
+`zaqaru_stop_at_board(kind, target, bound)`, which does the same for an
+instant of the board's own — its instruction count or its simulated time,
+which the container's count does not name, since an idle container
+retires nothing while its board runs on; `cabi_realloc`,
 which the host calls to place the bytes a read returns; `manifest`, the
 isotope Block's declaration of the store it serves; and its one mutable
 global, the shadow stack pointer, so a host can check it is at its base

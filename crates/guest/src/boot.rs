@@ -191,6 +191,86 @@ pub unsafe extern "C" fn zaqaru_stop_at(target: i64) -> i32 {
     }
 }
 
+/// Runs the container until its board stands at an instant of the
+/// board's own — `kind` 0: just after its `target`th instruction; 1: the
+/// first instruction boundary at or after `target` picoseconds of its
+/// simulated time — and holds it there, as [`zaqaru_stop_at`] holds the
+/// container at a count of its own instructions. The board is held at that
+/// horizon (see `System::hold_board`) from the first turn it exists, so
+/// whatever moves it — its clock, a debugger, the probe — stops there.
+///
+/// The container's count does not name such an instant: an idle container
+/// retires no instructions while the board, moved on at each idle turn
+/// against a recorded clock reading, runs on. So the turns are run as
+/// they come, idle ones too, to the one in which the board arrives.
+///
+/// Answers stopped once it is there; and stopped as well, the board short
+/// of it, when the container has run past `bound` of its own instructions,
+/// or [`STALLED_TURNS`] turns in a row have moved neither the container
+/// nor the board — a board halted for good, a replay whose recording has
+/// run out — so that whoever asks reads where the board did get to. For
+/// reading, not continuing.
+///
+/// # Safety
+/// As [`zaqaru_run`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zaqaru_stop_at_board(kind: i32, target: i64, bound: i64) -> i32 {
+    let slot = unsafe { &mut *(&raw mut SYSTEM) };
+    if let Some(status) = unsafe { FINISHED } {
+        if let Some(system) = slot {
+            system.serve();
+        }
+        return finished(status);
+    }
+    let system = match slot {
+        Some(system) => system,
+        None => match boot() {
+            Ok(booted) => slot.insert(booted),
+            Err(status) => {
+                unsafe { FINISHED = Some(status) };
+                return finished(status);
+            }
+        },
+    };
+    let target = target.max(0) as u64;
+    let (instructions, time) = if kind == 0 { (target, u64::MAX) } else { (u64::MAX, target) };
+    let bound = if bound < 0 { u64::MAX } else { bound as u64 };
+    let mut last = None;
+    let mut stalled = 0;
+    loop {
+        let hold = system.hold_board(instructions, time);
+        let here = (system.retired(), hold.map(|h| (h.instructions, h.time)));
+        stalled = if last == Some(here) { stalled + 1 } else { 0 };
+        last = Some(here);
+        if hold.is_some_and(|h| h.there) || system.retired() > bound || stalled >= STALLED_TURNS {
+            system.serve();
+            return KIND_STOPPED;
+        }
+        match system.turn_toward(None) {
+            Turn::Ran | Turn::Idle | Turn::Stopped => {}
+            Turn::Finished(outcome) => {
+                system.serve();
+                report_statistics(system);
+                let status = match outcome {
+                    Exit::Status(status) => status,
+                    other => {
+                        let mut message = String::from("guest: the container stopped: ");
+                        describe(&other, &mut message);
+                        report_to(&mut system.current().kernel, &message);
+                        UNIMPLEMENTED
+                    }
+                };
+                unsafe { FINISHED = Some(status) };
+                return finished(status);
+            }
+        }
+    }
+}
+
+/// How many turns in a row may move neither the container nor its board
+/// before [`zaqaru_stop_at_board`] takes it that nothing will.
+const STALLED_TURNS: u32 = 100_000;
+
 fn finished(status: i32) -> i32 {
     KIND_FINISHED | (status & 0xff) << 8
 }

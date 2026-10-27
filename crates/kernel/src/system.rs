@@ -443,6 +443,24 @@ impl<'a, S: Store + Clone> System<'a, S> {
         self.turn_toward(None)
     }
 
+    /// Holds the board at a horizon of its own — just after its
+    /// `instructions`th instruction, or the first instruction boundary at
+    /// or after `time` picoseconds, whichever comes first (`u64::MAX` for
+    /// neither) — which nothing that runs it will take it past. Answers
+    /// where it stands; `None` when there is no board (yet).
+    ///
+    /// For standing the board at an instant of its own, which the
+    /// container's count of instructions does not name: an idle container
+    /// retires none, while the board, moved on at each of its idle turns,
+    /// runs on. See `zaqaru_stop_at_board`.
+    pub fn hold_board(&mut self, instructions: u64, time: u64) -> Option<BoardHold> {
+        let shared = crate::board::Shared::clone(&self.current().kernel.board);
+        let mut slot = shared.borrow_mut();
+        let crate::board::Slot::Present(board) = &mut *slot else { return None };
+        board.machine.horizon = armv6m::Horizon { instructions, time };
+        Some(BoardHold { there: board.machine.at_horizon(), instructions: board.machine.retired, time: board.machine.time })
+    }
+
     /// A turn that stops on an instruction. With `stop_at` set, the running
     /// process gets the smaller of a quantum and the instructions left to
     /// the target, interpreted exactly when it is the latter, and the
@@ -1144,6 +1162,18 @@ impl<'a, S: Store + Clone> System<'a, S> {
         }
     }
 
+}
+
+/// Where the board stands against the horizon it is held at: see
+/// [`System::hold_board`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoardHold {
+    /// It stands at the horizon.
+    pub there: bool,
+    /// Where it stands: its instructions retired, and its simulated time
+    /// in picoseconds.
+    pub instructions: u64,
+    pub time: u64,
 }
 
 /// Why the running process stopped, which is what decides whether another

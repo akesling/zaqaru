@@ -766,6 +766,20 @@ export class Container {
     return this.decode(this.instance.exports.zaqaru_stop_at(BigInt(target)));
   }
 
+  /// Runs until the board stands at an instant of its own and holds it
+  /// there, for reading: `{ instructions }`, just after the board's
+  /// instruction of that count, or `{ time }`, the first instruction
+  /// boundary at or after that many picoseconds of its simulated time. The
+  /// container's count of instructions doesn't name such an instant — an
+  /// idle container retires none while its board runs on — so this runs
+  /// turns, idle ones too, to the one the board arrives in. Not past
+  /// `bound` of the container's instructions, if given: whoever asks reads
+  /// where the board got to. Not for continuing.
+  stopAtBoard({ instructions, time }, bound = -1) {
+    const [kind, target] = instructions !== undefined ? [0, instructions] : [1, time];
+    return this.decode(this.instance.exports.zaqaru_stop_at_board(kind, BigInt(target), BigInt(bound)));
+  }
+
   /// Runs to completion; answers the exit status.
   boot() {
     for (;;) {
