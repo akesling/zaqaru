@@ -64,6 +64,9 @@ impl Machine {
     pub(crate) fn enter(&mut self, n: u32) -> Result<(), Outcome> {
         self.stall += self.timing.entry;
         self.entries += 1;
+        // What a supervisor call's caller left in the registers a kernel
+        // reads its arguments from, for the trace: they are not stacked.
+        let asked = (self.cpu.r[11], self.cpu.r[4], self.cpu.r[5]);
         let from_handler = self.cpu.mode == Mode::Handler;
         let on_psp = self.cpu.on_psp();
         let extended = self.cpu.fpca;
@@ -145,6 +148,12 @@ impl Machine {
             exc_return &= !EXC_RETURN_BASIC;
         }
         self.cpu.r[14] = exc_return;
+        let time = self.time;
+        let signal = match n {
+            SVCALL => crate::trace::Signal::Syscall { r11: asked.0, r4: asked.1, r5: asked.2 },
+            n => crate::trace::Signal::Exception { number: n as u16 },
+        };
+        self.trace().record(time, signal);
         self.activate(n)
     }
 
@@ -312,6 +321,10 @@ impl Machine {
             self.cpu.msp = popped;
         }
         self.bus.scs.vectactive = self.cpu.ipsr;
+        if mode == Mode::Thread && on_psp {
+            let time = self.time;
+            self.trace().returned(time, popped);
+        }
         // A line its handler left asserted is pending again.
         self.sample_interrupts();
         Ok(())

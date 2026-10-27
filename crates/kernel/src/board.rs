@@ -173,6 +173,8 @@ pub struct Board {
     /// What the archive says the board's memory is, read the first time
     /// someone asks and kept, under the archive's path.
     map: RefCell<Option<(String, Rc<Result<armv6m::hubris::Image, String>>)>>,
+    /// The archive whose tasks' stacks the trace was given.
+    stacks_for: Option<String>,
     /// The listener the probe answers on.
     listener: u32,
     pub probe: Address,
@@ -226,7 +228,7 @@ pub struct Board {
 }
 
 /// How many trace records the board keeps, and serves at a time.
-const TRACE_KEPT: usize = 200_000;
+const TRACE_KEPT: usize = 500_000;
 const TRACE_SERVED: usize = 5_000;
 
 /// How many of what the host heard the board keeps.
@@ -695,6 +697,8 @@ impl Board {
             Outcome::Budget | Outcome::Asleep | Outcome::Halted => {}
             Outcome::SystemReset => self.take_reset(),
             outcome => {
+                let time = self.machine.time;
+                self.machine.trace().record(time, armv6m::trace::Signal::Board { what: format!("halted: {outcome:?}") });
                 // A halt a debugger with halting debug on asked for — its
                 // breakpoint, or a flash algorithm returning to one — is the
                 // debugger's business, and a flash writes one per page; a
@@ -712,6 +716,8 @@ impl Board {
     /// A system reset, as SYSRESETREQ asks for one.
     fn take_reset(&mut self) {
         self.console.push(format!("{} system reset", self.stamp()));
+        let time = self.machine.time;
+        self.machine.trace().record(time, armv6m::trace::Signal::Board { what: "reset".into() });
         if let Err(e) = self.machine.reset() {
             self.console.push(format!("board: reset failed: {e}"));
         }
@@ -1040,6 +1046,29 @@ impl Board {
         )
     }
 
+    /// Gives the trace the tasks' stacks, from the board's archive, once
+    /// for each archive: what says which task the core returns to.
+    pub fn give_trace_the_stacks(&mut self, read: impl FnOnce(&[u8]) -> Result<Vec<u8>, crate::errno::Errno>) {
+        if self.stacks_for == self.archive {
+            return;
+        }
+        self.stacks_for = self.archive.clone();
+        let stacks = match self.memory_map(read).as_deref() {
+            Some(Ok(image)) => image
+                .tasks
+                .iter()
+                .filter_map(|task| {
+                    let (base, size) = task.stack?;
+                    Some((base, size, task.index? as u16))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let trace = self.machine.trace();
+        trace.stacks = stacks;
+        trace.task = None;
+    }
+
     /// What the board's archive says its memory is, read through `read`
     /// the first time it is asked for and kept until the archive changes;
     /// `None` when nobody has said what the archive is.
@@ -1259,6 +1288,15 @@ impl Board {
                     let hex: String = head.iter().map(|b| format!("{b:02x}")).collect();
                     format!(r#""rx":{received},"len":{len},"head":{}"#, quoted(&hex))
                 }
+                Signal::Exception { number } => format!(
+                    r#""exc":{number},"name":{}"#,
+                    quoted(&armv6m::scs::exception::name(*number as u32))
+                ),
+                Signal::Syscall { r11, r4, r5 } => format!(r#""r11":{r11},"r4":{r4},"r5":{r5}"#),
+                Signal::Task { index, psp } => {
+                    format!(r#""task":{},"psp":{psp}"#, index.map_or("null".into(), |n| n.to_string()))
+                }
+                Signal::Board { what } => format!(r#""what":{}"#, quoted(what)),
             };
             out.push(format!(r#"{{"n":{n},"t":{},"ch":{},{what}}}"#, record.time / 1000, quoted(&channel)));
         }
@@ -1341,6 +1379,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         };
 
         self.accept_debugger(board);
+        board.give_trace_the_stacks(|path| self.read_file(path));
         let input = match &board.client {
             Some(client) => {
                 let queued = self.rings.borrow().queued(client.receive);
@@ -1457,6 +1496,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             image: configuration.image,
             archive: configuration.archive,
             map: RefCell::new(None),
+            stacks_for: None,
             listener,
             probe,
             client: None,

@@ -75,3 +75,22 @@ fn nothing_is_recorded_until_the_trace_is_on() {
     soc.drive(2, 13, Some(true), 1000);
     assert!(soc.trace.records.is_empty());
 }
+
+#[test]
+fn a_return_to_another_task_is_recorded_and_one_to_the_same_is_not() {
+    use armv6m::trace::Trace;
+    let mut trace = Trace { on: true, stacks: vec![(0x2400_1000, 0x400, 3), (0x2400_2000, 0x200, 5)], ..Trace::default() };
+    trace.returned(10, 0x2400_13F0); // task 3
+    trace.returned(20, 0x2400_1380); // task 3, deeper: the same task
+    trace.returned(30, 0x2400_2200); // task 5, its stack empty
+    trace.returned(40, 0x2000_0000); // nobody's
+    let tasks: Vec<_> = trace.records.iter().map(|r| (r.time, r.signal.clone())).collect();
+    assert_eq!(
+        tasks,
+        [
+            (10, Signal::Task { index: Some(3), psp: 0x2400_13F0 }),
+            (30, Signal::Task { index: Some(5), psp: 0x2400_2200 }),
+            (40, Signal::Task { index: None, psp: 0x2000_0000 }),
+        ]
+    );
+}

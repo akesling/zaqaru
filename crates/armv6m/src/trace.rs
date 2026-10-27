@@ -12,6 +12,15 @@
 //! Ethernet's its frames, each way, as the cable carries them (through the
 //! switch, if one is wired).
 //!
+//! And the core's own: each exception it takes — SysTick, an interrupt, a
+//! fault — and each supervisor call with the registers a kernel reads its
+//! arguments from (Hubris's: the call's number in r11, a send's target and
+//! operation in r4); and which task it returns to, whenever that changes —
+//! known by the process stack pointer it returns with, and the stacks the
+//! trace was told of ([`Trace::stacks`]) — so a timeline can show which task
+//! ran when, and what it asked of the kernel. And the board's own: a reset,
+//! a halt.
+//!
 //! Recording is off until someone turns it on ([`Trace::on`]); then the
 //! records wait in [`Trace::records`] for whoever drains them.
 
@@ -29,6 +38,17 @@ pub enum Signal {
     /// An Ethernet frame on the cable, received or sent: its first bytes,
     /// and how long it was.
     Eth { received: bool, len: u32, head: Vec<u8> },
+    /// The core took exception `number` — 15 SysTick, 16 and up an
+    /// interrupt, 3 to 6 a fault — other than a supervisor call.
+    Exception { number: u16 },
+    /// A supervisor call: what r11, r4 and r5 held at the `svc`.
+    Syscall { r11: u32, r4: u32, r5: u32 },
+    /// The core returned to a task other than the last one it returned
+    /// to: the task's index among [`Trace::stacks`], or `None` for a stack
+    /// in none of them; and the process stack pointer it returned with.
+    Task { index: Option<u16>, psp: u32 },
+    /// The board itself: `reset`, or why it halted.
+    Board { what: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,12 +86,35 @@ pub const FRAME_HEAD: usize = 96;
 pub struct Trace {
     pub on: bool,
     pub records: Vec<Record>,
+    /// The tasks' stacks — `(base, size, index)` — which say whose a
+    /// process stack pointer is; empty until someone says.
+    pub stacks: Vec<(u32, u32, u16)>,
+    /// The task last returned to, once one has been: so that a return to
+    /// the same task records nothing.
+    pub task: Option<Option<u16>>,
 }
 
 impl Trace {
     pub fn record(&mut self, time: u64, signal: Signal) {
         if self.on {
             self.records.push(Record { time, signal });
+        }
+    }
+
+    /// A return to Thread mode on the process stack, at `psp`: recorded if
+    /// it is to a task other than the last.
+    pub fn returned(&mut self, time: u64, psp: u32) {
+        if !self.on {
+            return;
+        }
+        let index = self
+            .stacks
+            .iter()
+            .find(|&&(base, size, _)| psp >= base && psp - base <= size)
+            .map(|&(_, _, index)| index);
+        if self.task != Some(index) {
+            self.task = Some(index);
+            self.record(time, Signal::Task { index, psp });
         }
     }
 
@@ -86,7 +129,8 @@ impl Trace {
 
 impl Signal {
     /// The channel a probe watches it on: `PB0`, `I2C2`, `SPI3`, `USART1`,
-    /// `ETH`.
+    /// `ETH`; and the core's and the board's, `EXC`, `SYS`, `TASK` and
+    /// `BOARD`.
     pub fn channel(&self) -> String {
         match self {
             Signal::Pin { port, pin, .. } => format!("P{}{pin}", (b'A' + port) as char),
@@ -94,6 +138,10 @@ impl Signal {
             Signal::Spi { controller, .. } => format!("SPI{}", controller + 1),
             Signal::Usart { port, .. } => format!("USART{}", port + 1),
             Signal::Eth { .. } => "ETH".to_string(),
+            Signal::Exception { .. } => "EXC".to_string(),
+            Signal::Syscall { .. } => "SYS".to_string(),
+            Signal::Task { .. } => "TASK".to_string(),
+            Signal::Board { .. } => "BOARD".to_string(),
         }
     }
 }
