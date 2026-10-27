@@ -199,7 +199,12 @@ pub struct Board {
     pub name: String,
     /// What has crossed the chip's pins and buses, numbered, the latest
     /// [`TRACE_KEPT`]; and the number the next will have.
-    trace: VecDeque<(u64, armv6m::trace::Record)>,
+    trace: VecDeque<(u64, armv6m::trace::Record, u64)>,
+    /// The container's instant — its instructions retired, the axis of
+    /// its timeline — at the crossing the board is being moved on at: what
+    /// each record collected there is stamped with. The board runs only at
+    /// crossings, so every record of one run of it has the same.
+    stamp: u64,
     trace_next: u64,
     /// What the USARTs have sent, the latest [`SERIAL_KEPT`] bytes or so.
     pub serial: Vec<u8>,
@@ -746,7 +751,7 @@ impl Board {
     fn collect(&mut self) {
         let records: Vec<armv6m::trace::Record> = self.machine.trace().records.drain(..).collect();
         for record in records {
-            self.trace.push_back((self.trace_next, record));
+            self.trace.push_back((self.trace_next, record, self.stamp));
             self.trace_next += 1;
         }
         if self.trace.len() > TRACE_KEPT {
@@ -1238,7 +1243,7 @@ impl Board {
     pub fn trace_json(&self, since: i64, channels: &[&str]) -> String {
         use crate::system::server::quoted;
         use armv6m::trace::{I2cEvent, Signal, SpiEvent};
-        let first = self.trace.front().map_or(self.trace_next, |(n, _)| *n);
+        let first = self.trace.front().map_or(self.trace_next, |(n, _, _)| *n);
         let wanted = |record: &armv6m::trace::Record| {
             let channel = record.signal.channel();
             channels.is_empty() || channels.iter().any(|c| c.eq_ignore_ascii_case(&channel))
@@ -1247,7 +1252,7 @@ impl Board {
         // stops.
         let since = if since < 0 {
             let tail = since.unsigned_abs().min(TRACE_SERVED as u64) as usize;
-            self.trace.iter().rev().filter(|(_, record)| wanted(record)).take(tail).last().map_or(self.trace_next, |(n, _)| *n)
+            self.trace.iter().rev().filter(|(_, record, _)| wanted(record)).take(tail).last().map_or(self.trace_next, |(n, _, _)| *n)
         } else {
             since as u64
         };
@@ -1256,7 +1261,7 @@ impl Board {
         // read a later instant of the board and now reads an earlier one —
         // learns where it is.
         let mut next = since.max(first).min(self.trace_next);
-        for (n, record) in self.trace.iter().skip(since.saturating_sub(first) as usize) {
+        for (n, record, at) in self.trace.iter().skip(since.saturating_sub(first) as usize) {
             if out.len() == TRACE_SERVED {
                 break;
             }
@@ -1298,7 +1303,7 @@ impl Board {
                 }
                 Signal::Board { what } => format!(r#""what":{}"#, quoted(what)),
             };
-            out.push(format!(r#"{{"n":{n},"t":{},"ch":{},{what}}}"#, record.time / 1000, quoted(&channel)));
+            out.push(format!(r#"{{"n":{n},"t":{},"at":{at},"ch":{},{what}}}"#, record.time / 1000, quoted(&channel)));
         }
         format!(r#"{{"first":{first},"next":{next},"records":[{}]}}"#, out.join(","))
     }
@@ -1369,7 +1374,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     ///
     /// Kernel state only, like the edge pump it runs beside: the board,
     /// rings, the socket arena, and the store's clock and console.
-    pub fn service_board(&mut self) -> bool {
+    pub fn service_board(&mut self, at: u64) -> bool {
         self.look_for_board_now();
         let board = Rc::clone(&self.board);
         let mut slot = board.borrow_mut();
@@ -1378,6 +1383,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             return self.service_usb();
         };
 
+        board.stamp = at;
         self.accept_debugger(board);
         board.give_trace_the_stacks(|path| self.read_file(path));
         let input = match &board.client {
@@ -1509,6 +1515,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             leds: configuration.leds.into_iter().map(|led| (led, None)).collect(),
             name: configuration.name,
             trace: VecDeque::new(),
+            stamp: 0,
             trace_next: 0,
             serial: Vec::new(),
             faults: 0,

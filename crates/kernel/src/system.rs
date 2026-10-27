@@ -582,7 +582,8 @@ impl<'a, S: Store + Clone> System<'a, S> {
             self.current().kernel.pump(None);
             self.refresh_clock(true);
             // The board, if there is one, up to the clock just read.
-            self.current().kernel.service_board();
+            let at = self.retired();
+            self.current().kernel.service_board(at);
             self.take_shutdown();
             // And the container's own store: whatever the outside asked
             // since the last slice. Kernel state only, like the pump.
@@ -805,7 +806,8 @@ impl<'a, S: Store + Clone> System<'a, S> {
         // The board runs while the processes wait, and what it answers a
         // debugger is what a parked process is waiting *for*: if it moved
         // bytes, somebody may be runnable now, and that is not idle.
-        if self.current().kernel.service_board() {
+        let at = self.retired();
+        if self.current().kernel.service_board(at) {
             return true;
         }
         // A running board is a deadline of its own: the container wakes to

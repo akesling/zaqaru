@@ -129,8 +129,8 @@ impl Trace {
 
 impl Signal {
     /// The channel a probe watches it on: `PB0`, `I2C2`, `SPI3`, `USART1`,
-    /// `ETH`; and the core's and the board's, `EXC`, `SYS`, `TASK` and
-    /// `BOARD`.
+    /// `ETH`; and the core's and the board's, `EXC`, `FAULT`, `SYS`,
+    /// `TASK` and `BOARD`.
     pub fn channel(&self) -> String {
         match self {
             Signal::Pin { port, pin, .. } => format!("P{}{pin}", (b'A' + port) as char),
@@ -138,6 +138,9 @@ impl Signal {
             Signal::Spi { controller, .. } => format!("SPI{}", controller + 1),
             Signal::Usart { port, .. } => format!("USART{}", port + 1),
             Signal::Eth { .. } => "ETH".to_string(),
+            // A fault on a channel of its own: something to find among a
+            // thousand SysTicks a second.
+            Signal::Exception { number: 3..=6 } => "FAULT".to_string(),
             Signal::Exception { .. } => "EXC".to_string(),
             Signal::Syscall { .. } => "SYS".to_string(),
             Signal::Task { .. } => "TASK".to_string(),
