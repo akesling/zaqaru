@@ -157,6 +157,24 @@ pub enum Event {
     Fault { time: u64, pc: u32, fault: Fault, mode: Mode, privileged: bool },
 }
 
+/// A point the machine will not run past, for standing it at an exact
+/// instant of its own: just after its `instructions`th instruction retires
+/// — before it takes an exception or sleeps — or at the first instruction
+/// boundary at or after `time`, in picoseconds (or at `time` itself, if it
+/// sleeps through it). Whichever comes first; `NONE` is neither.
+///
+/// It holds against every caller, its own clock's or a debugger's: a run
+/// at the horizon is over before it starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Horizon {
+    pub instructions: u64,
+    pub time: u64,
+}
+
+impl Horizon {
+    pub const NONE: Horizon = Horizon { instructions: u64::MAX, time: u64::MAX };
+}
+
 pub struct Machine {
     /// Which STM32 this is.
     pub part: part::Part,
@@ -197,6 +215,9 @@ pub struct Machine {
     /// Simulated time busy waits were skipped through, in picoseconds.
     pub skipped: u64,
     pub retired: u64,
+    /// Where the machine stops and will not run past, whoever asks it to
+    /// run: see [`Horizon`].
+    pub horizon: Horizon,
     pub events: Vec<Event>,
     /// How many times each exception has been entered.
     pub taken: Box<[u64; scs::exception::COUNT]>,
@@ -298,6 +319,7 @@ impl Machine {
             entries: 0,
             skipped: 0,
             retired: 0,
+            horizon: Horizon::NONE,
             events: Vec::new(),
             taken: Box::new([0; scs::exception::COUNT]),
             priority: scs::BASE_PRIORITY,
@@ -402,6 +424,9 @@ impl Machine {
         }
         // A step is one instruction whatever the budget: a debugger that
         // asked for one is owed it, even by a caller with no time to give.
+        if self.at_horizon() {
+            return Outcome::Budget;
+        }
         if self.debug.stepping {
             self.debug.stepping = false;
             let outcome = self.execute_for(u64::MAX, 1);
@@ -427,7 +452,8 @@ impl Machine {
     }
 
     fn execute_for(&mut self, until: u64, instructions: u64) -> Outcome {
-        let last = self.retired.saturating_add(instructions);
+        let last = self.retired.saturating_add(instructions).min(self.horizon.instructions);
+        let until = until.min(self.horizon.time);
         while self.time < until && self.retired < last {
             if self.bus.scs.reset_requested {
                 return Outcome::SystemReset;
@@ -485,10 +511,15 @@ impl Machine {
             self.retired += 1;
             self.charge_stalls(1);
             if let Some(head) = self.looped.take() {
-                self.spin(head, until);
+                self.spin(head, until, last);
             }
         }
         Outcome::Budget
+    }
+
+    /// Whether the machine stands at its [`Horizon`], and will run no further.
+    pub fn at_horizon(&self) -> bool {
+        self.retired >= self.horizon.instructions || self.time >= self.horizon.time
     }
 
     /// Resumes after a debugger stop: the core leaves Debug state, and the
@@ -552,7 +583,7 @@ impl Machine {
     /// as run: their cycles, their time and their instructions, up to the
     /// last that ends before the event; the loop then goes on, and sees
     /// what the event changed when it comes.
-    fn spin(&mut self, head: u32, until: u64) {
+    fn spin(&mut self, head: u32, until: u64, last: u64) {
         let same = self.spin.clean
             && self.spin.head == head
             && self.spin.stores == self.stores
@@ -563,11 +594,14 @@ impl Machine {
             let cycles = self.cycles - self.spin.cycles;
             let per = cycles * self.period;
             let to = self.tick_due.min(until);
-            if per > 0 && to > self.time {
-                let n = (to - self.time - 1) / per;
+            let each = self.retired - self.spin.retired;
+            if per > 0 && to > self.time && each > 0 {
+                // Not past the last instruction the run may retire either:
+                // the iterations short of it are skipped, the rest run.
+                let n = ((to - self.time - 1) / per).min((last - self.retired) / each);
                 self.cycles += n * cycles;
                 self.time += n * per;
-                self.retired += n * (self.retired - self.spin.retired);
+                self.retired += n * each;
                 self.skipped += n * per;
             }
         }
