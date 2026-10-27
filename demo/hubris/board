@@ -5,6 +5,7 @@
 chip   stm32h753
 name   nucleo-h753zi
 image  /hubris/final.bin
+archive /hubris/hubris.zip     # what says what its memory is: tasks, stacks, symbols
 probe  127.0.0.1:3333
 
 # What is wired to the Nucleo's headers, where the app's configuration has

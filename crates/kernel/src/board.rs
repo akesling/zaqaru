@@ -167,6 +167,12 @@ pub struct Board {
     pub debugger: Debugger,
     pub chip: String,
     pub image: String,
+    /// The Hubris archive the image came out of, if anyone said: the
+    /// configuration's `archive`, or an `image` that is one.
+    pub archive: Option<String>,
+    /// What the archive says the board's memory is, read the first time
+    /// someone asks and kept, under the archive's path.
+    map: RefCell<Option<(String, Rc<Result<armv6m::hubris::Image, String>>)>>,
     /// The listener the probe answers on.
     listener: u32,
     pub probe: Address,
@@ -244,6 +250,9 @@ struct Client {
 pub struct Configuration {
     pub chip: String,
     pub image: String,
+    /// The Hubris build archive the image came out of, if there is one:
+    /// what says what the board's memory is (see [`Board::whatis_json`]).
+    pub archive: Option<String>,
     pub probe: (u32, u16),
     pub leds: Vec<Led>,
     /// The parts wired to the buses, a line each: `i2c I2C2 0x48 tmp117`.
@@ -325,7 +334,7 @@ const SERIAL_KEPT: usize = 16 * 1024;
 
 /// Parses `/etc/zaqaru/board`: one `key value` per line, `#` comments.
 pub fn parse(text: &str) -> Result<Configuration, String> {
-    let (mut chip, mut image, mut probe, mut led) = (None, None, None, None);
+    let (mut chip, mut image, mut probe, mut led, mut archive) = (None, None, None, None, None);
     let mut wiring = Vec::new();
     let mut name = String::new();
     for line in text.lines() {
@@ -341,6 +350,7 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
             "chip" => chip = Some(value.to_string()),
             "name" => name = value.to_string(),
             "image" => image = Some(value.to_string()),
+            "archive" => archive = Some(value.to_string()),
             "probe" => probe = Some(parse_address(value).ok_or_else(|| format!("probe `{value}`: expected a.b.c.d:port"))?),
             "led" => led = Some(Led::parse(value).ok_or_else(|| format!("led `{value}`: expected a pin and a level, `PC6 low`"))?),
             "i2c" | "spi" => {
@@ -357,6 +367,7 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
     Ok(Configuration {
         chip: part.name.to_string(),
         image: image.ok_or("no `image`")?,
+        archive,
         probe: probe.unwrap_or((crate::socket::INADDR_LOOPBACK, 3333)),
         leds: led.map_or_else(|| Led::of(part.name), |led| vec![led]),
         wiring,
@@ -482,6 +493,11 @@ impl Board {
             }
             "image" if !rest.trim().is_empty() => {
                 self.image = rest.trim().to_string();
+                // A Hubris archive, as the door flashes: it says what the
+                // board's memory is too.
+                if self.image.ends_with(".zip") {
+                    self.archive = Some(self.image.clone());
+                }
                 Ok(())
             }
             "udp" => {
@@ -1024,6 +1040,128 @@ impl Board {
         )
     }
 
+    /// What the board's archive says its memory is, read through `read`
+    /// the first time it is asked for and kept until the archive changes;
+    /// `None` when nobody has said what the archive is.
+    pub fn memory_map(
+        &self,
+        read: impl FnOnce(&[u8]) -> Result<Vec<u8>, crate::errno::Errno>,
+    ) -> Option<Rc<Result<armv6m::hubris::Image, String>>> {
+        let archive = self.archive.as_ref()?;
+        if let Some((path, map)) = &*self.map.borrow()
+            && path == archive
+        {
+            return Some(Rc::clone(map));
+        }
+        let map = Rc::new(
+            read(archive.as_bytes())
+                .map_err(|errno| format!("{archive}: {errno:?}"))
+                .and_then(|bytes| armv6m::hubris::Image::read(&bytes).map_err(|why| format!("{archive}: {why}"))),
+        );
+        *self.map.borrow_mut() = Some((archive.clone(), Rc::clone(&map)));
+        Some(map)
+    }
+
+    /// The board's memory as its archive lays it out, as JSON: the
+    /// kernel, and each task in the task table's order, each with its
+    /// sections, its stack and how many symbols name what is in it.
+    pub fn tasks_json(&self, map: Option<&Result<armv6m::hubris::Image, String>>) -> String {
+        use crate::system::server::quoted;
+        let archive = self.archive.as_deref().map_or("null".into(), quoted);
+        let image = match map {
+            None => return format!(r#"{{"archive":null,"error":"the board's configuration names no archive"}}"#),
+            Some(Err(why)) => return format!(r#"{{"archive":{archive},"error":{}}}"#, quoted(why)),
+            Some(Ok(image)) => image,
+        };
+        let owner = |o: &armv6m::hubris::Owner| {
+            let sections: Vec<String> = o
+                .sections
+                .iter()
+                .map(|s| {
+                    format!(
+                        r#"{{"name":{},"base":{},"size":{},"writable":{},"executable":{}}}"#,
+                        quoted(&s.name),
+                        s.base,
+                        s.size,
+                        s.writable,
+                        s.executable
+                    )
+                })
+                .collect();
+            let stack = o.stack.map_or("null".into(), |(base, size)| format!(r#"{{"base":{base},"size":{size}}}"#));
+            let index = o.index.map_or("null".into(), |n| n.to_string());
+            format!(
+                r#"{{"name":{},"index":{index},"stack":{stack},"sections":[{}],"symbols":{}}}"#,
+                quoted(&o.name),
+                sections.join(","),
+                o.symbols.len()
+            )
+        };
+        let tasks: Vec<String> = image.tasks.iter().map(owner).collect();
+        format!(
+            r#"{{"archive":{archive},"app":{},"kernel":{},"tasks":[{}]}}"#,
+            quoted(&image.name),
+            owner(&image.kernel),
+            tasks.join(",")
+        )
+    }
+
+    /// What `address` is, as JSON: the memory or peripheral it is in, by
+    /// the chip's memory map; whose it is — the kernel's or a task's — and
+    /// which part, by the archive; the function or static it falls in;
+    /// and all of it as a line a person reads,
+    /// `i2c_driver .bss: drv_stm32xx_i2c_server::BUF + 0x4 (AXI SRAM + 0xd41c)`.
+    pub fn whatis_json(&self, address: u32, map: Option<&Result<armv6m::hubris::Image, String>>) -> String {
+        use crate::system::server::quoted;
+        let block = armv6m::names::block(&self.machine.bus.soc, address);
+        let place = map.and_then(|m| m.as_ref().ok()).and_then(|image| image.whatis(address));
+        let mut text = String::new();
+        if let Some(place) = &place {
+            text += &format!("{} {}", place.owner.name, place.part);
+            if let Some((symbol, offset)) = place.symbol {
+                text += &format!(": {}", symbol.name);
+                if offset > 0 {
+                    text += &format!(" + {offset:#x}");
+                }
+            }
+        }
+        if let Some((name, base)) = block {
+            let at = if address > base { format!("{name} + {:#x}", address - base) } else { name.to_string() };
+            text = if text.is_empty() { at } else { format!("{text} ({at})") };
+        }
+        if text.is_empty() {
+            text = format!("{address:#010x}: nothing the chip or the archive names");
+        }
+        let block = block.map_or("null".into(), |(name, base)| {
+            format!(r#"{{"name":{},"base":{base},"offset":{}}}"#, quoted(name), address - base)
+        });
+        let (owner, task, part, symbol) = match &place {
+            None => ("null".into(), "null".into(), "null".into(), "null".into()),
+            Some(place) => (
+                quoted(&place.owner.name),
+                place.owner.index.map_or("null".into(), |n| n.to_string()),
+                quoted(&place.part),
+                place.symbol.map_or("null".into(), |(s, offset)| {
+                    format!(
+                        r#"{{"name":{},"base":{},"size":{},"offset":{offset},"function":{}}}"#,
+                        quoted(&s.name),
+                        s.base,
+                        s.size,
+                        s.function
+                    )
+                }),
+            ),
+        };
+        let error = match map {
+            Some(Err(why)) => quoted(why),
+            _ => "null".into(),
+        };
+        format!(
+            r#"{{"address":{address},"text":{},"block":{block},"owner":{owner},"task":{task},"part":{part},"symbol":{symbol},"error":{error}}}"#,
+            quoted(&text)
+        )
+    }
+
     /// Up to [`MEMORY_SERVED`] bytes of the board's memory from `address`, as
     /// a debugger reads them: RAM, flash and the peripherals' registers,
     /// without a read's side effects. As JSON, hex, two digits a byte and
@@ -1317,6 +1455,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             debugger: Debugger::default(),
             chip: configuration.chip,
             image: configuration.image,
+            archive: configuration.archive,
+            map: RefCell::new(None),
             listener,
             probe,
             client: None,
@@ -1353,7 +1493,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     }
 
     /// The whole of a regular file in the container's filesystem.
-    fn read_file(&self, path: &[u8]) -> Result<Vec<u8>, crate::errno::Errno> {
+    pub(crate) fn read_file(&self, path: &[u8]) -> Result<Vec<u8>, crate::errno::Errno> {
         let root = self.vfs.root();
         let vnode = self.vfs.resolve(root, path, crate::vfs::Lookup::FOLLOW)?;
         let inode = self.vfs.inode(vnode)?;
@@ -1434,6 +1574,7 @@ mod tests {
             Configuration {
                 chip: "stm32g031".into(),
                 image: "/hubris/final.bin".into(),
+                archive: None,
                 probe: (0x7F00_0001, 3333),
                 leds: vec![Led { port: 2, pin: 6, active_low: true, color: "green" }],
                 wiring: vec![],
