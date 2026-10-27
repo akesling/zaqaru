@@ -64,12 +64,22 @@ pub struct Unmapped;
 pub struct Ram {
     pub base: u32,
     pub bytes: Vec<u8>,
-    /// When each word was last written: the board's time in microseconds,
-    /// plus one; 0 for never. It saturates at about 71 minutes.
-    pub written: Vec<u32>,
-    /// What last wrote each word: the address of the instruction that
-    /// stored to it, or one of [`BY_DMA`], [`BY_PROBE`], [`BY_EXCEPTION`].
-    pub writer: Vec<u32>,
+    /// When each word was last written, and by what; written through
+    /// [`Bus::write`] and the DMA, which keep it, and not otherwise —
+    /// what changes `bytes` directly, as a test setting up memory does,
+    /// leaves no mark.
+    pub marks: Vec<Mark>,
+}
+
+/// When a word of RAM was last written, and what wrote it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Mark {
+    /// The board's time in microseconds, plus one ([`write_stamp`]); 0
+    /// for never.
+    pub stamp: u64,
+    /// The address of the instruction that stored to it, or one of
+    /// [`BY_DMA`], [`BY_PROBE`], [`BY_EXCEPTION`].
+    pub writer: u32,
 }
 
 /// A word written by a peripheral's DMA.
@@ -79,25 +89,24 @@ pub const BY_PROBE: u32 = 0xFFFF_FFFE;
 /// A word written by the core itself, stacking an exception's frame.
 pub const BY_EXCEPTION: u32 = 0xFFFF_FFFD;
 
-/// The board's time, `now` picoseconds, as [`Ram::written`] keeps it.
-pub fn write_stamp(now: u64) -> u32 {
-    (now / 1_000_000).saturating_add(1).min(u32::MAX as u64) as u32
+/// The board's time, `now` picoseconds, as a [`Mark`] keeps it.
+pub fn write_stamp(now: u64) -> u64 {
+    now / 1_000_000 + 1
 }
 
 impl Ram {
     pub fn new(base: u32, size: usize) -> Ram {
         let words = size.div_ceil(4);
-        Ram { base, bytes: vec![0; size], written: vec![0; words], writer: vec![0; words] }
+        Ram { base, bytes: vec![0; size], marks: vec![Mark::default(); words] }
     }
 
     /// The `len` bytes at `offset` written at `stamp` by `writer`.
-    fn mark(&mut self, offset: usize, len: usize, stamp: u32, writer: u32) {
+    fn mark(&mut self, offset: usize, len: usize, stamp: u64, writer: u32) {
         if len == 0 {
             return;
         }
         for word in offset / 4..=(offset + len - 1) / 4 {
-            self.written[word] = stamp;
-            self.writer[word] = writer;
+            self.marks[word] = Mark { stamp, writer };
         }
     }
 }
@@ -130,6 +139,10 @@ pub struct Bus {
     /// What is writing: the address of the instruction storing, or one of
     /// the `BY_*`; whoever writes sets it first, as with `now`.
     pub writer: u32,
+    /// [`write_stamp`] of `stamped`: worked out again only when `now` has
+    /// moved on, not at every store.
+    stamp: u64,
+    stamped: u64,
 }
 
 enum Target {
@@ -169,6 +182,8 @@ impl Bus {
                     soc: Soc::G0(Box::new(soc)),
                     now: 0,
                     writer: 0,
+                    stamp: 1,
+                    stamped: 0,
                 }
             }
             Family::H7 => {
@@ -194,36 +209,41 @@ impl Bus {
                     soc: Soc::H7(Box::default()),
                     now: 0,
                     writer: 0,
+                    stamp: 1,
+                    stamped: 0,
                 }
             }
         })
     }
 
-    /// The RAM at `base`, if there is one there.
-    pub fn ram(&mut self, base: u32) -> Option<&mut Vec<u8>> {
-        self.rams.iter_mut().find(|ram| ram.base == base).map(|ram| &mut ram.bytes)
+    /// The RAM `addr` is in: its number, and the offset in it.
+    pub fn ram_at(&self, addr: u32) -> Option<(usize, usize)> {
+        self.rams
+            .iter()
+            .position(|ram| addr >= ram.base && ((addr - ram.base) as usize) < ram.bytes.len())
+            .map(|i| (i, (addr - self.rams[i].base) as usize))
     }
 
-    /// When the word at `addr` was last written, as [`Ram::written`]
-    /// keeps it, and what wrote it; `None` if it is not RAM or was never
-    /// written.
-    pub fn last_write(&self, addr: u32) -> Option<(u32, u32)> {
-        let ram = self.rams.iter().find(|ram| addr >= ram.base && ((addr - ram.base) as usize) < ram.bytes.len())?;
-        let word = (addr - ram.base) as usize / 4;
-        (ram.written[word] != 0).then(|| (ram.written[word], ram.writer[word]))
+    /// When the word at `addr` was last written, and what wrote it; `None`
+    /// if it is not RAM or was never written.
+    pub fn last_write(&self, addr: u32) -> Option<Mark> {
+        let (i, offset) = self.ram_at(addr)?;
+        let mark = self.rams[i].marks[offset / 4];
+        (mark.stamp != 0).then_some(mark)
     }
 
-    /// The cells of `cell` bytes (a multiple of 4) of every RAM written
-    /// after the stamp `since`: each RAM's base, the cell's number in it,
-    /// and when it was last written.
-    pub fn written_since(&self, since: u32, cell: u32) -> Vec<(u32, u32, u32)> {
-        let words = (cell / 4).max(1) as usize;
+    /// The cells of `cell` bytes (a multiple of 4) of every RAM written at
+    /// or after the stamp `since`: each RAM's number, the cell's number in
+    /// it, and when it was last written. At, as well as after: a word
+    /// written in the microsecond the last answer was given in — later in
+    /// it, or while the board stood still — has that answer's stamp, and is
+    /// not to be lost.
+    pub fn written_since(&self, since: u64, cell: u32) -> Vec<(usize, u32, u64)> {
         let mut out = Vec::new();
-        for ram in &self.rams {
-            for (n, stamps) in ram.written.chunks(words).enumerate() {
-                let last = stamps.iter().copied().max().unwrap_or(0);
-                if last > since {
-                    out.push((ram.base, n as u32, last));
+        for (i, ram) in self.rams.iter().enumerate() {
+            for (n, last) in Self::cells(&ram.marks, cell) {
+                if last >= since && last != 0 {
+                    out.push((i, n, last));
                 }
             }
         }
@@ -231,23 +251,31 @@ impl Bus {
     }
 
     /// The cells of `cell` bytes (a multiple of 4) of `[base, base +
-    /// length)`, within one RAM, written after the stamp `since`: each
-    /// cell's number from `base`, and when it was last written.
-    pub fn written_in(&self, since: u32, cell: u32, base: u32, length: u32) -> Vec<(u32, u32)> {
-        let Some(ram) = self.rams.iter().find(|ram| base >= ram.base && ((base - ram.base) as usize) < ram.bytes.len()) else {
-            return Vec::new();
-        };
-        let from = (base - ram.base) as usize / 4;
-        let to = ((base - ram.base) as usize + length as usize).div_ceil(4).min(ram.written.len());
+    /// length)` — of the one RAM `base` is in, and no further than its
+    /// end — written at or after the stamp `since`: each cell's number from
+    /// `base`, and when it was last written. `None` if `base` is not RAM.
+    pub fn written_in(&self, since: u64, cell: u32, base: u32, length: u32) -> Option<Vec<(u32, u64)>> {
+        let (i, offset) = self.ram_at(base)?;
+        let marks = &self.rams[i].marks;
+        let from = offset / 4;
+        let to = (offset as u64 + length as u64).div_ceil(4).min(marks.len() as u64) as usize;
+        Some(Self::cells(&marks[from..to.max(from)], cell).filter(|&(_, last)| last >= since && last != 0).collect())
+    }
+
+    /// Each cell of `cell` bytes of `marks`: its number, and the last
+    /// stamp in it.
+    fn cells(marks: &[Mark], cell: u32) -> impl Iterator<Item = (u32, u64)> + '_ {
         let words = (cell / 4).max(1) as usize;
-        let mut out = Vec::new();
-        for (n, stamps) in ram.written[from..to].chunks(words).enumerate() {
-            let last = stamps.iter().copied().max().unwrap_or(0);
-            if last > since {
-                out.push((n as u32, last));
-            }
+        marks.chunks(words).enumerate().map(|(n, marks)| (n as u32, marks.iter().map(|m| m.stamp).max().unwrap_or(0)))
+    }
+
+    /// [`write_stamp`] of the time it is.
+    fn stamp(&mut self) -> u64 {
+        if self.stamped != self.now {
+            self.stamped = self.now;
+            self.stamp = write_stamp(self.now);
         }
-        out
+        self.stamp
     }
 
     fn decode(&self, addr: u32) -> Option<Target> {
@@ -332,15 +360,14 @@ impl Bus {
             Target::Memory { region: Region::System, .. } => Err(Unmapped),
             Target::Memory { region: Region::Ram(i), offset } => {
                 let bytes = value.to_le_bytes();
+                let (stamp, writer) = (self.stamp(), self.writer);
                 let ram = &mut self.rams[i];
                 match size {
                     1 => ram.bytes[offset] = bytes[0],
                     2 => ram.bytes[offset..offset + 2].copy_from_slice(&bytes[..2]),
                     _ => ram.bytes[offset..offset + 4].copy_from_slice(&bytes),
                 }
-                let word = offset / 4;
-                ram.written[word] = write_stamp(self.now);
-                ram.writer[word] = self.writer;
+                ram.mark(offset, size as usize, stamp, writer);
                 Ok(())
             }
             Target::Scs => {
@@ -362,17 +389,18 @@ impl Bus {
 
     /// `len` bytes of RAM at `addr`, if they are all in one RAM: what a DMA
     /// reaches.
-    /// `len` bytes of RAM at `addr` written by DMA at `now`.
-    fn dma_wrote(rams: &mut [Ram], addr: u32, len: usize, now: u64) {
-        if let Some(ram) = rams.iter_mut().find(|ram| addr >= ram.base && (addr - ram.base) as usize + len <= ram.bytes.len()) {
-            ram.mark((addr - ram.base) as usize, len, write_stamp(now), BY_DMA);
-        }
-    }
-
     fn dma_slice(rams: &mut [Ram], addr: u32, len: usize) -> Option<&mut [u8]> {
         let ram = rams.iter_mut().find(|ram| addr >= ram.base && (addr - ram.base) as usize + len <= ram.bytes.len())?;
         let at = (addr - ram.base) as usize;
         Some(&mut ram.bytes[at..at + len])
+    }
+
+    /// `len` bytes of RAM at `addr`, as [`Bus::dma_slice`] found them,
+    /// written by DMA at `now`.
+    fn dma_wrote(rams: &mut [Ram], addr: u32, len: usize, now: u64) {
+        if let Some(ram) = rams.iter_mut().find(|ram| addr >= ram.base && (addr - ram.base) as usize + len <= ram.bytes.len()) {
+            ram.mark((addr - ram.base) as usize, len, write_stamp(now), BY_DMA);
+        }
     }
 
     fn dma_words(rams: &mut [Ram], addr: u32) -> Option<[u32; 4]> {

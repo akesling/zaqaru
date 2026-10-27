@@ -92,7 +92,10 @@ impl Machine {
 
         let privileged = self.cpu.privileged();
         let mut stacked = None;
-        self.bus.now = self.time;
+        // Only who is writing: `bus.now` is left as the last access left
+        // it, as it always was here, so what a frame stacked into a
+        // peripheral does is unchanged — and the frame's words are marked
+        // at that access's time, within an instruction of the entry.
         self.bus.writer = crate::bus::BY_EXCEPTION;
         for (i, &word) in values.iter().enumerate() {
             let addr = frame.wrapping_add(4 * i as u32);

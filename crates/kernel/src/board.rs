@@ -73,6 +73,17 @@ use crate::socket::{Address, Endpoint, State};
 /// The most of the board's memory one read of it serves.
 pub const MEMORY_SERVED: u32 = 4096;
 
+/// The most cells a `board/writes` answer has: the cells asked for are
+/// made larger, if they must be, to keep within it.
+pub const CELLS_SERVED: usize = 65536;
+
+/// The cell size, a multiple of 4, that covers `bytes` in at most
+/// [`CELLS_SERVED`] cells, and is no smaller than `asked`.
+fn cell_for(asked: u32, bytes: usize) -> u32 {
+    let least = bytes.div_ceil(CELLS_SERVED).next_multiple_of(4) as u32;
+    (asked.clamp(4, 1 << 20) & !3).max(least)
+}
+
 /// What Hubris's kernel fills a task's stack with when it starts the task.
 const STACK_PAINT: u32 = 0xbadd_cafe;
 
@@ -1396,14 +1407,15 @@ impl Board {
     pub fn written_json(&self, address: u32, length: u32, map: Option<&Result<armv6m::hubris::Image, String>>) -> String {
         use crate::system::server::quoted;
         use armv6m::bus::{BY_DMA, BY_EXCEPTION, BY_PROBE};
+        // Every word the bytes asked for touch, from the one the first is in.
+        let words = (length.min(MEMORY_SERVED) + (address & 3)).div_ceil(4);
         let address = address & !3;
-        let words = length.min(MEMORY_SERVED).div_ceil(4);
         let mut writers: Vec<u32> = Vec::new();
         let mut out = Vec::with_capacity(words as usize);
         for n in 0..words {
             match self.machine.bus.last_write(address.wrapping_add(4 * n)) {
                 None => out.push("0,-1".to_string()),
-                Some((stamp, by)) => {
+                Some(armv6m::bus::Mark { stamp, writer: by }) => {
                     let index = writers.iter().position(|&w| w == by).unwrap_or_else(|| {
                         writers.push(by);
                         writers.len() - 1
@@ -1429,14 +1441,17 @@ impl Board {
         )
     }
 
-    /// Which cells of `cell` bytes of the board's RAMs were written after
-    /// the stamp `since` (see [`Board::written_json`]), as JSON: the RAMs,
-    /// the board's time now, and each cell's RAM, number and last stamp,
-    /// flat, three numbers a cell — what a picture of memory lit by its
-    /// writes reads, again and again, for what changed.
-    pub fn writes_json(&self, since: u32, cell: u32) -> String {
-        let cell = cell.clamp(4, 1 << 20) & !3;
+    /// Which cells of `cell` bytes of the board's RAMs were written at or
+    /// after the stamp `since` (see [`Board::written_json`]), as JSON: the
+    /// RAMs, the board's time now, and each cell's RAM, number and last
+    /// stamp, flat, three numbers a cell — what a picture of memory lit by
+    /// its writes reads, again and again, for what changed. The cells are
+    /// made large enough that there are at most [`CELLS_SERVED`] of them,
+    /// and the answer says how large they were made.
+    pub fn writes_json(&self, since: u64, cell: u32) -> String {
         let bus = &self.machine.bus;
+        let total: usize = bus.rams.iter().map(|ram| ram.bytes.len()).sum();
+        let cell = cell_for(cell, total);
         let rams: Vec<String> = bus
             .rams
             .iter()
@@ -1446,8 +1461,7 @@ impl Board {
             })
             .collect();
         let mut cells = Vec::new();
-        for (base, n, stamp) in bus.written_since(since, cell) {
-            let ram = bus.rams.iter().position(|r| r.base == base).unwrap_or(0);
+        for (ram, n, stamp) in bus.written_since(since, cell) {
             cells.push(format!("{ram},{n},{stamp}"));
         }
         format!(
@@ -1459,17 +1473,23 @@ impl Board {
     }
 
     /// As [`Board::writes_json`], for `[base, base + length)` of one RAM
-    /// alone, cells numbered from `base`: what a picture zoomed in on part
-    /// of a RAM reads, at a finer grain.
-    pub fn writes_in_json(&self, since: u32, cell: u32, base: u32, length: u32) -> String {
-        let cell = cell.clamp(4, 1 << 20) & !3;
+    /// alone — no further than its end — cells numbered from `base`: what a
+    /// picture zoomed in on part of a RAM reads, at a finer grain. A `base`
+    /// in no RAM answers with no RAMs and no cells.
+    pub fn writes_in_json(&self, since: u64, cell: u32, base: u32, length: u32) -> String {
         let base = base & !3;
         let bus = &self.machine.bus;
+        let now = armv6m::bus::write_stamp(self.machine.time);
+        let Some((i, offset)) = bus.ram_at(base) else {
+            return format!(r#"{{"now":{now},"cell":{},"rams":[],"cells":[]}}"#, cell.max(4) & !3);
+        };
+        let length = length.min((bus.rams[i].bytes.len() - offset) as u32);
+        let cell = cell_for(cell, length as usize);
         let name = armv6m::names::block(&bus.soc, base).map_or("RAM", |(name, _)| name);
-        let cells: Vec<String> = bus.written_in(since, cell, base, length).into_iter().map(|(n, stamp)| format!("0,{n},{stamp}")).collect();
+        let cells: Vec<String> =
+            bus.written_in(since, cell, base, length).unwrap_or_default().into_iter().map(|(n, stamp)| format!("0,{n},{stamp}")).collect();
         format!(
-            r#"{{"now":{},"cell":{cell},"rams":[{{"base":{base},"length":{length},"name":"{name}"}}],"cells":[{}]}}"#,
-            armv6m::bus::write_stamp(self.machine.time),
+            r#"{{"now":{now},"cell":{cell},"rams":[{{"base":{base},"length":{length},"name":"{name}"}}],"cells":[{}]}}"#,
             cells.join(",")
         )
     }
