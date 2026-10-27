@@ -957,7 +957,7 @@ impl Board {
             _ => String::new(),
         };
         format!(
-            r#"{{"name":{},"chip":{},"core":{},"image":{},"state":{},"speed":{},"paused":{},"ratio":{:.4},"skipped_ms":{:.3},"clocks":{{{}}},"mode":{},"privileged":{},"simulated_ms":{:.3},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"wired":[{}],"gpio":[{}],"parts":[{}],"trace_next":{},"exceptions":{{{}}},"registers":{{{}}}}}"#,
+            r#"{{"name":{},"chip":{},"core":{},"image":{},"state":{},"speed":{},"paused":{},"ratio":{:.4},"skipped_ms":{:.3},"clocks":{{{}}},"mode":{},"privileged":{},"simulated_ms":{:.3},"time_ps":{},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"wired":[{}],"gpio":[{}],"parts":[{}],"trace_next":{},"exceptions":{{{}}},"registers":{{{}}}}}"#,
             quoted(&self.name),
             quoted(&self.chip),
             quoted(core_name(m.core)),
@@ -975,6 +975,7 @@ impl Board {
             quoted(&format!("{:?}", cpu.mode)),
             cpu.privileged(),
             self.ms(m.time),
+            m.time,
             m.retired,
             lit_json(self.leds.first().and_then(|&(_, lit)| lit)),
             self.leds.first().map_or("null".into(), |(led, _)| quoted(&led.name())),
@@ -1084,7 +1085,10 @@ impl Board {
             since as u64
         };
         let mut out = Vec::new();
-        let mut next = since.max(first);
+        // Not past the end: a reader whose cursor is ahead of it — one that
+        // read a later instant of the board and now reads an earlier one —
+        // learns where it is.
+        let mut next = since.max(first).min(self.trace_next);
         for (n, record) in self.trace.iter().skip(since.saturating_sub(first) as usize) {
             if out.len() == TRACE_SERVED {
                 break;
