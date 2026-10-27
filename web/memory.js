@@ -179,6 +179,104 @@ export function rounded(base, length, within = null) {
   return { base, length };
 }
 
+/// `rect` of a RAM's picture at `cell` bytes a cell, at the finest grain
+/// that draws it with at most `most` cells: a cell of `n` bytes is a
+/// square of four of `n / 4` in its place, so each step finer doubles the
+/// rectangle's sides, down to a word a cell; and if it is already too
+/// many, coarser, up to `coarsest`, halving them outwards.
+export function refine(rect, cell, most, coarsest = CELL) {
+  while (cell > 4 && rect.w * rect.h * 4 <= most) {
+    cell /= 4;
+    rect = { x: rect.x * 2, y: rect.y * 2, w: rect.w * 2, h: rect.h * 2 };
+  }
+  while (rect.w * rect.h > most && cell < coarsest) {
+    ({ rect, cell } = coarser(rect, cell));
+  }
+  return { rect, cell };
+}
+
+/// `rect` at the next grain coarser: four times the bytes a cell, its
+/// sides halved, outwards.
+export function coarser(rect, cell) {
+  const x = Math.floor(rect.x / 2);
+  const y = Math.floor(rect.y / 2);
+  return { cell: cell * 4, rect: { x, y, w: Math.ceil((rect.x + rect.w) / 2) - x, h: Math.ceil((rect.y + rect.h) / 2) - y } };
+}
+
+/// The cells of `view` in `rect`: the first and last by address, and how
+/// many there are — `null` when there are none.
+export function runOf(view, rect) {
+  let first = Infinity;
+  let last = -1;
+  let count = 0;
+  for (let y = rect.y; y < rect.y + rect.h; y++)
+    for (let x = rect.x; x < rect.x + rect.w; x++) {
+      const c = view.at[y * view.width + x];
+      if (c < 0) continue;
+      first = Math.min(first, c);
+      last = Math.max(last, c);
+      count++;
+    }
+  return last < 0 ? null : { first, last, count };
+}
+
+/// The rectangle around the cells `[from, to)` of `view`.
+export function rectAround(view, from, to) {
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -1;
+  let y1 = -1;
+  for (let c = from; c < to; c++) {
+    const x = view.place[2 * c];
+    const y = view.place[2 * c + 1];
+    x0 = Math.min(x0, x);
+    y0 = Math.min(y0, y);
+    x1 = Math.max(x1, x);
+    y1 = Math.max(y1, y);
+  }
+  return { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+}
+
+/// Where `rect`, of a RAM's picture at `cell` bytes a cell, falls on a
+/// box `width`×`height` showing `shown` of the same RAM's picture at
+/// `shownCell` bytes a cell — a cell's side halving as its bytes quarter
+/// — clipped to the box, in the box's units; `null` if it misses it.
+export function rectOnBox(rect, cell, shown, shownCell, width, height) {
+  const f = Math.sqrt(cell / shownCell);
+  const px = width / shown.w;
+  const py = height / shown.h;
+  const left = Math.max(0, (rect.x * f - shown.x) * px);
+  const top = Math.max(0, (rect.y * f - shown.y) * py);
+  const right = Math.min(width, ((rect.x + rect.w) * f - shown.x) * px);
+  const bottom = Math.min(height, ((rect.y + rect.h) * f - shown.y) * py);
+  if (right <= left || bottom <= top) return null;
+  return { left, top, width: right - left, height: bottom - top };
+}
+
+/// Statics as the runs of memory to read for them: those within `gap`
+/// bytes of each other read together, each run from a word's start to a
+/// word's end, at most `most` bytes in all — what is past that left out.
+export function clusters(statics, gap = 256, most = Infinity) {
+  const sorted = [...statics].filter((s) => s.size > 0).sort((a, b) => a.base - b.base);
+  const out = [];
+  for (const s of sorted) {
+    const base = s.base - (s.base % 4);
+    const end = Math.ceil((s.base + s.size) / 4) * 4;
+    const last = out.at(-1);
+    if (last && base <= last.end + gap) last.end = Math.max(last.end, end);
+    else out.push({ base, end });
+  }
+  let left = most;
+  const kept = [];
+  for (const run of out) {
+    if (left <= 0) break;
+    const end = Math.min(run.end, run.base + left);
+    kept.push({ base: run.base, end });
+    left -= end - run.base;
+  }
+  return kept;
+}
+
 /// A number of bytes, as `8 KiB` or `96 B`.
 export function size(bytes) {
   if (bytes >= 1024 * 1024) return `${+(bytes / 1048576).toFixed(1)} MiB`;
@@ -227,6 +325,12 @@ export class MemoryView {
     this.open = new Set(); // the statics shown whole
     this.zooms = []; // the way down: each a rectangle of a RAM's picture, and what it reads
     this.layouts = new Map(); // pictures' layouts, by RAM length and cell
+    // Bumped whenever what is shown is changed under the reads made for
+    // it — another image, instant or zoom — so an answer to an older one is
+    // dropped rather than drawn.
+    this.generation = 0;
+    this.inspecting = 0; // the same, for the inspector's own reads
+    this.latest = 0; // the latest stamp any picture has
     this.reset();
     this.image = null;
     this.owners = [];
@@ -244,13 +348,41 @@ export class MemoryView {
     this.rams = null;
     this.detail = null;
     this.now = 0;
+    this.latest = 0;
     this.instant = undefined;
     this.inspected = null;
+    this.generation++;
+  }
+
+  /// What the board's archive says its memory is: read when the image
+  /// changes, and again now and then — stacks deepen as the board runs,
+  /// and a board whose archive could not be read may yet have one.
+  readTasks() {
+    const image = this.image;
+    this.tasksRead = performance.now();
+    this.read("board/tasks")
+      .then((tasks) => {
+        if (image !== this.image || !tasks) return;
+        if (tasks.error !== undefined && tasks.kernel === undefined) {
+          this.tasks = { error: tasks.error };
+          return this.drawOwners();
+        }
+        const first = !this.tasks?.kernel;
+        this.tasks = tasks;
+        if (first) {
+          this.owners = owners(tasks, this.colorOf);
+          for (const picture of [...(this.rams ?? []), this.detail].filter(Boolean)) Object.assign(picture, cellOwners(picture.base, picture.view, this.owners));
+          this.repaint = true;
+          this.draw();
+        } else this.drawOwners();
+      })
+      .catch(() => {});
   }
 
   /// The board as the board panel last read it, and the instant the page
   /// stands at (`null`: live).
   update(board, standing) {
+    const instant = standing === null ? null : board.time_ps;
     if (board.image !== this.image) {
       this.image = board.image;
       this.reset();
@@ -259,35 +391,17 @@ export class MemoryView {
       this.symbols = new Map();
       this.whatis.clear();
       this.tasks = null;
-      this.read("board/tasks")
-        .then((tasks) => {
-          if (tasks?.error) return;
-          this.tasks = tasks;
-          this.owners = owners(tasks, this.colorOf);
-          for (const picture of [...(this.rams ?? []), this.detail].filter(Boolean)) Object.assign(picture, cellOwners(picture.base, picture.view, this.owners));
-          this.draw();
-        })
-        .catch(() => {});
-    }
-    const instant = standing === null ? null : board.time_ps;
-    // Stacks deepen as the board runs: their depths read again now and
-    // then, and at each instant stood at.
-    if (this.tasks && (instant !== this.instant || performance.now() - (this.tasksRead ?? 0) > TASKS_MS)) {
-      this.tasksRead = performance.now();
-      this.read("board/tasks")
-        .then((tasks) => {
-          if (tasks?.kernel && board.image === this.image) {
-            this.tasks = tasks;
-            this.drawOwners();
-          }
-        })
-        .catch(() => {});
-    }
+      this.drawOwners();
+      this.readTasks();
+    } else if (this.tasks && (instant !== this.instant || performance.now() - (this.tasksRead ?? 0) > TASKS_MS)) this.readTasks();
     if (instant !== this.instant) {
+      const image = this.image;
+      this.reset();
+      this.image = image;
       this.instant = instant;
-      this.rams = null;
-      this.detail = null;
-      this.inspected = null;
+      // A poll for the instant before may be under way: it is dropped when
+      // it answers, and this one made once it has.
+      if (this.busy) this.again = true;
       this.poll(true);
     } else this.poll(false);
   }
@@ -297,7 +411,7 @@ export class MemoryView {
   picture(ram, cell, rect = null) {
     const view = this.layoutOf(ram, cell);
     rect ??= { x: 0, y: 0, w: view.width, h: view.height };
-    return { ...ram, cell, view, rect, stamps: new Uint32Array(view.cells), ...cellOwners(ram.base, view, this.owners), statics: null };
+    return { ...ram, cell, view, rect, stamps: new Float64Array(view.cells), ...cellOwners(ram.base, view, this.owners), statics: null };
   }
 
   async poll(force) {
@@ -305,6 +419,7 @@ export class MemoryView {
     if (this.busy || (!force && now - (this.polled ?? 0) < POLL_MS)) return;
     this.busy = true;
     this.polled = now;
+    const generation = this.generation;
     try {
       const since = this.rams ? this.now : 0;
       const zoom = this.zooms.at(-1);
@@ -312,29 +427,47 @@ export class MemoryView {
         this.read(`board/writes/${since}/${CELL}`),
         zoom ? this.read(`board/writes/${this.detail ? this.now : 0}/${zoom.cell}/${zoom.base}/${zoom.length}`) : null,
       ]);
+      // What was asked for is no longer what is shown: dropped, and asked
+      // again for what is.
+      if (generation !== this.generation) return (this.again = true);
       if (!answer?.rams) return;
-      // The board went back — a reset, a seek: everything again.
+      // The board went back — a reset, a seek: everything again, once this
+      // poll is done.
       if (this.rams && answer.now < this.now) {
         this.rams = null;
         this.detail = null;
-        this.busy = false;
-        return this.poll(true);
+        this.latest = 0;
+        return (this.again = true);
       }
       if (!this.rams) this.rams = answer.rams.map((ram) => this.picture(ram, answer.cell));
       const cells = answer.cells;
-      for (let i = 0; i < cells.length; i += 3) this.rams[cells[i]].stamps[cells[i + 1]] = cells[i + 2];
-      // The zoom may have changed while this was read: only the one asked
-      // for is kept. Its cells are numbered from the start of what was
-      // read, which is cell `first` of the RAM's.
-      if (detail?.cells && zoom === this.zooms.at(-1)) {
+      for (let i = 0; i < cells.length; i += 3) {
+        this.rams[cells[i]].stamps[cells[i + 1]] = cells[i + 2];
+        this.latest = Math.max(this.latest, cells[i + 2]);
+      }
+      let changed = cells.length > 0;
+      // Its cells are numbered from the start of what was read, which is
+      // cell `first` of the RAM's — at the cell size asked for, which the
+      // store keeps to unless the run is too long for it.
+      if (zoom && detail?.cells && detail.cell === zoom.cell) {
         if (!this.detail) {
           this.detail = this.picture(this.rams[zoom.ram], zoom.cell, zoom.rect);
           this.nameStatics(this.detail);
+          changed = true;
         }
         for (let i = 0; i < detail.cells.length; i += 3) this.detail.stamps[zoom.first + detail.cells[i + 1]] = detail.cells[i + 2];
+        changed ||= detail.cells.length > 0;
       }
       this.now = answer.now;
-      this.draw();
+      // Repainted when something was written, or is still fading, or the
+      // page asked: an idle board's pictures are left as they are.
+      if (changed || this.repaint || heat(this.now - this.latest, this.half) > 0.02) {
+        this.repaint = false;
+        this.drawMaps();
+      }
+      this.drawHead();
+      this.drawCrumbs();
+      this.drawOwners();
       await this.inspect();
     } catch {
       // Nothing to read at this instant.
@@ -352,6 +485,7 @@ export class MemoryView {
   /// statics of the owners it shows are known: their outlines and names,
   /// drawn on it.
   async nameStatics(picture) {
+    const generation = this.generation;
     const shown = new Set();
     this.eachCell(picture, (c) => picture.owner[c] >= 0 && shown.add(picture.owner[c]));
     const all = [];
@@ -363,6 +497,7 @@ export class MemoryView {
       }
       all.push(...this.symbols.get(owner.name));
     }
+    if (generation !== this.generation) return;
     const statics = new Int32Array(picture.view.cells).fill(-1);
     const most = new Int32Array(picture.view.cells);
     all.forEach((s, i) => {
@@ -408,6 +543,8 @@ export class MemoryView {
     return last;
   }
 
+  /// Everything drawn again: what the page asks for when something it
+  /// shows was changed by a click — a choice, the mark, the heat's pace.
   draw() {
     this.drawHead();
     this.drawCrumbs();
@@ -446,6 +583,7 @@ export class MemoryView {
     this.zooms.length = depth;
     if (into) this.zooms.push(into);
     this.detail = null;
+    this.generation++;
     this.drawCrumbs();
     this.element.querySelector(".mem-maps").replaceChildren();
     this.polled = 0;
@@ -700,77 +838,45 @@ export class MemoryView {
   zoomFor(ram, rect, cell) {
     const picture = this.rams?.[ram];
     if (!picture || rect.w < 1 || rect.h < 1) return null;
-    while (cell > 4 && rect.w * rect.h * 4 <= ZOOM_CELLS) {
-      cell /= 4;
-      rect = { x: rect.x * 2, y: rect.y * 2, w: rect.w * 2, h: rect.h * 2 };
+    ({ rect, cell } = refine(rect, cell, ZOOM_CELLS));
+    let view = this.layoutOf(picture, cell);
+    let run = runOf(view, rect);
+    // The run of memory a box takes in may be longer than the box: kept
+    // within what one read answers at this grain, coarser if need be.
+    while (run && run.last - run.first + 1 > ZOOM_CELLS && cell < CELL) {
+      ({ rect, cell } = coarser(rect, cell));
+      view = this.layoutOf(picture, cell);
+      run = runOf(view, rect);
     }
-    while (rect.w * rect.h > ZOOM_CELLS && cell < CELL) {
-      cell *= 4;
-      const x = Math.floor(rect.x / 2);
-      const y = Math.floor(rect.y / 2);
-      rect = { x, y, w: Math.ceil((rect.x + rect.w) / 2) - x, h: Math.ceil((rect.y + rect.h) / 2) - y };
-    }
-    const view = this.layoutOf(picture, cell);
-    let first = Infinity;
-    let last = -1;
-    for (let y = rect.y; y < rect.y + rect.h; y++)
-      for (let x = rect.x; x < rect.x + rect.w; x++) {
-        const c = view.at[y * view.width + x];
-        if (c < 0) continue;
-        first = Math.min(first, c);
-        last = Math.max(last, c);
-      }
-    if (last < 0) return null;
+    if (!run) return null;
+    const { first, last, count } = run;
     const base = picture.base + first * cell;
     const length = (last - first + 1) * cell;
     const owners = [...new Set(this.owners.filter((o) => o.ranges.some((r) => r.base < base + length && r.end > base)).map((o) => o.name))];
     const name = `${picture.name}${owners.length && owners.length <= 3 ? ` · ${owners.join(", ")}` : ""}`;
     const block = rounded(base, length, picture);
     // The box is its block already when it takes in the whole of it.
-    const whole = block.length === length && block.base === base && (last - first + 1) === countIn(view, rect);
+    const whole = block.length === length && block.base === base && last - first + 1 === count;
     return { ram, cell, rect, first, base, length, name, block: whole ? null : block, text: `${rect.w}×${rect.h} cells of ${cell} B, within 0x${base.toString(16)}–0x${(base + length).toString(16)}` };
   }
 
   /// The zoom on the aligned block a zoom's run rounds out to: the
   /// rectangle around its cells.
   blockZoom(zoom) {
-    const picture = this.rams?.[zoom.ram];
+    const picture = this.rams?.[zoom?.ram];
     if (!picture || !zoom.block) return null;
-    const view = this.layoutOf(picture, 4);
     const from = (zoom.block.base - picture.base) / 4;
-    const to = from + zoom.block.length / 4;
-    let x0 = Infinity;
-    let y0 = Infinity;
-    let x1 = -1;
-    let y1 = -1;
-    for (let c = from; c < to; c++) {
-      const x = view.place[2 * c];
-      const y = view.place[2 * c + 1];
-      x0 = Math.min(x0, x);
-      y0 = Math.min(y0, y);
-      x1 = Math.max(x1, x);
-      y1 = Math.max(y1, y);
-    }
-    return this.zoomFor(zoom.ram, { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 }, 4);
+    const rect = rectAround(this.layoutOf(picture, 4), from, from + zoom.block.length / 4);
+    return this.zoomFor(zoom.ram, rect, 4);
   }
 
   /// Where `rect`, of a RAM's picture at `cell` bytes a cell, is on
-  /// `canvas`, in its pixels from its corner: a rectangle drawn at one
-  /// grain stands where it would at another, a cell's side halving as its
-  /// bytes quarter.
+  /// `canvas`, in its pixels from its corner.
   onCanvas(canvas, rect, cell) {
     const picture = this.shown()[Number(canvas.dataset.picture)];
     if (!picture) return null;
-    const f = Math.sqrt(cell / picture.cell);
     const box = canvas.getBoundingClientRect();
-    const px = box.width / picture.rect.w;
-    const py = box.height / picture.rect.h;
-    const left = Math.max(0, (rect.x * f - picture.rect.x) * px);
-    const top = Math.max(0, (rect.y * f - picture.rect.y) * py);
-    const right = Math.min(box.width, ((rect.x + rect.w) * f - picture.rect.x) * px);
-    const bottom = Math.min(box.height, ((rect.y + rect.h) * f - picture.rect.y) * py);
-    if (right <= left || bottom <= top) return null;
-    return { left, top, width: right - left, height: bottom - top };
+    return rectOnBox(rect, cell, picture.rect, picture.cell, box.width, box.height);
   }
 
   pick(canvas, event) {
@@ -801,11 +907,15 @@ export class MemoryView {
 
   drawOwners() {
     const box = this.element.querySelector(".mem-owners");
-    if (!this.owners.length) return set(box, `<div class="dim">${this.tasks === null ? "reading the board's archive…" : "no archive says what this memory is: the board's configuration names none"}</div>`);
+    if (!this.owners.length) {
+      const why = this.tasks === null ? "reading the board's archive…" : `nothing says what this memory is: ${this.escape(this.tasks.error ?? "the archive has no tasks")}`;
+      return set(box, `<div class="dim">${why}</div>`);
+    }
     const rows = this.owners
       .map((o) => {
         const bytes = o.ranges.reduce((n, r) => n + r.end - r.base, 0);
-        const last = this.lastWrite(o.ranges[0]?.base ?? 0, o.ranges.at(-1)?.end ?? 0);
+        // Its own ranges only: not whatever lies between them.
+        const last = Math.max(0, ...o.ranges.map((r) => this.lastWrite(r.base, r.end)));
         const glow = last ? heat(this.now - last, this.half) : 0;
         let gauge = "";
         if (o.stack) {
@@ -823,16 +933,25 @@ export class MemoryView {
 
   /// Reads what the inspector shows — the chosen owner's statics, or the
   /// bytes around an address — when what it covers was written since it
-  /// last read them.
+  /// last read them: each cluster of statics on its own, a word's start to
+  /// a word's end, so what lies between them is neither read nor watched.
   async inspect() {
     const box = this.element.querySelector(".mem-inspector");
     const owner = this.owners.find((o) => o.name === this.selected);
-    if (!owner && this.focus === null) return set(box, `<div class="dim">click a task, or a place in the pictures, to see what is there</div>`);
+    if (!owner && this.focus === null) {
+      this.inspected = null;
+      return set(box, `<div class="dim">click a task, or a place in the pictures, to see what is there</div>`);
+    }
+    // A later call — another choice, another instant — supersedes this one.
+    const token = ++this.inspecting;
+    const generation = this.generation;
+    const stale = () => token !== this.inspecting || generation !== this.generation;
     const key = `${this.selected} ${owner ? "" : this.focus}`;
     let statics = [];
     if (owner) {
       if (!this.symbols.has(owner.name)) {
         const answer = await this.read(`board/symbols/${owner.name}`).catch(() => null);
+        if (stale()) return;
         this.symbols.set(owner.name, answer?.statics ?? []);
       }
       statics = [...this.symbols.get(owner.name)];
@@ -844,65 +963,82 @@ export class MemoryView {
       }
     } else statics = [{ name: `around 0x${this.focus.toString(16)}`, base: (this.focus & ~0xff) >>> 0, size: 256 }];
     statics = statics.filter((s) => s.size > 0);
-    const base = Math.min(...statics.map((s) => s.base));
-    const end = Math.min(base + INSPECTED, Math.max(...statics.map((s) => s.base + s.size)));
-    const last = this.lastWrite(base, end);
-    if (this.inspected?.key === key && this.inspected.last === last && this.inspected.now === this.now) return this.drawInspector();
-    if (this.inspected?.key === key && this.inspected.last === last) {
-      this.inspected.now = this.now;
-      return this.drawInspector();
-    }
-    const hex = [];
-    const words = [];
+    const runs = clusters(statics, 256, INSPECTED);
+    const last = Math.max(0, ...runs.map((r) => this.lastWrite(r.base, r.end)));
+    if (this.inspected?.key === key && this.inspected.last === last) return this.drawInspector();
+    const chunks = [];
     const writers = [];
-    for (let at = base; at < end; at += SERVED) {
-      const length = Math.min(SERVED, end - at);
-      const [memory, written] = await Promise.all([this.read(`board/memory/${at}/${length}`), this.read(`board/written/${at}/${length}`)]);
-      if (!memory?.hex || !written?.words) return;
-      hex.push(memory.hex);
-      const offset = writers.length;
-      writers.push(...written.writers);
-      for (let i = 0; i < written.words.length; i += 2) words.push(written.words[i], written.words[i + 1] < 0 ? -1 : written.words[i + 1] + offset);
+    for (const run of runs) {
+      const chunk = { base: run.base, end: run.end, hex: "", words: [] };
+      for (let at = run.base; at < run.end; at += SERVED) {
+        const length = Math.min(SERVED, run.end - at);
+        const [memory, written] = await Promise.all([this.read(`board/memory/${at}/${length}`), this.read(`board/written/${at}/${length}`)]);
+        if (stale()) return;
+        if (!memory?.hex || !written?.words) return;
+        chunk.hex += memory.hex;
+        const offset = writers.length;
+        writers.push(...written.writers);
+        for (let i = 0; i < written.words.length; i += 2) chunk.words.push(written.words[i], written.words[i + 1] < 0 ? -1 : written.words[i + 1] + offset);
+      }
+      chunks.push(chunk);
     }
-    this.inspected = { key, base, end, last, now: this.now, hex: hex.join(""), words, writers, statics };
+    const covered = (st) => runs.some((r) => st.base >= r.base && st.base < r.end);
+    this.inspected = { key, last, chunks, writers, statics: statics.filter(covered), cut: statics.some((st) => !covered(st) || !runs.some((r) => st.base + st.size <= r.end)), id: token };
     this.drawInspector();
   }
 
+  /// The chunk an address of what the inspector read is in.
+  chunkOf(address) {
+    return this.inspected?.chunks.find((c) => address >= c.base && address < c.end) ?? null;
+  }
+
+  /// The word at `address`: its stamp and writer's number, from the chunk
+  /// it is in; `[0, -1]` for one not read.
+  wordAt(address) {
+    const chunk = this.chunkOf(address);
+    if (!chunk) return [0, -1];
+    const w = ((address - chunk.base) >> 2) * 2;
+    return [chunk.words[w] ?? 0, chunk.words[w + 1] ?? -1];
+  }
+
+  /// The inspector: its rows made again only when what they are changes —
+  /// what was read, the order, the filter, what is open or near — and
+  /// otherwise each byte's heat and each write's age brought up to date in
+  /// place, which is all a tick of the board changes.
   drawInspector() {
     const box = this.element.querySelector(".mem-inspector");
     const s = this.inspected;
     if (!s) return;
+    const shape = [s.id, this.sort, this.onlyMarked, this.mark, [...this.open].join(","), this.focus].join("|");
+    if (box.shape === shape && box.querySelector(".mem-inspector-head")) return this.warm(box);
+    box.shape = shape;
     const e = this.escape;
-    const wordOf = (address) => ((address - (s.base & ~3)) >> 2) * 2;
     const byteHtml = (address) => {
-      const i = 2 * (address - s.base);
-      const text = s.hex.slice(i, i + 2) || "  ";
-      const w = wordOf(address);
-      const stamp = s.words[w];
-      if (!stamp) return `<span class="b cold">${text}</span>`;
-      const h = heat(this.now - stamp, this.half);
-      const [r, g, b] = hot(h);
-      return `<span class="b" data-w="${w}" style="background:rgb(${r} ${g} ${b} / ${(0.12 + 0.75 * h).toFixed(2)})">${text}</span>`;
+      const chunk = this.chunkOf(address);
+      const i = chunk ? 2 * (address - chunk.base) : -1;
+      const text = (chunk && chunk.hex.slice(i, i + 2)) || "  ";
+      const [stamp] = this.wordAt(address);
+      return stamp ? `<span class="b" data-a="${address}">${text}</span>` : `<span class="b cold">${text}</span>`;
     };
     const rows = s.statics
-      .filter((st) => st.base < s.end)
       .map((st) => {
         let last = 0;
         let by = -1;
-        for (let a = st.base & ~3; a < Math.min(st.base + st.size, s.end); a += 4) {
-          const w = wordOf(a);
-          if (s.words[w] > last) {
-            last = s.words[w];
-            by = s.words[w + 1];
+        for (let a = st.base - (st.base % 4); a < st.base + st.size; a += 4) {
+          const [stamp, writer] = this.wordAt(a);
+          if (stamp > last) {
+            last = stamp;
+            by = writer;
           }
         }
         return { st, last, by };
       })
-      .filter((row) => this.mark === null || !this.onlyMarked || row.last > this.mark);
+      .filter((row) => this.mark === null || !this.onlyMarked || row.last >= this.mark);
     if (this.sort === "recent") rows.sort((a, b) => b.last - a.last);
     const lines = rows
       .map(({ st, last, by }) => {
-        const shown = Math.min(st.size, this.open.has(st.base) ? 1024 : 16, s.end - st.base);
+        const chunk = this.chunkOf(st.base);
+        const shown = Math.min(st.size, this.open.has(st.base) ? 1024 : 16, chunk ? chunk.end - st.base : 0);
         let bytes = "";
         for (let a = st.base; a < st.base + shown; a++) {
           if (a > st.base && (a - st.base) % 16 === 0) bytes += `<br><span class="addr">${(a - st.base).toString(16).padStart(4, "0")}</span> `;
@@ -911,10 +1047,10 @@ export class MemoryView {
         const more = st.size > shown ? `<span class="dim"> …${st.size - shown} more</span>` : "";
         const writer = by >= 0 ? s.writers[by]?.code : null;
         const when = last
-          ? `<span class="t" data-stand="${last}" title="stand the board just after this write">${age(this.now - last)} ago</span>${writer ? ` <span class="dim">by ${e(writer)}</span>` : ""}`
+          ? `<span class="t" data-stand="${last}" title="stand the board just after this write"></span>${writer ? ` <span class="dim">by ${e(writer)}</span>` : ""}`
           : `<span class="dim">never written</span>`;
         const near = this.focus !== null && this.focus >= st.base && this.focus < st.base + st.size;
-        return `<div class="mem-static${near ? " near" : ""}${this.mark !== null && last > this.mark ? " since" : ""}" data-static="${st.base}"><div class="mem-static-head"><span class="name" title="${e(st.name)}">${e(st.stack ? st.name : shortName(st.name))}</span> <span class="dim">0x${st.base.toString(16)} · ${st.size} B</span> · ${when}</div><div class="mem-bytes">${bytes}${more}</div></div>`;
+        return `<div class="mem-static${near ? " near" : ""}${this.mark !== null && last >= this.mark ? " since" : ""}" data-static="${st.base}"><div class="mem-static-head"><span class="name" title="${e(st.name)}">${e(st.stack ? st.name : shortName(st.name))}</span> <span class="dim">0x${st.base.toString(16)} · ${st.size} B</span> · ${when}</div><div class="mem-bytes">${bytes}${more}</div></div>`;
       })
       .join("");
     const owner = this.selected ? `<b>${e(this.selected)}</b>` : "";
@@ -922,21 +1058,34 @@ export class MemoryView {
       .map((sort) => `<button type="button" data-sort="${sort}"${sort === this.sort ? ' class="on"' : ""}>${sort === "address" ? "by address" : "latest written first"}</button>`)
       .join("");
     const marked = this.mark === null ? "" : `<button type="button" data-only${this.onlyMarked ? ' class="on"' : ""}>only written since the mark</button>`;
-    const truncated = s.end < Math.max(...s.statics.map((st) => st.base + st.size)) ? `<div class="dim">the first ${INSPECTED / 1024} KiB shown</div>` : "";
-    set(box, `<div class="mem-inspector-head">${owner} <span class="controls">${sorts}${marked}</span> <span class="dim mem-hover">&nbsp;</span></div>${lines || `<div class="dim">nothing to show</div>`}${truncated}`);
+    const truncated = s.cut ? `<div class="dim">the first ${INSPECTED / 1024} KiB of its statics shown</div>` : "";
+    // Made whole, not morphed: what changed is the rows themselves.
+    box.innerHTML = `<div class="mem-inspector-head">${owner} <span class="controls">${sorts}${marked}</span> <span class="dim mem-hover">&nbsp;</span></div>${lines || `<div class="dim">nothing to show</div>`}${truncated}`;
+    box.shown = null;
     box.onmouseover = (event) => {
-      const byte = event.target.closest("[data-w]");
+      const byte = event.target.closest("[data-a]");
       const hover = box.querySelector(".mem-hover");
       if (!byte || !hover) return;
-      const w = Number(byte.dataset.w);
-      const writer = s.writers[s.words[w + 1]];
-      hover.textContent = `this word: written ${age(this.now - s.words[w])} ago by ${writer?.code ?? "?"}`;
+      const [stamp, writer] = this.wordAt(Number(byte.dataset.a));
+      hover.textContent = `this word: written ${age(this.now - stamp)} ago by ${this.inspected?.writers[writer]?.code ?? "?"}`;
     };
+    this.warm(box);
     const near = box.querySelector(".mem-static.near");
     if (near && this.focusShown !== this.focus) {
       this.focusShown = this.focus;
       near.scrollIntoView({ block: "nearest" });
     }
+  }
+
+  /// Each byte's heat and each write's age, as of now, in the rows shown.
+  warm(box) {
+    for (const byte of box.querySelectorAll("[data-a]")) {
+      const [stamp] = this.wordAt(Number(byte.dataset.a));
+      const h = heat(this.now - stamp, this.half);
+      const [r, g, b] = hot(h);
+      byte.style.background = `rgb(${r} ${g} ${b} / ${(0.12 + 0.75 * h).toFixed(2)})`;
+    }
+    for (const when of box.querySelectorAll("[data-stand]")) when.textContent = `${age(this.now - Number(when.dataset.stand))} ago`;
   }
 
   clicked(event) {
@@ -952,6 +1101,11 @@ export class MemoryView {
       this.half = Number(t("[data-half]").dataset.half);
       this.draw();
       return this.drawInspector();
+    }
+    if (t("[data-stand]")) {
+      // The write was within this microsecond of the board's; its end is
+      // just after it.
+      return this.stand(Number(t("[data-stand]").dataset.stand) * 1e6);
     }
     if (t("[data-mark]")) {
       this.mark = this.mark === null ? this.now : null;
@@ -975,10 +1129,6 @@ export class MemoryView {
       this.onlyMarked = !this.onlyMarked;
       return this.drawInspector();
     }
-    const stand = t("[data-stand]");
-    // The write was within this microsecond of the board's; its end is
-    // just after it.
-    if (stand) return this.stand(Number(stand.dataset.stand) * 1e6);
     const head = t(".mem-static-head");
     if (head) {
       const base = Number(head.parentElement.dataset.static);
@@ -987,13 +1137,6 @@ export class MemoryView {
       return this.drawInspector();
     }
   }
-}
-
-/// How many cells of `view` are in `rect`.
-function countIn(view, rect) {
-  let n = 0;
-  for (let y = rect.y; y < rect.y + rect.h; y++) for (let x = rect.x; x < rect.x + rect.w; x++) if (view.at[y * view.width + x] >= 0) n++;
-  return n;
 }
 
 function mix(a, b, f) {

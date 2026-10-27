@@ -1,7 +1,7 @@
 // Checks `memory.js` under Node: node --test web/memory.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cellOwners, heat, hilbert, layout, owners, rounded, shortName, tiles } from "./memory.js";
+import { cellOwners, clusters, coarser, heat, hilbert, layout, owners, rectAround, rectOnBox, refine, rounded, runOf, shortName, tiles } from "./memory.js";
 
 test("a Hilbert curve visits every point of its square once, each next to the last", () => {
   const seen = new Set();
@@ -90,8 +90,62 @@ test("a run rounds out to the aligned block that holds it, within its RAM", () =
   assert.deepEqual(rounded(0x24010040, 0x7fc0), { base: 0x24010000, length: 0x8000 });
   // Across a 64 KiB boundary: the block that holds both sides.
   assert.deepEqual(rounded(0x2400f000, 0x2000), { base: 0x24000000, length: 0x20000 });
-  // A block past the end of the RAM is no block: the run as it is.
+  // Within its RAM, a block that ends at the RAM's end is a block.
   const ram = { base: 0x38800000, length: 4096 };
   assert.deepEqual(rounded(0x38800e00, 0x180, ram), { base: 0x38800e00, length: 0x200 });
+  // A run inside SRAM1-3's 288 KiB whose aligned block — 512 KiB — would
+  // overhang its end is no block: the run as it is.
+  assert.deepEqual(rounded(0x3003f000, 0x2000, { base: 0x30000000, length: 0x48000 }), { base: 0x3003f000, length: 0x2000 });
+  // Nor is one for a run that starts below the RAM.
   assert.deepEqual(rounded(0x387fff00, 0x200, ram), { base: 0x387fff00, length: 0x200 });
+});
+
+test("a box is drawn as finely as the most cells allow, and no finer than a word", () => {
+  // Two 64-byte cells by two: refined twice, to 4-byte cells, 8 by 8.
+  assert.deepEqual(refine({ x: 3, y: 5, w: 2, h: 2 }, 64, 65536), { cell: 4, rect: { x: 12, y: 20, w: 8, h: 8 } });
+  // A whole 512 KiB RAM at 64 bytes, 128 by 64 cells: one step finer
+  // (32768 cells), not two (131072).
+  assert.deepEqual(refine({ x: 0, y: 0, w: 128, h: 64 }, 64, 65536), { cell: 16, rect: { x: 0, y: 0, w: 256, h: 128 } });
+  // Too many at 4 bytes: coarser, outwards.
+  assert.deepEqual(refine({ x: 1, y: 1, w: 300, h: 300 }, 4, 65536), { cell: 16, rect: { x: 0, y: 0, w: 151, h: 151 } });
+  assert.deepEqual(coarser({ x: 3, y: 3, w: 2, h: 2 }, 4), { cell: 16, rect: { x: 1, y: 1, w: 2, h: 2 } });
+});
+
+test("a box's run is its cells' first and last, and how many it holds", () => {
+  const view = layout(65536, 64); // 32 by 32
+  const all = runOf(view, { x: 0, y: 0, w: 32, h: 32 });
+  assert.deepEqual(all, { first: 0, last: 1023, count: 1024 });
+  // The 8 by 8 square at the top left is the first 64 cells, whole.
+  assert.deepEqual(runOf(view, { x: 0, y: 0, w: 8, h: 8 }), { first: 0, last: 63, count: 64 });
+  assert.equal(runOf(layout(288 * 1024, 64), { x: 70, y: 20, w: 4, h: 4 }), null, "below the second tile there is nothing");
+});
+
+test("an aligned block's cells are the rectangle around them, square or two squares", () => {
+  const view = layout(512 * 1024, 4);
+  // 32 KiB at 64 KiB in: 8192 words, a 128 by 64 rectangle holding them all.
+  const rect = rectAround(view, 0x10000 / 4, 0x18000 / 4);
+  assert.equal(rect.w * rect.h, 8192);
+  assert.deepEqual(runOf(view, rect), { first: 0x10000 / 4, last: 0x18000 / 4 - 1, count: 8192 });
+});
+
+test("a rectangle at one grain falls on a box showing another, on whole cells", () => {
+  // A 4-byte-cell rectangle on the whole 64-byte picture of 128 by 64
+  // cells drawn 384 by 192: cell (5, 6) is at 3 pixels a cell.
+  const box = rectOnBox({ x: 20, y: 24, w: 8, h: 4 }, 4, { x: 0, y: 0, w: 128, h: 64 }, 64, 384, 192);
+  assert.deepEqual(box, { left: 15, top: 18, width: 6, height: 3 });
+  // On a zoom showing part of the picture, stretched 2.5 times.
+  const zoomed = rectOnBox({ x: 10, y: 10, w: 4, h: 4 }, 16, { x: 8, y: 8, w: 40, h: 40 }, 16, 100, 100);
+  assert.deepEqual(zoomed, { left: 5, top: 5, width: 10, height: 10 });
+  assert.equal(rectOnBox({ x: 0, y: 0, w: 2, h: 2 }, 16, { x: 8, y: 8, w: 40, h: 40 }, 16, 100, 100), null, "outside it");
+});
+
+test("statics are read in clusters, word aligned, and only so much", () => {
+  const statics = [
+    { base: 0x101, size: 3 },
+    { base: 0x108, size: 5 },
+    { base: 0x1000, size: 8 },
+    { base: 0x2000, size: 0 },
+  ];
+  assert.deepEqual(clusters(statics, 256), [{ base: 0x100, end: 0x110 }, { base: 0x1000, end: 0x1008 }]);
+  assert.deepEqual(clusters(statics, 256, 0x14), [{ base: 0x100, end: 0x110 }, { base: 0x1000, end: 0x1004 }]);
 });

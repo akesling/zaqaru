@@ -143,7 +143,8 @@
   .mem-head { margin: 2px 0 6px; }
   .mem-maps { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end; }
   .mem-ram { margin: 0; }
-  .mem-crumbs { margin: 2px 0 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Wrapping, not clipped: the whole-block button at its end must stay in reach. */
+  .mem-crumbs { margin: 2px 0 6px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 0; }
   .mem-crumbs a { color: var(--accent); cursor: pointer; }
   .mem-crumbs a:hover { text-decoration: underline; }
   .mem-crumbs a.here { color: inherit; font-weight: 600; cursor: default; text-decoration: none; }
