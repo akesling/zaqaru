@@ -21,6 +21,15 @@ miniz_oxide = "0.8.9"
 # flag, and NaNs whose bits do not depend on the host.
 rustc_apfloat = "0.2.3"
 rustc-demangle = "0.1.24"
+# For reading the DWARF in a Hubris archive's ELFs (`dwarf`): what source
+# line an instruction is from, the types of statics, how to step a stack
+# back a frame, where a frame's variables are. DWARF's line programs, call
+# frame instructions and location expressions are each a small machine of
+# their own; gimli is the reader the Rust toolchain itself uses, and
+# addr2line its lookup of lines and inlined calls. Reading only, without
+# the loader that would pull in `object` and memory maps.
+gimli = { version = "0.33.0", default-features = false, features = ["read", "std", "endian-reader"] }
+addr2line = { version = "0.26.1", default-features = false, features = ["std", "rustc-demangle"] }
 
 [dev-dependencies]
 # The ISA tests assemble their programs with clang and read the labels back

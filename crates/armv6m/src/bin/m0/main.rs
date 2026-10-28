@@ -34,7 +34,35 @@ pub(crate) fn usage() -> ExitCode {
     eprintln!("       zaqaru-m0 serve <final.bin> [--part NAME] [--gdb ADDR] [--listen ADDR] [--archive ZIP] [--board FILE]");
     eprintln!("       zaqaru-m0 door [--listen ADDR] [--probe ADDR] [--archive ZIP] [--humility PATH]");
     eprintln!("       zaqaru-m0 repack <in.zip> <out.zip> [--stored]");
+    eprintln!("       zaqaru-m0 sources <archive.zip>");
     ExitCode::from(2)
+}
+
+/// `zaqaru-m0 sources ARCHIVE`: every source file the DWARF of the
+/// archive's kernel and tasks names, one a line, as the build remapped it
+/// (`/hubris/…`, `/crates.io/…`, `/git/…`, `/rustc/HASH/…`): what a build
+/// keeps beside the archive for a debugger to show the code.
+fn sources(args: Vec<String>) -> ExitCode {
+    let [input] = args.as_slice() else { return usage() };
+    let archive = match std::fs::read(input) {
+        Ok(archive) => archive,
+        Err(e) => {
+            eprintln!("zaqaru-m0: {input}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut files = std::collections::BTreeSet::new();
+    for name in zip::names(&archive).into_iter().filter(|n| n == "elf/kernel" || n.starts_with("elf/task/")) {
+        let Some(elf) = zip::entry(&archive, &name) else { continue };
+        match armv6m::dwarf::Debug::read(&elf) {
+            Ok(debug) => files.extend(debug.files()),
+            Err(why) => eprintln!("zaqaru-m0: {name}: {why}"),
+        }
+    }
+    for file in files {
+        println!("{file}");
+    }
+    ExitCode::SUCCESS
 }
 
 /// `zaqaru-m0 repack IN OUT`: a Hubris archive with its entries deflated
@@ -72,6 +100,9 @@ fn main() -> ExitCode {
     }
     if args.next_if(|a| a == "door").is_some() {
         return door::main(args.collect());
+    }
+    if args.next_if(|a| a == "sources").is_some() {
+        return sources(args.collect());
     }
     if args.next_if(|a| a == "repack").is_some() {
         return repack(args.collect());

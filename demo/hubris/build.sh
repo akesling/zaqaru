@@ -111,6 +111,13 @@ echo "build: the archives, deflated"
 linux 'for zip in "$W"/bench/archives/*.zip "$W/bench/hubris.zip"; do
   "$T/release/zaqaru-m0" repack "$zip" "$zip.new" && mv "$zip.new" "$zip"; done'
 
+# The source the archives' DWARF names, for the page to show beside a
+# frame or a write: gathered here, on the host, where it was built from.
+echo "build: the sources"
+linux 'for zip in "$W"/bench/archives/*.zip; do "$T/release/zaqaru-m0" sources "$zip"; done | sort -u > "$W/sources.txt"'
+rm -rf "$work/bench/src"
+"$here/sources.sh" "$hubris" "$work/sources.txt" "$work/bench/src"
+
 echo "build: the bench image"
 cp "$here/Dockerfile" "$here/board" "$work/bench/"
 retry docker build -q --platform linux/amd64 -t zaqaru-hubris-bench "$work/bench" >/dev/null

@@ -68,6 +68,9 @@ use armv6m::gpio::Edge;
 use armv6m::{Event, Machine, Outcome};
 
 use crate::ring::End;
+
+mod dwarf;
+pub use dwarf::ReadFile;
 use crate::socket::{Address, Endpoint, State};
 
 /// The most of the board's memory one read of it serves.
@@ -187,6 +190,9 @@ pub struct Board {
     /// What the archive says the board's memory is, read the first time
     /// someone asks and kept, under the archive's path.
     map: RefCell<Option<(String, Rc<Result<armv6m::hubris::Image, String>>)>>,
+    /// What each owner's DWARF in the archive says, read as it is asked
+    /// for: see `dwarf`.
+    debug: RefCell<dwarf::Cache>,
     /// The archive whose tasks' stacks the trace was given.
     stacks_for: Option<String>,
     /// The listener the probe answers on.
@@ -1404,7 +1410,7 @@ impl Board {
     /// (0: never) and the writer's number in `writers`, which says each
     /// one's code — `i2c_driver: main + 0x80e` — or `probe`, `dma` or
     /// `exception` for what wrote without an instruction.
-    pub fn written_json(&self, address: u32, length: u32, map: Option<&Result<armv6m::hubris::Image, String>>) -> String {
+    pub fn written_json(&self, address: u32, length: u32, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
         use crate::system::server::quoted;
         use armv6m::bus::{BY_DMA, BY_EXCEPTION, BY_PROBE};
         // Every word the bytes asked for touch, from the one the first is in.
@@ -1430,7 +1436,12 @@ impl Board {
                 BY_PROBE => r#"{"code":"the probe"}"#.into(),
                 BY_DMA => r#"{"code":"DMA"}"#.into(),
                 BY_EXCEPTION => r#"{"code":"the core, stacking an exception"}"#.into(),
-                pc => format!(r#"{{"pc":{pc},"code":{}}}"#, quoted(&self.code_at(pc, map))),
+                // And where in the source, innermost first.
+                pc => format!(
+                    r#"{{"pc":{pc},"code":{},"lines":[{}]}}"#,
+                    quoted(&self.code_at(pc, map)),
+                    self.lines_at(pc, map, read).iter().map(dwarf::line_json).collect::<Vec<_>>().join(",")
+                ),
             })
             .collect();
         format!(
@@ -1800,6 +1811,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             image: configuration.image,
             archive: configuration.archive,
             map: RefCell::new(None),
+            debug: RefCell::default(),
             stacks_for: None,
             listener,
             probe,

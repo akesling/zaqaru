@@ -2,7 +2,7 @@
 # /etc/zaqaru/board), with Humility beside it and a front door on port 80
 # that runs a Humility command per connection. Humility reaches the board
 # through its USB debug probe, which it finds as it would a probe plugged
-# in. build.sh stages the four files this copies.
+# in. build.sh stages the files this copies.
 #
 # Debian-based for glibc, which is the tested libc.
 FROM --platform=linux/amd64 debian:bookworm-slim
@@ -10,6 +10,9 @@ FROM --platform=linux/amd64 debian:bookworm-slim
 COPY humility zaqaru-m0 /usr/local/bin/
 COPY final.bin hubris.zip /hubris/
 COPY archives /hubris/archives/
+# The source files the archives' DWARF names, at the paths it names them
+# by, for the board's `board/file/{path}`: see sources.sh.
+COPY src /hubris/src/
 COPY board /etc/zaqaru/board
 
 # One malloc arena. Every process here shares the module's one 4 GiB

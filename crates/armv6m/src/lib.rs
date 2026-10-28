@@ -41,6 +41,7 @@ pub mod cmsis_dap;
 pub mod dap;
 pub mod debug;
 pub mod devices;
+pub mod dwarf;
 pub mod exception;
 pub mod eth_h7;
 pub mod exec;

@@ -161,6 +161,101 @@ impl Owner {
     }
 }
 
+/// The kernel's table of tasks, as its DWARF lays it out: where the table
+/// is, how far apart its entries are, and where in an entry the task's
+/// saved registers are. Found by name and type, not by offsets written
+/// down here, so a kernel built another way is read as it was built.
+pub struct TaskTable {
+    pub base: u32,
+    pub stride: u32,
+    pub count: u32,
+    /// The offsets in an entry of `save.r4` … `save.r11`, `save.psp` and
+    /// `save.exc_return`.
+    saved: [u32; 10],
+    /// Where the kernel keeps a pointer to the task it is running.
+    current: Option<u32>,
+}
+
+impl TaskTable {
+    /// The table, from the kernel's DWARF: the static
+    /// `HUBRIS_TASK_TABLE_SPACE`, an array of `Task` wrapped in a
+    /// `MaybeUninit`, each of whose `save` is the registers the kernel
+    /// keeps for it (`ArmMSavedState`, in `sys/kern/src/arch/arm_m.rs`).
+    pub fn of(kernel: &crate::dwarf::Debug) -> Option<TaskTable> {
+        use crate::dwarf::Type;
+        let space = kernel.static_named("HUBRIS_TASK_TABLE_SPACE")?;
+        // Down through the wrappers at offset 0 to the array.
+        let (mut offset, mut ty) = (0, space.ty);
+        let (element, stride, count) = loop {
+            match kernel.ty(kernel.resolve(ty))? {
+                Type::Array { element, stride, count, .. } => break (element, stride, count),
+                Type::Struct { fields, variants: None, .. } => {
+                    // A `MaybeUninit`'s `value`, not its zero-sized `uninit`.
+                    let first = fields.iter().filter(|f| f.offset == 0).max_by_key(|f| kernel.size(f.ty))?;
+                    offset += first.offset;
+                    ty = first.ty;
+                }
+                _ => return None,
+            }
+        };
+        // And down through the entry's own wrappers to the `Task`.
+        let mut task = element;
+        let mut inner = 0;
+        let (save, state) = loop {
+            if let Some(found) = kernel.field(task, "save") {
+                break found;
+            }
+            let Type::Struct { fields, .. } = kernel.ty(kernel.resolve(task))? else { return None };
+            let first = fields.iter().filter(|f| f.offset == 0).max_by_key(|f| kernel.size(f.ty))?;
+            inner += first.offset;
+            task = first.ty;
+        };
+        let save = save + inner;
+        let mut saved = [0; 10];
+        for (slot, name) in saved.iter_mut().zip(["r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "psp", "exc_return"]) {
+            *slot = save + kernel.field(state, name)?.0;
+        }
+        let current = kernel.static_named("CURRENT_TASK_PTR").map(|s| s.address);
+        Some(TaskTable { base: space.address + offset, stride, count, saved, current })
+    }
+
+    /// Which task the kernel is running, or last ran.
+    pub fn current(&self, read: &dyn Fn(u32) -> Option<u32>) -> Option<usize> {
+        let at = read(self.current?)?;
+        let n = at.checked_sub(self.base)? / self.stride.max(1);
+        (n < self.count).then_some(n as usize)
+    }
+
+    /// The registers task `index` will resume with, from what the kernel
+    /// saved when it last stopped running it: r4 to r11 in its table entry;
+    /// r0 to r3, r12, lr, pc and xPSR in the exception frame the core
+    /// pushed on the task's stack; and the stack pointer above that frame,
+    /// which is larger with the FPU's registers in it (`EXC_RETURN` bit 4
+    /// clear) and four bytes larger again when the core aligned it (xPSR
+    /// bit 9). `None` for a task that has never run.
+    pub fn registers(&self, index: usize, read: &dyn Fn(u32) -> Option<u32>) -> Option<[Option<u32>; 16]> {
+        if index as u32 >= self.count {
+            return None;
+        }
+        let entry = self.base + index as u32 * self.stride;
+        let mut regs = [None; 16];
+        for n in 0..8 {
+            regs[4 + n] = read(entry + self.saved[n]);
+        }
+        let psp = read(entry + self.saved[8]).filter(|&p| p != 0)?;
+        let exc_return = read(entry + self.saved[9])?;
+        let frame = |n: u32| read(psp + 4 * n);
+        for (n, reg) in [0, 1, 2, 3, 12, 14, 15].into_iter().enumerate() {
+            regs[reg] = frame(n as u32);
+        }
+        let xpsr = frame(7)?;
+        let frame_size = if exc_return & 0x10 == 0 { 0x68 } else { 0x20 };
+        regs[13] = Some(psp + frame_size + if xpsr & (1 << 9) != 0 { 4 } else { 0 });
+        regs[15] = regs[15].map(|pc| pc & !1);
+        Some(regs)
+    }
+}
+
 /// A symbol's name as a person reads it: demangled, without the hash.
 fn demangle(name: &str) -> String {
     format!("{:#}", rustc_demangle::demangle(name))
@@ -207,6 +302,31 @@ impl AppToml {
         }
         out
     }
+}
+
+/// The sections of a 32-bit little-endian ELF that have bytes in the file,
+/// by name: what `dwarf` reads its debugging sections out of.
+pub(crate) fn sections(elf: &[u8]) -> Option<Vec<(String, &[u8])>> {
+    let parsed = Elf::parse(elf)?;
+    Some(
+        parsed
+            .sections
+            .into_iter()
+            // Not SHT_NOBITS, which has a size and no bytes.
+            .filter(|s| s.kind != 8)
+            .filter_map(|s| Some((s.name, elf.get(s.offset as usize..(s.offset as usize).checked_add(s.size as usize)?)?)))
+            .collect(),
+    )
+}
+
+/// The functions of a 32-bit little-endian ELF, from its symbol table:
+/// each one's address, without the Thumb bit, and its size.
+pub(crate) fn functions(elf: &[u8]) -> Vec<(u32, u32)> {
+    let Some(parsed) = Elf::parse(elf) else { return Vec::new() };
+    let mut out: Vec<(u32, u32)> = parsed.symbols.iter().filter(|s| s.kind == STT_FUNC && s.size != 0).map(|s| (s.value & !1, s.size)).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 const STT_OBJECT: u8 = 1;

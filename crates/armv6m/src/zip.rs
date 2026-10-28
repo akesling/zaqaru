@@ -24,6 +24,20 @@ pub fn entry(archive: &[u8], name: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// The names of the archive's entries, in its directory's order; empty if
+/// it is not an archive this reads.
+pub fn names(archive: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(directory) = Directory::find(archive) else { return out };
+    let mut at = directory.start;
+    for _ in 0..directory.count {
+        let Some(header) = Header::at(archive, at) else { break };
+        out.push(String::from_utf8_lossy(header.name).into_owned());
+        at = header.next;
+    }
+    out
+}
+
 /// How [`repack`] writes the entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Packing {

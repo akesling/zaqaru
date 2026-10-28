@@ -9,6 +9,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59317f77929f0e679d39364702289274de2f0f0b22cbf50b2b8cff2169a0b27a"
 dependencies = [
  "gimli",
+ "rustc-demangle",
 ]
 
 [[package]]
@@ -1886,7 +1887,9 @@ dependencies = [
 name = "zaqaru-armv6m"
 version = "0.1.0"
 dependencies = [
+ "addr2line",
  "bzip2-rs",
+ "gimli",
  "miniz_oxide",
  "object 0.40.0",
  "rustc-demangle",
