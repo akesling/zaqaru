@@ -51,10 +51,12 @@ pub mod gdb;
 pub mod gpio;
 pub mod hubris;
 pub mod i2c;
+pub mod ltdc;
 pub mod names;
 pub mod net;
 pub mod part;
 pub mod provenance;
+pub mod quadspi;
 pub mod scs;
 pub mod spi_h7;
 pub mod state;
@@ -846,6 +848,33 @@ impl Machine {
         soc.attach(wiring)?;
         self.sample_interrupts();
         Ok(())
+    }
+
+    /// Puts a NOR flash on the QUADSPI, for software to map: see
+    /// [`quadspi`].
+    pub fn attach_nor(&mut self, nor: quadspi::Nor) -> Result<(), String> {
+        let crate::bus::Soc::H7(soc) = &mut self.bus.soc else {
+            return Err(format!("the {} has no QUADSPI", self.part.name));
+        };
+        soc.quadspi.nor = Some(nor);
+        Ok(())
+    }
+
+    /// What the panel on the LTDC shows now, and how many frames it has
+    /// been shown: see [`ltdc`]. `None` if there is no LTDC or it is off.
+    pub fn screen(&self) -> Option<(ltdc::Screen, u64)> {
+        let crate::bus::Soc::H7(soc) = &self.bus.soc else { return None };
+        let screen = soc.ltdc.scan(|address, length| self.bus.peek_bytes(address, length))?;
+        Some((screen, soc.ltdc.frames))
+    }
+
+    /// How many frames the panel on the LTDC has been shown: a number that
+    /// moves when [`Machine::screen`] would show something new.
+    pub fn frames_shown(&self) -> u64 {
+        match &self.bus.soc {
+            crate::bus::Soc::H7(soc) => soc.ltdc.frames,
+            crate::bus::Soc::G0(_) => 0,
+        }
     }
 
     /// The parts on the I2C buses, to set what they read.

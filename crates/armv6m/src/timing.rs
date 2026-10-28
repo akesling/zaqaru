@@ -46,6 +46,8 @@ pub struct Timing {
     flash_fetch: u64,
     /// The H7's SRAMs outside the TCMs.
     sram: u64,
+    /// The QUADSPI's memory-mapped window.
+    qspi: u64,
     /// What a taken branch costs, and a BL more on an M0+.
     pub branch: u64,
     pub bl: u64,
@@ -75,6 +77,11 @@ impl Timing {
                     // A 64-bit AXI read holds four halfwords.
                     flash_fetch: if icache { 0 } else { latency * ahb / 4 },
                     sram: if dcache { 0 } else { ahb },
+                    // Uncached, a read is a whole command on the flash's
+                    // wires: instruction, address, dummy cycles and data,
+                    // some 40 cycles of a QUADSPI clock that is the AHB's
+                    // halved.
+                    qspi: if dcache { 0 } else { 80 * ahb },
                     branch: 2,
                     bl: 0,
                     entry: 2 * 12,
@@ -95,6 +102,7 @@ impl Timing {
                     flash_data: 2 * latency,
                     flash_fetch: fetch,
                     sram: 0,
+                    qspi: 0,
                     branch: 2 + if icache { 0 } else { 2 * latency },
                     bl: 2,
                     entry: 2 * 15,
@@ -118,6 +126,7 @@ impl Timing {
                 0x0000_0000..=0x0000_FFFF | 0x2000_0000..=0x2001_FFFF => 0,
                 0x0800_0000..=0x1FFF_FFFF => self.flash_data,
                 0x2400_0000..=0x3FFF_FFFF => self.sram,
+                0x9000_0000..=0x9FFF_FFFF => self.qspi,
                 0x4000_0000..=0x4000_FFFF => self.apb[0],
                 0x4001_0000..=0x4001_FFFF => self.apb[1],
                 0x5000_0000..=0x50FF_FFFF => self.apb[2],

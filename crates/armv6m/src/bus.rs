@@ -29,6 +29,7 @@
 //! | `0x3800_0000..0x3801_0000`  | SRAM4, 64 KiB                         |
 //! | `0x3880_0000..0x3880_1000`  | backup SRAM, 4 KiB                    |
 //! | `0x4000_0000..0x5C00_2000`  | peripherals; see [`crate::stm32h7`]   |
+//! | `0x9000_0000..0xA000_0000`  | a NOR, mapped; see [`crate::quadspi`] |
 //! | `0xE000_0000..0xE010_0000`  | the PPB; see [`crate::scs`]           |
 
 use crate::flash_h7;
@@ -156,6 +157,8 @@ enum Region {
     Flash,
     System,
     Ram(usize),
+    /// The NOR flash the QUADSPI maps, while it does.
+    Nor,
 }
 
 impl Bus {
@@ -291,6 +294,11 @@ impl Bus {
                 return Some(Target::Memory { region: Region::Ram(i), offset });
             }
         }
+        if let Soc::H7(soc) = &self.soc {
+            if let Some(offset) = within(crate::quadspi::WINDOW, soc.quadspi.mapped()) {
+                return Some(Target::Memory { region: Region::Nor, offset });
+            }
+        }
         if let Some(offset) = within(0, flash).filter(|_| self.flash_alias) {
             return Some(Target::Memory { region: Region::Flash, offset });
         }
@@ -311,14 +319,41 @@ impl Bus {
             Region::Flash => &self.flash,
             Region::System => &self.system,
             Region::Ram(i) => &self.rams[i].bytes,
+            Region::Nor => match &self.soc {
+                Soc::H7(soc) => soc.quadspi.nor.as_ref().map_or(&[], |nor| nor.contents()),
+                Soc::G0(_) => &[],
+            },
         }
+    }
+
+    /// `size` bytes at `offset` in a memory, little-endian: what a load
+    /// there reads. The NOR reads erased past what was put on it.
+    fn load(&self, region: Region, offset: usize, size: u32) -> u32 {
+        let memory = self.memory(region);
+        if region == Region::Nor && offset + size as usize > memory.len() {
+            let byte = |i: usize| u32::from(memory.get(offset + i).copied().unwrap_or(0xFF));
+            return (0..size as usize).fold(0, |word, i| word | byte(i) << (8 * i));
+        }
+        little_endian(memory, offset, size)
+    }
+
+    /// `len` bytes at `addr` as [`Bus::peek`] reads them: at once from one
+    /// memory, if they are all in it, and otherwise a byte at a time.
+    /// `None` if any of them is unmapped.
+    pub fn peek_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
+        if let Some(Target::Memory { region, offset }) = self.decode(addr) {
+            if let Some(bytes) = self.memory(region).get(offset..offset + len) {
+                return Some(bytes.to_vec());
+            }
+        }
+        (0..len as u32).map(|i| self.peek(addr.wrapping_add(i), 1).ok().map(|b| b as u8)).collect()
     }
 
     /// Reads `size` bytes (1, 2 or 4) at `addr`, which the caller has
     /// already checked is aligned.
     pub fn read(&mut self, addr: u32, size: u32) -> Result<u32, Unmapped> {
         match self.decode(addr).ok_or(Unmapped)? {
-            Target::Memory { region, offset } => Ok(little_endian(self.memory(region), offset, size)),
+            Target::Memory { region, offset } => Ok(self.load(region, offset, size)),
             Target::Scs => Ok(subword(self.scs.read(addr & !3).ok_or(Unmapped)?, addr, size)),
             Target::Soc => Ok(subword(self.soc.read(addr & !3, size, self.now).ok_or(Unmapped)?, addr, size)),
         }
@@ -339,7 +374,7 @@ impl Bus {
     /// COUNTFLAG), and without counting as software touching a peripheral.
     pub fn peek(&self, addr: u32, size: u32) -> Result<u32, Unmapped> {
         match self.decode(addr).ok_or(Unmapped)? {
-            Target::Memory { region, offset } => Ok(little_endian(self.memory(region), offset, size)),
+            Target::Memory { region, offset } => Ok(self.load(region, offset, size)),
             Target::Scs => Ok(subword(self.scs.peek(addr & !3).ok_or(Unmapped)?, addr, size)),
             Target::Soc => Ok(subword(self.soc.peek(addr & !3, self.now), addr, size)),
         }
@@ -357,7 +392,8 @@ impl Bus {
                 self.soc.program(&mut self.flash, offset, size, value, self.now);
                 Ok(())
             }
-            Target::Memory { region: Region::System, .. } => Err(Unmapped),
+            // System memory is ST's; the NOR, mapped, is read-only.
+            Target::Memory { region: Region::System | Region::Nor, .. } => Err(Unmapped),
             Target::Memory { region: Region::Ram(i), offset } => {
                 let bytes = value.to_le_bytes();
                 let (stamp, writer) = (self.stamp(), self.writer);

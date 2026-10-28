@@ -9,9 +9,10 @@
 //! drives from outside, such as the Nucleo's user button on PC13), EXTI and
 //! SYSCFG's line routing for their interrupts, the USARTs, I2C1 to 4
 //! ([`crate::i2c`]), SPI1 to 6 ([`crate::spi_h7`]), the general-purpose
-//! timers as time bases ([`crate::timer`]), the RNG, DBGMCU, and the flash
-//! interface ([`crate::flash_h7`]). RCC's reset bits reset the peripherals
-//! they name.
+//! timers as time bases ([`crate::timer`]), the RNG, DBGMCU, the flash
+//! interface ([`crate::flash_h7`]), the QUADSPI with a NOR flash mapped
+//! through it ([`crate::quadspi`]), and the LTDC with the panel it drives
+//! ([`crate::ltdc`]). RCC's reset bits reset the peripherals they name.
 //!
 //! The parts wired to the board's buses ([`crate::devices`]) are attached
 //! with [`Stm32h7::attach`]: an I2C part answers its address on its
@@ -31,6 +32,8 @@ use crate::eth_h7::{self, Ethernet};
 use crate::flash_h7;
 use crate::gpio::{Edge, Gpio};
 use crate::i2c::I2c;
+use crate::ltdc::Ltdc;
+use crate::quadspi::Quadspi;
 use crate::spi_h7::Spi;
 use crate::timer::Timer;
 use crate::trace::{Signal, SpiEvent, Trace};
@@ -141,6 +144,8 @@ pub struct Stm32h7 {
     pub spi_parts: Vec<SpiWired>,
     timers: Vec<Timer>,
     pub eth: Ethernet,
+    pub quadspi: Quadspi,
+    pub ltdc: Ltdc,
     /// What RCC's registers make of the oscillators, worked out again
     /// whenever they are written.
     pub clocks: Clocks,
@@ -190,6 +195,8 @@ impl Default for Stm32h7 {
             spi_parts: Vec::new(),
             timers: TIMERS.iter().map(|&(_, _, wide)| Timer::new(wide, Clocks::period(HSI))).collect(),
             eth: Ethernet::default(),
+            quadspi: Quadspi::default(),
+            ltdc: Ltdc::default(),
             clocks: Clocks::reset(HSI),
             trace: Trace::default(),
             watched: [0; PORTS],
@@ -314,6 +321,8 @@ impl Stm32h7 {
         self.rng.cr = 0;
         self.dbgmcu = [0; 0x20];
         self.other.clear();
+        self.quadspi.reset();
+        self.ltdc.reset();
         for usart in &mut self.usarts {
             usart.reset();
         }
@@ -545,6 +554,8 @@ impl Stm32h7 {
             || Self::spi(addr).is_some()
             || Self::timer(addr).is_some()
             || Ethernet::contains(addr)
+            || Quadspi::contains(addr)
+            || Ltdc::contains(addr)
     }
 
     /// The interrupt lines the peripherals assert, as a mask by IRQ number.
@@ -686,6 +697,12 @@ impl Stm32h7 {
         if Ethernet::contains(addr) {
             return self.eth.read(addr);
         }
+        if Quadspi::contains(addr) {
+            return self.quadspi.read(addr - crate::quadspi::BASE);
+        }
+        if Ltdc::contains(addr) {
+            return self.ltdc.read(addr - Ltdc::BASE);
+        }
         if let Some((n, offset)) = Self::i2c(addr) {
             let mut i2c = self.i2cs[n].clone();
             i2c.advance(now);
@@ -766,6 +783,10 @@ impl Stm32h7 {
         }
         if Ethernet::contains(addr) {
             self.eth.write(addr, value);
+        } else if Quadspi::contains(addr) {
+            self.quadspi.write(addr - crate::quadspi::BASE, value);
+        } else if Ltdc::contains(addr) {
+            self.ltdc.write(addr - Ltdc::BASE, value);
         } else if let Some((n, offset)) = Self::i2c(addr) {
             self.i2cs[n].advance(now);
             self.i2cs[n].write(offset, value, now);
