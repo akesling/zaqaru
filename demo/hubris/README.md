@@ -330,6 +330,9 @@ Outside the page, `zaqaru run web/demo/hubris.wasm -p 8080:80` and
   as fast as it can; an H7 in a browser falls behind real time when it is
   busy, and the kernel gives the difference up rather than racing. Not
   modelled: the M7's dual issue and branch prediction, cache misses.
+- Of the H753 too, for a board that has them (see `demo/doom`): the
+  QUADSPI in memory-mapped mode over a NOR flash, and the LTDC with the
+  panel it drives, its layers and colour look-up tables.
 - Not modelled: caches (they are registers that read back), the H7's
-  other DMA engines, QSPI, the hash and crypto blocks, USB, and anything
-  analog.
+  other DMA engines, the QUADSPI's indirect modes, the hash and crypto
+  blocks, USB, and anything analog.
