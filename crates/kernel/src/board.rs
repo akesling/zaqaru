@@ -99,6 +99,14 @@ pub const MAX_BEHIND_NS: u64 = 250_000_000;
 /// when nobody is looking, and how bunched its events are.
 pub const TICK_NS: u64 = 20_000_000;
 
+/// The most of the board's time one advance runs, catching up: a board
+/// behind the container's clock catches up a step at a time, waking the
+/// container again at once until it has, rather than all at once. Each
+/// step hands the host the board as it is, and a panel on a board running
+/// a game shows each frame a step makes; a catch-up of a quarter of a
+/// second in one go is seven frames of Doom drawn as one.
+pub const STEP_NS: u64 = 20_000_000;
+
 /// How fast the board's simulated time runs against the container's clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Speed {
@@ -204,6 +212,9 @@ pub struct Board {
     /// simulated time at its start.
     rate: (u64, u64),
     ratio: f64,
+    /// Whether the last advance left the board behind the container's
+    /// clock: see [`STEP_NS`].
+    behind: bool,
     /// The last monotonic reading the board was moved on at.
     pub now: u64,
     /// The board's LEDs, and whether each is lit, if it has been driven.
@@ -724,6 +735,8 @@ impl Board {
         }
         Some(match self.speed {
             Speed::Max => self.now,
+            // Still catching up: at once.
+            Speed::Scaled(_) if self.behind => self.now,
             Speed::Scaled(_) => self.now + TICK_NS,
         })
     }
@@ -745,10 +758,12 @@ impl Board {
                 let due = now.saturating_sub(origin) * permille;
                 let behind = due.saturating_sub(self.machine.time);
                 let limit = MAX_BEHIND_NS * permille;
-                let outcome = self.machine.run_until(self.machine.time + behind.min(limit), u64::MAX);
+                let step = STEP_NS * permille;
+                let outcome = self.machine.run_until(self.machine.time + behind.min(step), u64::MAX);
                 if behind > limit {
                     self.rebase(now);
                 }
+                self.behind = behind > step && behind <= limit;
                 outcome
             }
             Speed::Max => {
@@ -1907,6 +1922,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             paused: false,
             rate: (0, 0),
             ratio: 0.0,
+            behind: false,
             now: 0,
             leds: configuration.leds.into_iter().map(|led| (led, None)).collect(),
             name: configuration.name,

@@ -7,6 +7,10 @@
 // indices and the palette, when one L8 layer covers the panel — Doom's
 // case, a byte a pixel — or as RGB.
 //
+// Live, the frames come without asking: the worker sends each as a slice
+// shows it (see `pushed`), and the asking above is only for an instant
+// stood at, or a board the worker has not sent one for lately.
+//
 // What it writes: keys. While the screen has the focus, each key going
 // down or up is its scan code, set 1, as an AT keyboard sends it — the make
 // code, the break code with the top bit set, and 0xe0 before the keys the
@@ -50,10 +54,13 @@ const hex = (bytes) => bytes.map((b) => b.toString(16).padStart(2, "0")).join(""
 
 export class ScreenView {
   /// `body` is the panel's body; `read` reads a store path at the instant
-  /// in view; `type` sends a line to the board's front door.
-  constructor(body, { read, type }) {
+  /// in view; `type` sends a line to the board's front door; `live` says
+  /// whether the page is following the live run, whose frames are sent.
+  constructor(body, { read, type, live = () => false }) {
     this.read = read;
     this.type = type;
+    this.live = live;
+    this.pushedAt = 0;
     this.frame = null; // the count of the frame drawn
     this.busy = false;
     this.held = new Set();
@@ -141,9 +148,18 @@ export class ScreenView {
     this.type(`keys ${hex([MOUSE | this.buttons, dx & 0xff, dy & 0xff])}`);
   }
 
-  /// Asks for a newer frame than the one drawn, one ask at a time.
+  /// A frame the worker sent: drawn if the page is following the live run
+  /// and it is newer than the one drawn.
+  pushed(value) {
+    if (!this.live()) return;
+    this.pushedAt = performance.now();
+    if (value.frame > (this.frame ?? -1)) this.draw(value);
+  }
+
+  /// Asks for a newer frame than the one drawn, one ask at a time: when the
+  /// page stands at an instant, or no frame has been sent lately.
   async poll() {
-    if (this.busy) return;
+    if (this.busy || (this.live() && performance.now() - this.pushedAt < 250)) return;
     this.busy = true;
     try {
       const answer = await this.read(`board/display/${this.frame ?? 0}`);

@@ -89,6 +89,9 @@ pub struct System<'a, S: Store> {
     /// How many thread quanta the running process has used since it was
     /// given the processor. See [`SLICE`].
     slice: u64,
+    /// Whether a turn has moved a board on since the host last asked
+    /// ([`System::board_moved`]).
+    board_moved: bool,
     /// Whether the host's shutdown request has already been delivered.
     stopping: bool,
     /// How the *first* process ended, in full.
@@ -141,6 +144,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             current: 0,
             next: FIRST + 1,
             slice: 0,
+            board_moved: false,
             stopping: false,
             ending: None,
             departed: 0,
@@ -584,6 +588,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             // The board, if there is one, up to the clock just read.
             let at = self.retired();
             self.current().kernel.service_board(at);
+            self.board_moved |= self.current().kernel.board_wake().is_some();
             self.take_shutdown();
             // And the container's own store: whatever the outside asked
             // since the last slice. Kernel state only, like the pump.
@@ -601,6 +606,20 @@ impl<'a, S: Store + Clone> System<'a, S> {
             });
         }
         Turn::Ran
+    }
+
+    /// Whether a turn has moved a running board on since this was last
+    /// asked: what a run toward a count of instructions stops at, to hand
+    /// the host the board as it now is. A board that falls behind the
+    /// container's clock catches up in one turn, and while a process runs
+    /// slowly, as one polling does, that turn comes once a slice; a run
+    /// that went on to its count would take as many of them as it took
+    /// slices, and the host would see nothing of the board for all of
+    /// them (seconds, in a browser that runs it slower than a board needs).
+    /// Where a run stops is no part of what the container does, which is a
+    /// function of instructions retired, so a recording replays the same.
+    pub fn board_moved(&mut self) -> bool {
+        core::mem::take(&mut self.board_moved)
     }
 
     /// Why nothing can run, process by process and thread by thread.
