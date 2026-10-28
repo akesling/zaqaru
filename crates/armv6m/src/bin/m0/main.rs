@@ -31,6 +31,7 @@ pub(crate) const PS_PER_MS: u64 = 1_000_000_000;
 
 pub(crate) fn usage() -> ExitCode {
     eprintln!("usage: zaqaru-m0 <final.bin> [--part stm32g031|stm32g070|stm32h753|…] [--core m0+|m7] [--ms N] [--quiet] [--udp PORT:TEXT] [--ping]");
+    eprintln!("                 [--nor FILE] [--keys USART:MS:HEX,…] [--frames DIR] [--every N] [--peek ADDR:LEN,…]");
     eprintln!("       zaqaru-m0 serve <final.bin> [--part NAME] [--gdb ADDR] [--listen ADDR] [--archive ZIP] [--board FILE]");
     eprintln!("       zaqaru-m0 door [--listen ADDR] [--probe ADDR] [--archive ZIP] [--humility PATH]");
     eprintln!("       zaqaru-m0 repack <in.zip> <out.zip> [--stored]");
@@ -83,6 +84,11 @@ fn main() -> ExitCode {
     let mut core = None;
     let mut datagrams: Vec<(u16, String)> = Vec::new();
     let mut ping = false;
+    let mut nor = None;
+    let mut keys: Vec<(usize, u64, Vec<u8>)> = Vec::new();
+    let mut frames_dir = None;
+    let mut every: u64 = 35;
+    let mut peeks: Vec<(u32, usize)> = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--part" => match args.next().and_then(|v| armv6m::part::Part::named(&v)) {
@@ -108,6 +114,42 @@ fn main() -> ExitCode {
                 None => return usage(),
             },
             "--ping" => ping = true,
+            // A NOR flash on the QUADSPI, holding a file, for the image to
+            // map: a game's data, say.
+            "--nor" => match args.next() {
+                Some(path) => nor = Some(path),
+                None => return usage(),
+            },
+            // Bytes to arrive on a USART at a simulated time: `3:5000:1c9c`
+            // is USART3 at 5 s, a key's scan codes down and up.
+            "--keys" => match args.next().and_then(|v| parse_keys(&v)) {
+                Some(more) => keys.extend(more),
+                None => return usage(),
+            },
+            // Every `--every`th frame the LTDC is shown, as a PPM.
+            "--frames" => match args.next() {
+                Some(dir) => frames_dir = Some(dir),
+                None => return usage(),
+            },
+            // Memory to show at the end, as a debugger reads it.
+            "--peek" => {
+                let parsed: Option<Vec<(u32, usize)>> = args.next().and_then(|v| {
+                    v.split(',')
+                        .map(|p| {
+                            let (a, n) = p.split_once(':')?;
+                            Some((u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, n.parse().ok()?))
+                        })
+                        .collect()
+                });
+                match parsed {
+                    Some(more) => peeks.extend(more),
+                    None => return usage(),
+                }
+            }
+            "--every" => match args.next().and_then(|v| v.parse().ok()) {
+                Some(n) if n > 0 => every = n,
+                _ => return usage(),
+            },
             _ if image.is_none() && !arg.starts_with('-') => image = Some(arg),
             _ => return usage(),
         }
@@ -131,6 +173,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(path) = &nor {
+        let attached = std::fs::read(path)
+            .map_err(|e| format!("{path}: {e}"))
+            .and_then(|contents| armv6m::quadspi::Nor::new(&contents, 16 << 20))
+            .and_then(|nor| machine.attach_nor(nor));
+        if let Err(e) = attached {
+            eprintln!("zaqaru-m0: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    keys.sort_by_key(|&(_, at, _)| at);
+    let mut keys = keys.into_iter().peekable();
+    let mut shown_frames = 0;
 
     let end = ms * PS_PER_MS;
     let started = Instant::now();
@@ -159,6 +214,23 @@ fn main() -> ExitCode {
             }
         }
         shown = machine.events.len();
+        while let Some((port, _, bytes)) = keys.next_if(|&(_, at, _)| machine.time >= at * PS_PER_MS) {
+            for byte in bytes {
+                machine.receive(port - 1, byte);
+            }
+        }
+        let frames = machine.frames_shown();
+        if frames != shown_frames {
+            shown_frames = frames;
+            if let Some(dir) = frames_dir.as_ref().filter(|_| frames % every == 0) {
+                if let Some((screen, _)) = machine.screen() {
+                    let path = format!("{dir}/frame-{frames:06}.ppm");
+                    if let Err(e) = std::fs::write(&path, ppm(&screen)) {
+                        eprintln!("zaqaru-m0: {path}: {e}");
+                    }
+                }
+            }
+        }
         for reply in replies {
             machine.deliver(reply);
         }
@@ -218,6 +290,18 @@ fn main() -> ExitCode {
         .collect();
     println!("exceptions taken: {}", taken.join(", "));
     println!("faults: {faults}, resets: {resets}");
+    for &(address, length) in &peeks {
+        let bytes = machine.debug_read(address, length).unwrap_or_default();
+        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        println!("0x{address:08x}: {}", hex.join(" "));
+    }
+    if shown_frames > 0 {
+        println!(
+            "LTDC frames shown: {shown_frames}, {:.1} a second of simulated time, {:.1} a second of this host's",
+            shown_frames as f64 / (ms_at(machine.time) / 1000.0),
+            shown_frames as f64 / secs,
+        );
+    }
     let mpu = &machine.bus.scs.mpu;
     println!(
         "MPU {}, {} of 8 regions enabled for the current task",
@@ -233,6 +317,39 @@ fn main() -> ExitCode {
         Outcome::Budget if faults == 0 => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     }
+}
+
+/// `USART:MS:HEX`, comma-separated: bytes to arrive on a USART (1 for
+/// USART1) at a simulated time.
+fn parse_keys(text: &str) -> Option<Vec<(usize, u64, Vec<u8>)>> {
+    text.split(',')
+        .map(|item| {
+            let mut fields = item.splitn(3, ':');
+            let port: usize = fields.next()?.parse().ok().filter(|&p| p >= 1)?;
+            let at: u64 = fields.next()?.parse().ok()?;
+            let hex = fields.next()?;
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|i| hex.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
+                .collect::<Option<Vec<u8>>>()?;
+            Some((port, at, bytes))
+        })
+        .collect()
+}
+
+/// A screen as a binary PPM.
+fn ppm(screen: &armv6m::ltdc::Screen) -> Vec<u8> {
+    let mut out = format!("P6 {} {} 255\n", screen.width, screen.height).into_bytes();
+    match &screen.pixels {
+        armv6m::ltdc::Pixels::Indexed { indices, palette } => {
+            for &i in indices {
+                let c = palette[i as usize];
+                out.extend([(c >> 16) as u8, (c >> 8) as u8, c as u8]);
+            }
+        }
+        armv6m::ltdc::Pixels::Rgb(rgb) => out.extend_from_slice(rgb),
+    }
+    out
 }
 
 /// Simulated milliseconds at `time`, in picoseconds.
