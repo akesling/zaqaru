@@ -20,6 +20,7 @@
 import { request as requestUsb } from "./usb.js";
 import * as bench from "./bench.js";
 import { MemoryView } from "./memory.js";
+import { ScreenView } from "./screen.js";
 
 const worker = new Worker("./worker.js", { type: "module" });
 const $ = (id) => document.getElementById(id);
@@ -53,6 +54,7 @@ let spans = []; // { sent, answered } per request answered through the edge
 let playing = null;
 let checkpointing = null; // live: what checkpoints are costing, from the worker
 let lastState = 0; // when the last state was drawn, by the page's clock
+let seekCost = 0; // ms the last seek took the worker, restoring aside
 let current = 0;
 let busy = false;
 let queued = null;
@@ -268,18 +270,28 @@ function drawLanes() {
   g.fillStyle = "#58a6ff";
   for (const s of spans) g.fillRect(x(s.sent), 9, Math.max(2, x(s.answered) - x(s.sent)), 3);
   // The board's Hubris tasks: each system call at the instant the board was
-  // moved on at, in its kind's colour; faults, resets and halts taller.
+  // moved on at, in its kind's colour; faults, resets and halts taller. A
+  // pixel column at a time, the latest in it shown and a fault over
+  // anything: a board playing a game makes hundreds of calls a second, and
+  // a rectangle each, every redraw, is what kept the page too busy to draw
+  // the game.
   if (hubris.length) {
+    const columns = new Array(Math.ceil(width) + 1).fill(null);
     for (const record of hubris) {
-      const at = x(record.at);
-      if (record.ch === "SYS") {
-        g.fillStyle = KIND_COLORS[bench.syscallLine(record).kind] ?? "#888";
-        g.fillRect(at, 14, 1.5, 5);
-      } else {
-        g.fillStyle = KIND_COLORS.fault;
-        g.fillRect(at, 13, 2, 7);
-      }
+      const column = Math.max(0, Math.min(columns.length - 1, Math.floor(x(record.at))));
+      if (record.ch !== "SYS") columns[column] = KIND_COLORS.fault;
+      else if (columns[column] !== KIND_COLORS.fault) columns[column] = record;
     }
+    columns.forEach((what, column) => {
+      if (what === null) return;
+      if (what === KIND_COLORS.fault) {
+        g.fillStyle = what;
+        g.fillRect(column, 13, 2, 7);
+      } else {
+        g.fillStyle = KIND_COLORS[bench.syscallLine(what).kind] ?? "#888";
+        g.fillRect(column, 14, 1.5, 5);
+      }
+    });
   }
 }
 
@@ -354,7 +366,9 @@ worker.onmessage = (event) => {
     if (message.reply) {
       if (!drain()) seek(frontier);
     } else if (following && (message.stopped || finished !== null)) follow();
-    else if (following && !busy && performance.now() - lastState >= FOLLOW_MS) follow();
+    // At most a twentieth of the worker's time reading every panel, which
+    // a busy board needs the rest of.
+    else if (following && !busy && performance.now() - lastState >= Math.max(FOLLOW_MS, 20 * seekCost)) follow();
     return;
   }
   // The USB devices the worker holds for the container: the page's grants.
@@ -364,9 +378,14 @@ worker.onmessage = (event) => {
     if (panel && values.usb?.value) renderers.usb(values.usb.value, panel);
     return;
   }
+  if (message.type === "display") {
+    screenView?.pushed(message.value);
+    return;
+  }
   if (message.type === "state") {
     busy = false;
     lastState = performance.now();
+    seekCost = message.took ?? 0;
     render(message);
     if (!drain() && playing && !live) seek(current + playing);
     return;
@@ -776,6 +795,7 @@ function buildPanels() {
   if (terminalPort) makeTerminalPanel();
   for (const pattern of OPEN) if (readable.includes(pattern)) makePanel(pattern, pattern, $("panels"));
   if (readable.includes("board")) makeMemoryPanel();
+  if (readable.includes("board")) makeScreenPanel();
   // The host's side of the boundary, which is not a path of the
   // container's store but is what the page is to it: its edge, its console.
   makeEdgePanel();
@@ -807,6 +827,22 @@ function makeMemoryPanel() {
     colorOf: bench.taskColor,
     update,
   });
+}
+
+// The panel on the board's LTDC, if it has one, and a keyboard for it:
+// see `screen.js`. Shown once it has a frame to show, first of all.
+// The board's screen: see `screen.js`. Live, the worker sends each new frame
+// itself; at an instant, the panel reads the frame there.
+let screenView = null;
+function makeScreenPanel() {
+  const element = document.createElement("section");
+  element.className = "panel screen-panel";
+  element.id = "screen";
+  element.hidden = true;
+  element.innerHTML = `<h2><span class="path">screen</span> — the panel on the board's LTDC; click it to type at the board</h2><div class="body"></div>`;
+  $("panels").prepend(element);
+  equipPanel(element);
+  screenView = new ScreenView(element.querySelector(".body"), { read, type: boardControl, live: () => boardTime === null && playing !== null });
 }
 
 function makeEdgePanel() {
@@ -1678,10 +1714,10 @@ async function followTimeline() {
     }
     for (const record of answer.records) {
       if (!timelineRecords.has(record.ch)) timelineRecords.set(record.ch, []);
-      const list = timelineRecords.get(record.ch);
-      list.push(record);
-      if (list.length > TIMELINE_KEPT) list.splice(0, list.length - TIMELINE_KEPT);
+      timelineRecords.get(record.ch).push(record);
     }
+    // The oldest let go once a read, not once a record.
+    for (const list of timelineRecords.values()) if (list.length > TIMELINE_KEPT) list.splice(0, list.length - TIMELINE_KEPT);
     timelineCursor = answer.next;
     if (answer.records.length || since < 0) drawTimeline();
   } catch {

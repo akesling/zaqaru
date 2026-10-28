@@ -1,0 +1,17 @@
+# The board on this container's bench, which zaqaru's kernel runs: an
+# STM32H753 Nucleo-144 playing Doom, its flash the Hubris image of
+# app-doom.toml. Its debug probe is on USB, as the Hubris bench's is, for
+# Humility; `probe` is where a GDB server listens too.
+chip     stm32h753
+name     nucleo-h753zi
+image    /hubris/final.bin
+archive  /hubris/hubris.zip
+probe    127.0.0.1:3333
+
+# What the board has that a Nucleo does not: a 16 MiB NOR flash on the
+# QUADSPI, holding the WAD, which the image maps at boot; and a keyboard on
+# USART3, the ST-LINK's virtual COM port, sending scan codes -- what the
+# page's screen types, through the door's `keys`. The display on the LTDC
+# needs no line: the panel is whatever the controller scans out.
+nor      /hubris/doom1.wad
+keyboard USART3

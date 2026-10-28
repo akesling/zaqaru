@@ -41,6 +41,7 @@
 //               { type: "write", id, data }              live: more for an open connection, a string or bytes
 // Messages out: { type: "loaded", ... }  { type: "progress", ... }
 //               { type: "state", ... }   { type: "value", id, path, value | error }
+//               { type: "display", value }   live: the board's screen, a new frame of it
 //               { type: "response", id, response }
 //               { type: "stream", id, data | ended }      what an open connection's guest wrote
 //               { type: "error", message }
@@ -292,6 +293,31 @@ function checkpoint() {
 /// Live: one slice of the frontier, at most `by` instructions; answers the
 /// turn's kind.
 let idleFor = 0; // ms the last idle slice said the container can be left
+/// Live: the board's screen, sent to the page as soon as a slice has shown
+/// it a new frame, rather than asked for: an ask waits behind whatever the
+/// board is doing, and frames that come in bunches stutter. At most every
+/// `DISPLAY_MS`; a board without a panel is asked only until it says so.
+const DISPLAY_MS = 8;
+let displayed = 0; // the count of the frame last sent
+let displayAt = 0;
+let hasDisplay = true;
+function sendDisplay() {
+  const now = performance.now();
+  if (!hasDisplay || now - displayAt < DISPLAY_MS) return;
+  displayAt = now;
+  let value;
+  try {
+    value = live.value(`board/display/${displayed}`);
+  } catch {
+    hasDisplay = false;
+    return;
+  }
+  if (value?.off && value.frame === 0) return;
+  if (value?.pixels === undefined) return;
+  displayed = value.frame;
+  postMessage({ type: "display", value });
+}
+
 function slice(by) {
   const began = performance.now();
   const turn = live.step(frontier + by);
@@ -305,6 +331,7 @@ function slice(by) {
     finished = turn.status;
     checkpoint();
   } else if (checkpointDue()) checkpoint();
+  sendDisplay();
   return turn.kind;
 }
 
@@ -358,11 +385,24 @@ async function advance(by) {
 }
 
 // A turn of the event loop and no more: setTimeout clamps to 4 ms once
-// nested, and a message to oneself does not.
+// nested, and a message to oneself does not. But Chrome runs a worker's
+// messages to itself ahead of the page's to it, so a worker that only ever
+// yields that way, as one running a busy board does, can leave the page's
+// reads and seeks unanswered for seconds: the screen stalls and then jumps.
+// So at least every `FAIR_MS`, a timer instead, which lets them in.
 const channel = new MessageChannel();
 const yielded = [];
 channel.port1.onmessage = () => yielded.shift()?.();
-const yieldNow = () => new Promise((resolve) => (yielded.push(resolve), channel.port2.postMessage(null)));
+const FAIR_MS = 16;
+let fairAt = 0;
+const yieldNow = () => {
+  const now = performance.now();
+  if (now - fairAt >= FAIR_MS) {
+    fairAt = now;
+    return sleep(0);
+  }
+  return new Promise((resolve) => (yielded.push(resolve), channel.port2.postMessage(null)));
+};
 
 const IDLE_MAX_MS = 50; // the longest an idle container is left, whatever it says
 
@@ -383,6 +423,10 @@ async function idle() {
   const woke = new Promise((resolve) => (waking = () => ((woken = true), resolve())));
   if (until - performance.now() >= 4) await Promise.race([sleep(until - performance.now() - 1), woke]);
   while (!woken && performance.now() < until) await yieldNow();
+  // And a turn of the event loop however short the wait: a board running
+  // behind says to wake at once, again and again, and a loop that never
+  // yields leaves the page's messages unread for as long as it runs.
+  if (!woken) await yieldNow();
   waking = null;
 }
 
@@ -519,6 +563,7 @@ async function query(id, board, path) {
 /// `context` says which process and thread the page is looking at (the
 /// running ones when it says nothing) and where it is browsing the files.
 async function seek(at, context = {}, board = null) {
+  const began = performance.now();
   const restored = await stand(at, board);
   const values = {};
   const statistics = read(viewer, "statistics", "statistics");
@@ -547,6 +592,10 @@ async function seek(at, context = {}, board = null) {
     type: "state",
     at: statistics.value?.retired ?? at,
     restored,
+    // What the seek cost, restoring aside: what the page paces its
+    // following of a live run by, so that reading every panel does not
+    // take the time a busy board needs.
+    took: performance.now() - began - restored,
     pid: current?.pid ?? null,
     tid: thread?.tid ?? null,
     values,

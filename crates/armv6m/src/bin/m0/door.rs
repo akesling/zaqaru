@@ -106,6 +106,9 @@ const HELP: &str = "\
                             flash it — g031, g070, h753, Oxide's
                             gimletlet and psc, or one you uploaded (drop
                             an archive on the terminal)
+    keys 1c 9c              scan codes on the board's keyboard, if it has
+                            one: Enter, down and up; the page's screen
+                            sends them as you type at it
     button                  press and release the Nucleo's user button,
                             PC13 on an H7's
     udp [PORT] TEXT         send TEXT to the board's UDP PORT (7, echo, if
@@ -201,6 +204,13 @@ fn session(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
                 door.network(&format!("udp {port} {text}\n"), &out)?
             }
             Some("ping") => door.network("ping\n", &out)?,
+            // Scan codes for a board's keyboard, as the page sends them a
+            // key at a time: quiet, as typing is.
+            Some("keys") => {
+                if std::fs::write("/dev/board", format!("keys {}\n", words[1..].join(" "))).is_err() {
+                    out.write_all(b"keys HEX: scan codes, for a board with a keyboard\n")?;
+                }
+            }
             Some(verb @ ("speed" | "pause" | "resume" | "advance")) => {
                 let line = format!("{verb} {}\n", words[1..].join(" "));
                 if std::fs::write("/dev/board", line).is_err() {
@@ -220,7 +230,7 @@ fn session(stream: TcpStream, door: &FrontDoor) -> std::io::Result<()> {
                 Some(name) => door.flash(name, &out)?,
                 None => out.write_all(b"flash NAME: an archive `archives` lists, or one uploaded\n")?,
             },
-            Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, clock, speed, pause, resume, advance, button, udp, ping, temperature, flash, help and exit\n").as_bytes())?,
+            Some(other) => out.write_all(format!("{other}: not here — this bench runs humility, board, clock, speed, pause, resume, advance, button, keys, udp, ping, temperature, flash, help and exit\n").as_bytes())?,
         }
         out.write_all(PROMPT)?;
     }

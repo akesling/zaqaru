@@ -100,7 +100,12 @@ pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
         }
         crate::abi::between_turns();
         match system.turn() {
-            // A plain turn never stops on an instruction.
+            // A plain turn never stops on an instruction; one that moved a
+            // board on stops the run, for the host to see it.
+            Turn::Ran | Turn::Stopped if until >= 0 && system.board_moved() => {
+                system.serve();
+                return KIND_RUNNING;
+            }
             Turn::Ran | Turn::Stopped => {}
             Turn::Idle if until < 0 => {}
             Turn::Idle => {
