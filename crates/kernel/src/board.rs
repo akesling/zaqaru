@@ -1271,13 +1271,13 @@ impl Board {
     /// data register, and the trace record of the byte it gave — with its
     /// time in the board's nanoseconds. Empty when nothing is being
     /// followed, or the byte came from nowhere followed.
-    pub fn why_json(&self, address: u32, map: Option<&Result<armv6m::hubris::Image, String>>) -> String {
+    pub fn why_json(&self, address: u32, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
         use crate::system::server::quoted;
         let Some(p) = &self.machine.provenance else {
             return r#"{"following":false,"steps":[]}"#.to_string();
         };
         let tag = p.memory.get(&address).copied().unwrap_or(0);
-        let steps = self.why_steps(p, tag, map, 24);
+        let steps = self.why_steps(p, tag, map, read, 24);
         format!(
             r#"{{"following":true,"since_ns":{},"address":{address},"what":{},"steps":[{}]}}"#,
             p.since / 1000,
@@ -1340,13 +1340,21 @@ impl Board {
         p: &armv6m::provenance::Provenance,
         tag: armv6m::provenance::Tag,
         map: Option<&Result<armv6m::hubris::Image, String>>,
+        read: ReadFile,
         depth: usize,
     ) -> Vec<String> {
         use crate::system::server::quoted;
         use armv6m::provenance::What;
         let mut out = Vec::new();
         for (_, node) in p.history(tag, depth) {
-            let common = format!(r#""t":{},"pc":{},"code":{}"#, node.time / 1000, node.pc, quoted(&self.code_at(node.pc, map)));
+            let lines: Vec<String> = self.lines_at(node.pc, map, read).iter().map(dwarf::line_json).collect();
+            let common = format!(
+                r#""t":{},"pc":{},"code":{},"lines":[{}]"#,
+                node.time / 1000,
+                node.pc,
+                quoted(&self.code_at(node.pc, map)),
+                lines.join(",")
+            );
             out.push(match node.what {
                 What::Store { addr, size, value } => format!(
                     r#"{{"what":"store","addr":{addr},"size":{size},"value":{value},"where":{},{common}}}"#,
@@ -1362,7 +1370,7 @@ impl Board {
                     )
                 }
                 What::Merge => {
-                    let other = self.why_steps(p, node.parents[1], map, depth / 2);
+                    let other = self.why_steps(p, node.parents[1], map, read, depth / 2);
                     format!(r#"{{"what":"merge","other":[{}],{common}}}"#, other.join(","))
                 }
             });

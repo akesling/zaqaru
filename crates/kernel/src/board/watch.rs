@@ -225,6 +225,48 @@ impl Board {
         )
     }
 
+    /// `board/writers/{owner}`: the code that last wrote each word of
+    /// `owner`'s RAM (its writable sections and its stack): each writer
+    /// with its code and source line, how many words it holds, the latest
+    /// stamp among them, and the runs of words, `[address, length]`. What
+    /// colours a source file by the memory each of its lines holds.
+    pub fn writers_json(&self, owner: &str, map: Option<&Result<Image, String>>, read: ReadFile) -> Option<String> {
+        let image = map?.as_ref().ok()?;
+        let place = if owner == "kernel" { &image.kernel } else { image.owner(owner)? };
+        let mut ranges: Vec<(u32, u32)> = place.sections.iter().filter(|s| s.writable).map(|s| (s.base, s.size)).collect();
+        ranges.extend(place.stack);
+        // writer → (words, latest, runs)
+        let mut by: BTreeMap<u32, (u32, u64, Vec<(u32, u32)>)> = BTreeMap::new();
+        for (base, size) in ranges {
+            for a in (base & !3..base.saturating_add(size)).step_by(4) {
+                let Some(mark) = self.machine.bus.last_write(a) else { continue };
+                let entry = by.entry(mark.writer).or_default();
+                entry.0 += 1;
+                entry.1 = entry.1.max(mark.stamp);
+                match entry.2.last_mut() {
+                    Some((start, length)) if *start + *length == a => *length += 4,
+                    _ => entry.2.push((a, 4)),
+                }
+            }
+        }
+        let writers: Vec<String> = by
+            .iter()
+            .map(|(&writer, (words, latest, runs))| {
+                format!(
+                    r#"{{"writer":{},"words":{words},"latest":{latest},"runs":[{}]}}"#,
+                    self.writer_json(writer, map, read),
+                    runs.iter().map(|(a, n)| format!("[{a},{n}]")).collect::<Vec<_>>().join(",")
+                )
+            })
+            .collect();
+        Some(format!(
+            r#"{{"owner":{},"now":{},"writers":[{}]}}"#,
+            quoted(owner),
+            armv6m::bus::write_stamp(self.machine.time),
+            writers.join(",")
+        ))
+    }
+
     fn object_json(&self, o: &Object) -> String {
         format!(
             r#"{{"owner":{},"name":{},"address":{},"size":{},"type":{}}}"#,
