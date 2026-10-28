@@ -149,6 +149,21 @@ function drain() {
   return true;
 }
 
+/// One path read at the board's instant in view (the live run's latest,
+/// or the one stood at), from a container re-executed there with
+/// `options` on the way: `{ watch, back }` to watch writes from `back`
+/// picoseconds before. What `memory.js` asks a variable's history and an
+/// audit with; the panels stay where they are.
+function query(options, path) {
+  return new Promise((resolve, reject) => {
+    const id = nextRead++;
+    reads.set(id, { resolve, reject });
+    const time = boardTime ?? (Number.isFinite(liveBoardTime) ? liveBoardTime : null);
+    if (time === null) return reject("no board time to stand at yet");
+    worker.postMessage({ type: "query", id, board: { time, follow: false, ...options }, path });
+  });
+}
+
 /// One path of the store, read at the instant in view.
 function read(path) {
   return new Promise((resolve, reject) => {
@@ -786,6 +801,7 @@ function makeMemoryPanel() {
   equipPanel(element);
   memoryView = new MemoryView(element.querySelector(".body"), {
     read,
+    query,
     stand: (ps) => seekBoard(ps),
     escape,
     colorOf: bench.taskColor,

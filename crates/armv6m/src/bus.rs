@@ -111,6 +111,68 @@ impl Ram {
     }
 }
 
+/// Every write to a range of RAM, and how often each instruction wrote each
+/// word anywhere, kept while someone asks: what a variable's history and an
+/// audit of who writes what are made of. Off (the bus's `watch` is `None`)
+/// it costs a test per write to RAM. Observation only, as the marks are.
+#[derive(Clone, Debug, Default)]
+pub struct Watch {
+    /// The range whose writes are logged, `[base, base + length)`.
+    pub base: u32,
+    pub length: u32,
+    /// Oldest first, at most [`LOGGED`].
+    pub log: Vec<Written>,
+    /// Writes to the range past the most `log` keeps.
+    pub dropped: u64,
+    /// When auditing: for each writer, the caller it was called from (lr,
+    /// for what a helper such as `memcpy` wrote on its caller's behalf),
+    /// and word, how many times it wrote there; at most [`SITES`] of them.
+    pub sites: Option<std::collections::HashMap<(u32, u32, u32), u32>>,
+}
+
+/// A write to RAM, as a [`Watch`] logs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Written {
+    /// The board's time, in picoseconds.
+    pub time: u64,
+    /// As a [`Mark`]'s.
+    pub writer: u32,
+    /// lr when the writer stored: who called the function storing.
+    pub caller: u32,
+    pub address: u32,
+    pub size: u32,
+    /// What was stored, for a store of up to a word; 0 for the DMA's.
+    pub value: u32,
+}
+
+/// The most writes a [`Watch`] logs.
+pub const LOGGED: usize = 4096;
+/// The most writer, caller and word a [`Watch`] counts.
+pub const SITES: usize = 1 << 20;
+
+impl Watch {
+    fn note(&mut self, written: Written) {
+        let (start, end) = (u64::from(written.address), u64::from(written.address) + u64::from(written.size));
+        if start < u64::from(self.base) + u64::from(self.length) && end > u64::from(self.base) {
+            if self.log.len() < LOGGED {
+                self.log.push(written);
+            } else {
+                self.dropped += 1;
+            }
+        }
+        if let Some(sites) = &mut self.sites {
+            for word in (written.address / 4)..=((written.address + written.size.max(1) - 1) / 4) {
+                let key = (written.writer, written.caller, word * 4);
+                if let Some(count) = sites.get_mut(&key) {
+                    *count += 1;
+                } else if sites.len() < SITES {
+                    sites.insert(key, 1);
+                }
+            }
+        }
+    }
+}
+
 /// The chip around the core: its peripherals, by family.
 #[derive(Clone, Debug)]
 pub enum Soc {
@@ -139,6 +201,10 @@ pub struct Bus {
     /// What is writing: the address of the instruction storing, or one of
     /// the `BY_*`; whoever writes sets it first, as with `now`.
     pub writer: u32,
+    /// lr as the writer stored, when it is an instruction: see [`Written`].
+    pub caller: u32,
+    /// What is being watched, if anything: see [`Watch`].
+    pub watch: Option<Box<Watch>>,
     /// [`write_stamp`] of `stamped`: worked out again only when `now` has
     /// moved on, not at every store.
     stamp: u64,
@@ -182,6 +248,8 @@ impl Bus {
                     soc: Soc::G0(Box::new(soc)),
                     now: 0,
                     writer: 0,
+                    caller: 0,
+                    watch: None,
                     stamp: 1,
                     stamped: 0,
                 }
@@ -209,6 +277,8 @@ impl Bus {
                     soc: Soc::H7(Box::default()),
                     now: 0,
                     writer: 0,
+                    caller: 0,
+                    watch: None,
                     stamp: 1,
                     stamped: 0,
                 }
@@ -368,6 +438,9 @@ impl Bus {
                     _ => ram.bytes[offset..offset + 4].copy_from_slice(&bytes),
                 }
                 ram.mark(offset, size as usize, stamp, writer);
+                if let Some(watch) = &mut self.watch {
+                    watch.note(Written { time: self.now, writer, caller: self.caller, address: addr, size, value });
+                }
                 Ok(())
             }
             Target::Scs => {
@@ -397,9 +470,12 @@ impl Bus {
 
     /// `len` bytes of RAM at `addr`, as [`Bus::dma_slice`] found them,
     /// written by DMA at `now`.
-    fn dma_wrote(rams: &mut [Ram], addr: u32, len: usize, now: u64) {
+    fn dma_wrote(rams: &mut [Ram], watch: &mut Option<Box<Watch>>, addr: u32, len: usize, now: u64) {
         if let Some(ram) = rams.iter_mut().find(|ram| addr >= ram.base && (addr - ram.base) as usize + len <= ram.bytes.len()) {
             ram.mark((addr - ram.base) as usize, len, write_stamp(now), BY_DMA);
+            if let Some(watch) = watch {
+                watch.note(Written { time: now, writer: BY_DMA, caller: 0, address: addr, size: len as u32, value: 0 });
+            }
         }
     }
 
@@ -415,7 +491,7 @@ impl Bus {
     pub fn run_dma(&mut self) {
         use crate::eth_h7::{BUF1V, FD, LD, OWN};
         let Soc::H7(soc) = &mut self.soc else { return };
-        let (rams, eth) = (&mut self.rams, &mut soc.eth);
+        let (rams, eth, watch) = (&mut self.rams, &mut soc.eth, &mut self.watch);
         if eth.tx_kicked && eth.tx_running() {
             eth.tx_kicked = false;
             let mut frame = Vec::new();
@@ -445,7 +521,7 @@ impl Bus {
                 let written = (tdes3 & !OWN).to_le_bytes();
                 if let Some(slot) = Self::dma_slice(rams, at + 12, 4) {
                     slot.copy_from_slice(&written);
-                    Self::dma_wrote(rams, at + 12, 4, self.now);
+                    Self::dma_wrote(rams, watch, at + 12, 4, self.now);
                 }
                 eth.tx_advance();
                 if tdes3 & 1 << 30 == 0 && tdes3 & LD != 0 {
@@ -481,7 +557,7 @@ impl Bus {
             let len = frame.len().min(eth.rx_buffer_size());
             if let Some(bytes) = Self::dma_slice(rams, buffer, len) {
                 bytes.copy_from_slice(&frame[..len]);
-                Self::dma_wrote(rams, buffer, len, self.now);
+                Self::dma_wrote(rams, watch, buffer, len, self.now);
             }
             // Written back: FD and LD, the length with its FCS, and RDES1's
             // IPv6-header-present bit set for what is IPv6.
@@ -492,7 +568,7 @@ impl Bus {
                 for (i, word) in words.iter().enumerate() {
                     slot[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
                 }
-                Self::dma_wrote(rams, at, 16, self.now);
+                Self::dma_wrote(rams, watch, at, 16, self.now);
             }
             eth.rx_advance();
             eth.received(rdes3);

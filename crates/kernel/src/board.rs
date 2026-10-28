@@ -70,6 +70,7 @@ use armv6m::{Event, Machine, Outcome};
 use crate::ring::End;
 
 mod dwarf;
+mod watch;
 pub use dwarf::ReadFile;
 use crate::socket::{Address, Endpoint, State};
 

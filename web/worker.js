@@ -34,6 +34,8 @@
 //                                                       picoseconds of the board's own time, in place of `at`;
 //                                                       `follow`: where its values go followed on the way
 //               { type: "read", id, path }              one path, at the instant in view
+//               { type: "query", id, board, path }      one path, at an instant of the board's stood at
+//                                                       with board: { time, watch, back, follow }
 //               { type: "request", id, port, request }  live: through the edge
 //               { type: "open", id, port }               live: a connection that stays open
 //               { type: "write", id, data }              live: more for an open connection, a string or bytes
@@ -469,26 +471,48 @@ async function stand(at, board = null) {
 /// With `follow`, where values go is followed on the way (`board/provenance`),
 /// from a checkpoint far enough back — `FOLLOW_BACK` of the board's time —
 /// that what arrived shortly before the instant is caught too, and never
-/// one from before there was a board to follow.
+/// one from before there was a board to follow. With `watch`, writes are
+/// watched on the way likewise (`board/watch`: a range's every write, or
+/// who writes what), from `back` picoseconds before the instant.
 const FOLLOW_BACK = 2e12;
-async function standBoard({ time, follow = false }) {
+async function standBoard(board) {
   const began = performance.now();
-  const from = follow ? time - FOLLOW_BACK : time;
+  viewer = await boardAt(board);
+  return performance.now() - began;
+}
+
+/// A container restored and run to where its board stands at `time`: see
+/// `standBoard`. Its own, so that a seek made while it runs on cannot
+/// change which one it is.
+async function boardAt({ time, follow = false, watch = null, back = FOLLOW_BACK }) {
+  const from = follow || watch ? time - (watch ? back : FOLLOW_BACK) : time;
   const boarded = (entry) => entry.board !== null && entry.board !== undefined;
-  // The last checkpoint before `from`; following, failing that, the first
-  // with a board at all.
+  // The last checkpoint before `from`; following or watching, failing
+  // that, the first with a board at all.
   let index = checkpoints.entries.findLastIndex((entry) => boarded(entry) && entry.board < from);
-  if (index < 0) index = follow ? Math.max(0, checkpoints.entries.findIndex((entry) => boarded(entry) && entry.board < time)) : 0;
-  viewer = await Container.fromSnapshot(module, checkpoints.snapshot(index));
-  if (follow) {
+  if (index < 0) index = follow || watch ? Math.max(0, checkpoints.entries.findIndex((entry) => boarded(entry) && entry.board < time)) : 0;
+  const container = await Container.fromSnapshot(module, checkpoints.snapshot(index));
+  for (const [path, on] of [["board/provenance", follow && "on"], ["board/watch", watch]]) {
+    if (!on) continue;
     try {
-      viewer.put("board/provenance", "on");
+      container.put(path, on);
     } catch {
-      // No board at that checkpoint: nothing to follow.
+      // No board at that checkpoint: nothing to follow or watch.
     }
   }
-  viewer.stopAtBoard({ time }, live ? frontier : -1);
-  return performance.now() - began;
+  container.stopAtBoard({ time }, live ? frontier : -1);
+  return container;
+}
+
+/// One path read at an instant of the board's, from a container stood
+/// there with `board`'s options on the way: what a variable's history and
+/// an audit are, read once the re-execution that made them is done. The
+/// panels' own instant is left as it was.
+async function query(id, board, path) {
+  const began = performance.now();
+  const container = await boardAt(board);
+  const answer = read(container, path, path);
+  postMessage({ type: "value", id, path, restored: performance.now() - began, ...answer });
 }
 
 /// The machine at `at`, as every path of its store the instant can fill.
@@ -584,6 +608,7 @@ onmessage = async (event) => {
     }
     else if (message.type === "seek") await seek(message.at, message.context, message.board);
     else if (message.type === "read") readOne(message.id, message.path);
+    else if (message.type === "query") await query(message.id, message.board, message.path);
     else if (message.type === "request") request(message.id, message.port, message.request);
     else if (message.type === "open") openStream(message.id, message.port);
     // Text a line at a time, or bytes: a file dropped on the terminal.
