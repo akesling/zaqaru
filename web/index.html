@@ -181,6 +181,56 @@
   .mem-bytes .b { padding: 0 1px; margin-right: 2px; border-radius: 2px; }
   .mem-bytes .b.cold { opacity: .5; }
   .mem-bytes .addr { opacity: .4; margin-left: -1.5em; display: inline-block; width: 3.6em; }
+  .mem-owner .doing { margin-left: auto; overflow: hidden; text-overflow: ellipsis; max-width: 16em; }
+  .mem-owner .doing + .mem-gauge { margin-left: 6px; }
+  .mem-views { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+  .mem-view { flex: 1 1 32em; min-width: 0; }
+  .mem-source { flex: 1 1 32em; min-width: 0; position: sticky; top: 3em; max-height: 70vh; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; }
+  .mem-source-head { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-bottom: 3px; }
+  .mem-source-head a, .mem-history a[data-close], .mem-node .acts a { color: var(--accent); cursor: pointer; }
+  .mem-source-body { overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.45; }
+  .mem-source .sl { display: flex; gap: 6px; white-space: pre; }
+  .mem-source .sl[data-runs] { cursor: pointer; }
+  .mem-source .sl[data-runs]:hover { background: var(--line); }
+  .mem-source .sl.here { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+  .mem-source .ln { opacity: .45; min-width: 3.5em; text-align: right; flex: none; }
+  .mem-source .heat { width: 6px; flex: none; border-radius: 1px; }
+  .mem-source .heat.none { background: transparent; }
+  .mem-source .wrote { flex: none; }
+  .mem-node { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.55; }
+  .mem-node .tw { display: inline-block; width: 1.1em; cursor: pointer; opacity: .7; }
+  .mem-node .heat, .mem-words .heat { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+  .mem-node .name { font-weight: 600; }
+  .mem-node .ty { opacity: .55; }
+  .mem-node.unknown .val { opacity: .6; font-style: italic; }
+  .mem-node .acts { visibility: hidden; margin-left: 8px; }
+  .mem-node:hover .acts { visibility: visible; }
+  .mem-node.near { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .mem-node .by a.stand { cursor: pointer; }
+  a.src { color: var(--accent); cursor: pointer; }
+  a.src:hover { text-decoration: underline; }
+  .mem-ring { padding-left: 2.4em; margin: 2px 0 4px; }
+  .mem-ring table, .mem-table, .mem-words { border-collapse: collapse; font-size: 12px; }
+  .mem-ring td, .mem-table td, .mem-words td { padding: 1px 8px 1px 0; vertical-align: top; }
+  .mem-table tr[data-runs] { cursor: pointer; }
+  .mem-table tr[data-runs]:hover, .mem-words tr.near { background: var(--line); }
+  .mem-table .num { text-align: right; }
+  .mem-history { margin: 3px 0 6px 2.4em; padding: 4px 8px; border-left: 2px solid var(--accent); background: color-mix(in srgb, var(--accent) 6%, transparent); }
+  .mem-history a[data-stand] { cursor: pointer; text-decoration: underline dotted; }
+  .mem-ticks { position: relative; height: 10px; margin: 4px 0; background: #8882; border-radius: 2px; }
+  .mem-ticks span { position: absolute; top: 0; width: 2px; height: 10px; background: var(--accent); }
+  .mem-why { margin: 2px 0; padding-left: 1.6em; }
+  .mem-why a[data-stand] { cursor: pointer; }
+  .mem-finding { color: #f85149; margin: 3px 0; }
+  .mem-ok { color: #3fb950; margin: 3px 0; }
+  .mem-score { margin: 2px 0 6px; }
+  .mem-frame-row { margin: 4px 0 8px; }
+  .mem-frame-row .inl { padding-left: 2em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mem-frame-row .fn { padding-left: 1.2em; margin-top: 2px; }
+  .mem-words .g-pointer, .mem-words .g-code { color: #7ee787; }
+  .mem-words .g-paint, .mem-words .g-zero { opacity: .5; }
+  .mem-words .g-text { color: #d2a8ff; }
+  .chg { padding-left: 1.2em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .usb .usbbar { margin-bottom: 6px; }
   .usb .dim { opacity: .65; }
   .usb .device { margin-top: 6px; }

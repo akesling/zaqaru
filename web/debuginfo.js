@@ -218,7 +218,9 @@ function clip(text, most = 96) {
 /// value; a tuple's fields are unnamed.
 function summary(node) {
   const parts = node.children ?? [];
-  if (parts.length === 1 && /^__0$/.test(parts[0].name)) return parts[0].value;
+  // A wrapper of one thing (a newtype, an `AtomicBool`'s `v`, an
+  // `UnsafeCell`'s `value`) is that thing.
+  if (node.kind === "struct" && parts.length === 1) return parts[0].value;
   const tuple = parts.length && parts.every((c) => /^__\d+$/.test(c.name));
   const inner = parts.map((c) => (tuple || c.name.startsWith("[") ? c.value : `${c.name}: ${c.value}`)).join(", ");
   if (node.kind === "array") return clip(`[${inner}${node.more ? `, …${node.more} more` : ""}]`);
@@ -410,12 +412,12 @@ export function scheduling(state) {
   };
   switch (variant) {
     case "InReply":
-      return { text: "waiting for a reply", on: id(sched) };
+      return { text: "awaiting a reply", on: id(sched) };
     case "InSend":
-      return { text: "waiting to send", on: id(sched) };
+      return { text: "sending", on: id(sched) };
     case "InRecv": {
       const from = sched.children?.[0];
-      return from?.variant === "Some" ? { text: "waiting for a message from one task", on: id(from) } : { text: "waiting for a message", on: null };
+      return from?.variant === "Some" ? { text: "receiving only", on: id(from) } : { text: "receiving", on: null };
     }
     default:
       return { text: variant ? variant.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase() : sched.value, on: null };

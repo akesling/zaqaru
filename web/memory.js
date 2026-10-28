@@ -3,8 +3,9 @@
 // for the MPU — is a square or a 2:1 block of its own; each cell coloured
 // by whose it is, and lit by how lately it was written, fading in the
 // board's own time. Under it, each task's stack and how deep it has been,
-// and an inspector: the statics of whatever is chosen, each byte lit the
-// same way, with the code that last wrote it, and the time of that write a
+// and an inspector (`inspector.js`): what is chosen, as its DWARF says it
+// is — typed statics, the stack frame by frame, the source lines that
+// wrote it — each part lit the same way, with the time of its last write a
 // handle on the instant.
 //
 // What it reads, from the board's store: `board/writes/{since}/{cell}` for
@@ -12,6 +13,8 @@
 // `board/symbols/{owner}` for what the memory is, `board/memory` and
 // `board/written` for the bytes of what the inspector shows, and
 // `board/whatis` for what the pointer is on.
+
+import { Inspector } from "./inspector.js";
 
 /// The bytes a cell of the picture stands for.
 export const CELL = 64;
@@ -306,14 +309,18 @@ const ZOOM_CELLS = 65536; // the most cells a zoomed picture is drawn with
 const SERVED = 4096; // bytes a read of memory answers with
 const INSPECTED = 65536; // the most of an owner's statics the inspector reads
 const BACKGROUND = [22, 25, 30];
+const AROUND = 256; // bytes shown around an address nothing describes
 
 export class MemoryView {
   /// `read(path)` reads the board's store at the instant in view;
   /// `stand(ps)` stands every panel at an instant of the board's.
-  constructor(element, { read, stand, escape, colorOf, update }) {
+  /// `query(options, path)` reads a path from a re-execution to the
+  /// instant in view, watching or following on the way (see `inspector.js`).
+  constructor(element, { read, query, stand, escape, colorOf, update }) {
     if (update) shown = update;
     this.element = element;
     this.read = read;
+    this.query = query;
     this.stand = stand;
     this.escape = escape;
     this.colorOf = colorOf;
@@ -321,8 +328,8 @@ export class MemoryView {
     this.mark = null;
     this.selected = null; // an owner's name
     this.focus = null; // an address the inspector shows
-    this.sort = "address";
-    this.open = new Set(); // the statics shown whole
+    this.highlight = null; // runs of memory outlined in the pictures: [address, length]
+    this.arrows = []; // pointers drawn in the pictures: [from, to]
     this.zooms = []; // the way down: each a rectangle of a RAM's picture, and what it reads
     this.layouts = new Map(); // pictures' layouts, by RAM length and cell
     // Bumped whenever what is shown is changed under the reads made for
@@ -342,6 +349,8 @@ export class MemoryView {
       <div class="mem-inspector"></div>`;
     element.onclick = (event) => this.clicked(event);
     this.whatis = new Map();
+    this.inspector = new Inspector(this, element.querySelector(".mem-inspector"));
+    this.inspectedMost = INSPECTED;
   }
 
   reset() {
@@ -375,6 +384,10 @@ export class MemoryView {
           this.repaint = true;
           this.draw();
         } else this.drawOwners();
+        // What each task is doing, from the kernel's own table.
+        this.inspector.readSchedules().then(() => {
+          if (image === this.image) this.drawOwners();
+        });
       })
       .catch(() => {});
   }
@@ -390,6 +403,8 @@ export class MemoryView {
       this.owners = [];
       this.symbols = new Map();
       this.whatis.clear();
+      this.inspector.reset();
+      this.highlight = null;
       this.tasks = null;
       this.drawOwners();
       this.readTasks();
@@ -709,6 +724,52 @@ export class MemoryView {
     };
     if (statics) label(statics, picture.names, 1200, "10px ui-monospace, monospace");
     label(picture.owner, this.owners.map((o) => o.name), 900, statics ? "bold 12px ui-monospace, monospace" : "10px ui-monospace, monospace");
+    this.overlay(g, picture, s);
+  }
+
+  /// What the inspector asked to be shown on the pictures: the memory a
+  /// source line wrote, outlined, and where the chosen task's pointers
+  /// point, as arrows from each pointer to its target.
+  overlay(g, picture, s) {
+    const { view, rect } = picture;
+    // A cell's place on the canvas, in its pixels: its centre, or null when
+    // it is outside the rectangle shown.
+    const placeOf = (address) => {
+      if (address < picture.base || address >= picture.base + picture.length) return null;
+      const c = Math.floor((address - picture.base) / picture.cell);
+      const x = view.place[2 * c] - rect.x;
+      const y = view.place[2 * c + 1] - rect.y;
+      return x < 0 || y < 0 || x >= rect.w || y >= rect.h ? null : [x * s, y * s];
+    };
+    if (this.highlight) {
+      g.lineWidth = Math.max(1, s / 3);
+      g.strokeStyle = "#fff";
+      for (const [address, length] of this.highlight)
+        for (let a = address - ((address - picture.base) % picture.cell); a < address + length; a += picture.cell) {
+          const at = placeOf(a);
+          if (at) g.strokeRect(at[0] + 0.5, at[1] + 0.5, s - 1, s - 1);
+        }
+    }
+    g.strokeStyle = "#7ee787";
+    g.fillStyle = "#7ee787";
+    g.lineWidth = Math.max(1, s / 4);
+    for (const [from, to] of this.arrows) {
+      const a = placeOf(from);
+      const b = placeOf(to);
+      if (!a || !b || (a[0] === b[0] && a[1] === b[1])) continue;
+      const [x0, y0, x1, y1] = [a[0] + s / 2, a[1] + s / 2, b[0] + s / 2, b[1] + s / 2];
+      g.beginPath();
+      g.moveTo(x0, y0);
+      g.lineTo(x1, y1);
+      g.stroke();
+      const angle = Math.atan2(y1 - y0, x1 - x0);
+      const head = Math.max(4, s);
+      g.beginPath();
+      g.moveTo(x1, y1);
+      g.lineTo(x1 - head * Math.cos(angle - 0.4), y1 - head * Math.sin(angle - 0.4));
+      g.lineTo(x1 - head * Math.cos(angle + 0.4), y1 - head * Math.sin(angle + 0.4));
+      g.fill();
+    }
   }
 
   /// Where a point of the page is in a picture's grid — the whole grid's
@@ -925,47 +986,60 @@ export class MemoryView {
           gauge = `<span class="mem-gauge${share > 0.85 ? " tight" : ""}" title="its stack: ${used} of ${o.stack.size} bytes reached, at the deepest"><span style="width:${(100 * share).toFixed(1)}%;background:${o.color}"></span></span> <span class="dim">${used}/${o.stack.size} B</span>`;
         }
         const [r, g, b] = hot(glow);
+        const doing = o.index !== null && o.index !== undefined ? this.inspector.schedules[o.index] : null;
+        if (doing) gauge = `<span class="dim doing" title="${this.escape(this.inspector.scheduleText(doing))}">${this.escape(this.inspector.scheduleText(doing))}</span>${gauge}`;
         return `<div class="mem-owner${o.name === this.selected ? " on" : ""}" data-owner="${this.escape(o.name)}"><span class="swatch" style="background:${o.color}"></span><span class="glow" style="background:rgb(${r} ${g} ${b} / ${glow.toFixed(2)})" title="${last ? `last wrote ${age(this.now - last)} ago` : "never written"}"></span><b>${this.escape(o.name)}</b> <span class="dim">${(bytes / 1024).toFixed(1)} KiB</span> ${gauge}</div>`;
       })
       .join("");
-    set(box, `<div class="dim mem-label">whose memory it is · how lately each wrote · how deep each stack has been</div><div class="mem-owner-grid">${rows}</div>`);
+    set(box, `<div class="dim mem-label">whose memory it is · how lately each wrote · what each is doing · how deep each stack has been</div><div class="mem-owner-grid">${rows}</div>`);
   }
 
-  /// Reads what the inspector shows — the chosen owner's statics, or the
-  /// bytes around an address — when what it covers was written since it
-  /// last read them: each cluster of statics on its own, a word's start to
-  /// a word's end, so what lies between them is neither read nor watched.
+  /// Reads what the inspector shows (the chosen owner's statics, typed
+  /// where its DWARF says what they are, and its stack; or the bytes
+  /// around an address nothing describes) when what it covers was written
+  /// since it last read them: each cluster on its own, a word's start to a
+  /// word's end, so what lies between them is neither read nor watched.
   async inspect() {
-    const box = this.element.querySelector(".mem-inspector");
     const owner = this.owners.find((o) => o.name === this.selected);
     if (!owner && this.focus === null) {
       this.inspected = null;
-      return set(box, `<div class="dim">click a task, or a place in the pictures, to see what is there</div>`);
+      return this.inspector.draw(true);
     }
     // A later call — another choice, another instant — supersedes this one.
     const token = ++this.inspecting;
     const generation = this.generation;
     const stale = () => token !== this.inspecting || generation !== this.generation;
-    const key = `${this.selected} ${owner ? "" : this.focus}`;
+    const key = `${this.selected} ${this.focus}`;
     let statics = [];
     if (owner) {
+      const typed = await this.inspector.typedOf(owner.name);
+      if (stale()) return;
       if (!this.symbols.has(owner.name)) {
         const answer = await this.read(`board/symbols/${owner.name}`).catch(() => null);
         if (stale()) return;
         this.symbols.set(owner.name, answer?.statics ?? []);
       }
-      statics = [...this.symbols.get(owner.name)];
+      statics = (typed.statics ?? []).map((s) => ({ name: s.name, base: s.address, size: s.size, type: s.type }));
+      // What the symbol table names that the DWARF does not type: its bytes.
+      for (const s of this.symbols.get(owner.name)) if (!statics.some((t) => t.base === s.base)) statics.push({ ...s });
+      statics.sort((a, b) => a.base - b.base);
       // Its stack, as deep as it has been: below that is only the paint.
       if (owner.stack) {
         const top = owner.stack.base + owner.stack.size;
         const deepest = this.stackOf(owner.name)?.deepest ?? owner.stack.base;
         statics.push({ name: "its stack, as deep as it has been", base: deepest, size: top - deepest, stack: true });
       }
-    } else statics = [{ name: `around 0x${this.focus.toString(16)}`, base: (this.focus & ~0xff) >>> 0, size: 256 }];
+    }
+    // Around an address no static of its covers: its words, to be guessed at.
+    const covered = (a) => statics.some((s) => !s.stack && a >= s.base && a < s.base + s.size);
+    const around = this.focus !== null && !covered(this.focus) ? [{ name: `around 0x${this.focus.toString(16)}`, base: (this.focus & ~(AROUND - 1)) >>> 0, size: AROUND, around: true }] : [];
     statics = statics.filter((s) => s.size > 0);
-    const runs = clusters(statics, 256, INSPECTED);
+    const runs = clusters([...statics, ...around], 256, INSPECTED);
     const last = Math.max(0, ...runs.map((r) => this.lastWrite(r.base, r.end)));
-    if (this.inspected?.key === key && this.inspected.last === last) return this.drawInspector();
+    if (this.inspected?.key === key && this.inspected.last === last) {
+      this.inspector.draw();
+      return this.inspector.refresh();
+    }
     const chunks = [];
     const writers = [];
     for (const run of runs) {
@@ -982,14 +1056,33 @@ export class MemoryView {
       }
       chunks.push(chunk);
     }
-    const covered = (st) => runs.some((r) => st.base >= r.base && st.base < r.end);
-    this.inspected = { key, last, chunks, writers, statics: statics.filter(covered), cut: statics.some((st) => !covered(st) || !runs.some((r) => st.base + st.size <= r.end)), id: token };
-    this.drawInspector();
+    const read = (st) => runs.some((r) => st.base >= r.base && st.base < r.end);
+    this.inspected = {
+      key,
+      last,
+      chunks,
+      writers,
+      statics: statics.filter((st) => !st.stack && read(st)),
+      around: around.filter(read),
+      cut: statics.some((st) => !read(st) || !runs.some((r) => st.base + st.size <= r.end)),
+      id: token,
+    };
+    this.inspector.draw();
+    await this.inspector.refresh();
   }
 
   /// The chunk an address of what the inspector read is in.
   chunkOf(address) {
     return this.inspected?.chunks.find((c) => address >= c.base && address < c.end) ?? null;
+  }
+
+  /// The byte at `address`, as the inspector read it; null if it did not.
+  byteAt(address) {
+    const chunk = this.chunkOf(address);
+    if (!chunk) return null;
+    const i = 2 * (address - chunk.base);
+    const pair = chunk.hex.slice(i, i + 2);
+    return pair.length === 2 ? parseInt(pair, 16) : null;
   }
 
   /// The word at `address`: its stamp and writer's number, from the chunk
@@ -1001,95 +1094,66 @@ export class MemoryView {
     return [chunk.words[w] ?? 0, chunk.words[w + 1] ?? -1];
   }
 
-  /// The inspector: its rows made again only when what they are changes —
-  /// what was read, the order, the filter, what is open or near — and
-  /// otherwise each byte's heat and each write's age brought up to date in
-  /// place, which is all a tick of the board changes.
-  drawInspector() {
-    const box = this.element.querySelector(".mem-inspector");
-    const s = this.inspected;
-    if (!s) return;
-    const shape = [s.id, this.sort, this.onlyMarked, this.mark, [...this.open].join(","), this.focus].join("|");
-    if (box.shape === shape && box.querySelector(".mem-inspector-head")) return this.warm(box);
-    box.shape = shape;
-    const e = this.escape;
-    const byteHtml = (address) => {
-      const chunk = this.chunkOf(address);
-      const i = chunk ? 2 * (address - chunk.base) : -1;
-      const text = (chunk && chunk.hex.slice(i, i + 2)) || "  ";
-      const [stamp] = this.wordAt(address);
-      return stamp ? `<span class="b" data-a="${address}">${text}</span>` : `<span class="b cold">${text}</span>`;
-    };
-    const rows = s.statics
-      .map((st) => {
-        let last = 0;
-        let by = -1;
-        for (let a = st.base - (st.base % 4); a < st.base + st.size; a += 4) {
-          const [stamp, writer] = this.wordAt(a);
-          if (stamp > last) {
-            last = stamp;
-            by = writer;
-          }
-        }
-        return { st, last, by };
-      })
-      .filter((row) => this.mark === null || !this.onlyMarked || row.last >= this.mark);
-    if (this.sort === "recent") rows.sort((a, b) => b.last - a.last);
-    const lines = rows
-      .map(({ st, last, by }) => {
-        const chunk = this.chunkOf(st.base);
-        const shown = Math.min(st.size, this.open.has(st.base) ? 1024 : 16, chunk ? chunk.end - st.base : 0);
-        let bytes = "";
-        for (let a = st.base; a < st.base + shown; a++) {
-          if (a > st.base && (a - st.base) % 16 === 0) bytes += `<br><span class="addr">${(a - st.base).toString(16).padStart(4, "0")}</span> `;
-          bytes += byteHtml(a);
-        }
-        const more = st.size > shown ? `<span class="dim"> …${st.size - shown} more</span>` : "";
-        const writer = by >= 0 ? s.writers[by]?.code : null;
-        const when = last
-          ? `<span class="t" data-stand="${last}" title="stand the board just after this write"></span>${writer ? ` <span class="dim">by ${e(writer)}</span>` : ""}`
-          : `<span class="dim">never written</span>`;
-        const near = this.focus !== null && this.focus >= st.base && this.focus < st.base + st.size;
-        return `<div class="mem-static${near ? " near" : ""}${this.mark !== null && last >= this.mark ? " since" : ""}" data-static="${st.base}"><div class="mem-static-head"><span class="name" title="${e(st.name)}">${e(st.stack ? st.name : shortName(st.name))}</span> <span class="dim">0x${st.base.toString(16)} · ${st.size} B</span> · ${when}</div><div class="mem-bytes">${bytes}${more}</div></div>`;
-      })
-      .join("");
-    const owner = this.selected ? `<b>${e(this.selected)}</b>` : "";
-    const sorts = ["address", "recent"]
-      .map((sort) => `<button type="button" data-sort="${sort}"${sort === this.sort ? ' class="on"' : ""}>${sort === "address" ? "by address" : "latest written first"}</button>`)
-      .join("");
-    const marked = this.mark === null ? "" : `<button type="button" data-only${this.onlyMarked ? ' class="on"' : ""}>only written since the mark</button>`;
-    const truncated = s.cut ? `<div class="dim">the first ${INSPECTED / 1024} KiB of its statics shown</div>` : "";
-    // Made whole, not morphed: what changed is the rows themselves.
-    box.innerHTML = `<div class="mem-inspector-head">${owner} <span class="controls">${sorts}${marked}</span> <span class="dim mem-hover">&nbsp;</span></div>${lines || `<div class="dim">nothing to show</div>`}${truncated}`;
-    box.shown = null;
-    box.onmouseover = (event) => {
-      const byte = event.target.closest("[data-a]");
-      const hover = box.querySelector(".mem-hover");
-      if (!byte || !hover) return;
-      const [stamp, writer] = this.wordAt(Number(byte.dataset.a));
-      hover.textContent = `this word: written ${age(this.now - stamp)} ago by ${this.inspected?.writers[writer]?.code ?? "?"}`;
-    };
-    this.warm(box);
-    const near = box.querySelector(".mem-static.near");
-    if (near && this.focusShown !== this.focus) {
-      this.focusShown = this.focus;
-      near.scrollIntoView({ block: "nearest" });
+  /// The latest write to any word of `[from, to)` the inspector read: its
+  /// stamp and writer's number.
+  latestIn(from, to) {
+    let best = [0, -1];
+    for (let a = from - (from % 4); a < to; a += 4) {
+      const word = this.wordAt(a);
+      if (word[0] > best[0]) best = word;
     }
+    return best;
   }
 
-  /// Each byte's heat and each write's age, as of now, in the rows shown.
-  warm(box) {
-    for (const byte of box.querySelectorAll("[data-a]")) {
-      const [stamp] = this.wordAt(Number(byte.dataset.a));
-      const h = heat(this.now - stamp, this.half);
-      const [r, g, b] = hot(h);
-      byte.style.background = `rgb(${r} ${g} ${b} / ${(0.12 + 0.75 * h).toFixed(2)})`;
+  stampOf(from, to) {
+    return this.latestIn(from, to)[0];
+  }
+
+  heatOf(stamp) {
+    return stamp ? heat(this.now - stamp, this.half) : 0;
+  }
+
+  hotColour(h, alpha) {
+    const [r, g, b] = hot(h);
+    return `rgb(${r} ${g} ${b} / ${alpha.toFixed(2)})`;
+  }
+
+  ago(stamp) {
+    return age(Math.max(0, this.now - stamp));
+  }
+
+  /// A static nothing types, as its bytes.
+  rawStaticHtml(st) {
+    const e = this.escape;
+    let bytes = "";
+    const shown = Math.min(st.size, 64);
+    for (let a = st.base; a < st.base + shown; a++) {
+      if (a > st.base && (a - st.base) % 16 === 0) bytes += `<br><span class="addr">${(a - st.base).toString(16).padStart(4, "0")}</span> `;
+      const b = this.byteAt(a);
+      bytes += `<span class="b" data-heat="${a},${a + 1}">${b === null ? "  " : b.toString(16).padStart(2, "0")}</span>`;
     }
-    for (const when of box.querySelectorAll("[data-stand]")) when.textContent = `${age(this.now - Number(when.dataset.stand))} ago`;
+    const more = st.size > shown ? `<span class="dim"> …${st.size - shown} more</span>` : "";
+    return `<div class="mem-static"><div class="mem-static-head"><span class="name" title="${e(st.name)}">${e(shortName(st.name))}</span> <span class="dim">0x${st.base.toString(16)} · ${st.size} B · untyped</span></div><div class="mem-bytes">${bytes}${more}</div></div>`;
+  }
+
+  /// Memory to outline in the pictures: runs of `[address, length]`.
+  setHighlight(runs) {
+    this.highlight = runs?.length ? runs : null;
+    this.drawMaps();
+  }
+
+  /// Pointers to draw in the pictures, `[from, to]`: redrawn when they change.
+  setArrows(arrows) {
+    const key = arrows.map(([a, b]) => `${a}>${b}`).join(",");
+    if (key === this.arrowsKey) return;
+    this.arrowsKey = key;
+    this.arrows = arrows;
+    this.drawMaps();
   }
 
   clicked(event) {
     const t = (selector) => event.target.closest(selector);
+    if (t(".mem-inspector") && this.inspector.clicked(event)) return;
     const crumb = t("[data-crumb]");
     if (crumb) return this.zoom(Number(crumb.dataset.crumb));
     if (t("[data-block]")) {
@@ -1100,7 +1164,7 @@ export class MemoryView {
     if (t("[data-half]")) {
       this.half = Number(t("[data-half]").dataset.half);
       this.draw();
-      return this.drawInspector();
+      return this.inspector.draw();
     }
     if (t("[data-stand]")) {
       // The write was within this microsecond of the board's; its end is
@@ -1109,32 +1173,20 @@ export class MemoryView {
     }
     if (t("[data-mark]")) {
       this.mark = this.mark === null ? this.now : null;
-      this.onlyMarked = false;
+      // What every task's statics held at the mark, for what changed since.
+      if (this.mark !== null) this.inspector.takeSnapshot();
+      else this.inspector.snapshot = null;
       this.draw();
-      return this.drawInspector();
+      return this.inspector.draw(true);
     }
     const owner = t("[data-owner]");
     if (owner) {
       this.selected = this.selected === owner.dataset.owner ? null : owner.dataset.owner;
       this.focus = null;
       this.inspected = null;
+      this.highlight = null;
       this.draw();
       return this.inspect();
-    }
-    if (t("[data-sort]")) {
-      this.sort = t("[data-sort]").dataset.sort;
-      return this.drawInspector();
-    }
-    if (t("[data-only]")) {
-      this.onlyMarked = !this.onlyMarked;
-      return this.drawInspector();
-    }
-    const head = t(".mem-static-head");
-    if (head) {
-      const base = Number(head.parentElement.dataset.static);
-      if (this.open.has(base)) this.open.delete(base);
-      else this.open.add(base);
-      return this.drawInspector();
     }
   }
 }

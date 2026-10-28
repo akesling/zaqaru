@@ -102,6 +102,6 @@ test("writes at a fixed stride are an array's elements", () => {
 
 test("a task's state says whom it waits on", () => {
   const state = { variant: "Healthy", value: "Healthy(InReply(…))", children: [{ variant: "InReply", value: "InReply(TaskId(0x8003))", children: [{ kind: "struct", children: [{ kind: "base", size: 2, value: "32771 (0x8003)", children: null }] }] }] };
-  assert.deepEqual(scheduling(state), { text: "waiting for a reply", on: 3 });
+  assert.deepEqual(scheduling(state), { text: "awaiting a reply", on: 3 });
   assert.equal(scheduling({ variant: "Healthy", children: [{ variant: "Runnable", value: "Runnable", children: [] }] }).text, "runnable");
 });

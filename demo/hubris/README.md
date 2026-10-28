@@ -191,15 +191,73 @@ inspector. The emulator keeps, for every word of RAM, when it was last
 written and by what, all the time, so none of this re-executes anything.
 Under the pictures, each task with how lately it wrote and how deep its
 stack has been — the lowest word no longer holding the `0xbaddcafe` the
-kernel paints it with, as `humility stackmargin` finds it. Click a task,
-or a place in a picture, and its statics are listed, each byte lit the
-same way, with how long ago it was written and by which function; that
-time stands the board just after the write. **mark** an instant, run
-something, and the inspector can show only what was written since: mark,
-then `humility i2c -c 2 -p F -d 0x48 -r 0 -n 2`, and hiffy's list is
-`HIFFY_TEXT` written by the probe — Humility's program — then
-`HIFFY_KICK`, `HIFFY_SCRATCH` holding `0c 80` (25 °C) and `HIFFY_RSTACK`
-written by hiffy, and in i2c_driver its ring buffer of the transfer.
+kernel paints it with, as `humility stackmargin` finds it — and what it
+is doing, from the kernel's own task table: receiving, awaiting a reply
+from another task, runnable, faulted. **mark** an instant, and the cells
+written since are outlined.
+
+## What the code says it is
+
+The archive's ELFs carry their DWARF, and the board reads it (with gimli,
+the reader the Rust toolchain uses) as it is asked for: which source line
+an instruction came from and what was inlined into it, the type of every
+static, how to step a stack back a frame, and where a frame's variables
+are. The kernel's own DWARF finds its task table — `HUBRIS_TASK_TABLE_SPACE`,
+an array of `MaybeUninit<Task>`, by its type rather than by offsets written
+down here — and in each task's entry the registers it saved; from those,
+and the exception frame on the task's stack, each blocked task's stack is
+stepped back through the system call's stub (which has no unwinding
+information; its pushes say how) into the code that called it. `build.sh`
+keeps every source file the DWARF names beside the archive (`sources.sh`),
+the standard library's from GitHub at the compiler's commit.
+
+Click a task, and the inspector shows it as its code says it is:
+
+- **variables**: its statics as typed trees — a struct's fields, the
+  variant a Rust enum holds (by its discriminant, a niche's too), arrays,
+  pointers and what they point at — each part lit by how lately it was
+  written, with the source line that wrote it; a `ringbuf!` as its log,
+  latest first. Hover a field for **history**, every write to it over the
+  last 100 ms to all of the run, from a re-execution watching it, each a
+  handle on its instant; and **why**, each copy of its value back to the
+  bytes off a bus, from a re-execution following values. A line above says
+  how often guessing at words alone — zero, the stack paint, a pointer into
+  code or RAM, text, a number, a float — agrees with the DWARF, the misses
+  on hover; a click on memory nothing describes guesses at each word.
+  Pointers among what is shown are drawn as arrows on the pictures.
+- **stack**: its stack, frame by frame, each with its source line, the
+  calls inlined there, and its variables decoded the same way; a value in a
+  register the unwinding could not recover is unknown, not wrong.
+- **writers**: its memory by the source line that last wrote it, most
+  first; a click outlines that memory in the pictures.
+- **audit**: a re-execution counting which code writes which word across
+  the whole board, each write put down to its code, or a helper's
+  (`memcpy`, `memset`) to its caller; any code that wrote on from one
+  variable into the next, in one run of words, is said first. Then each
+  static and stack with what wrote it, and memory no DWARF describes.
+- **changes since the mark**: every field of every task that changed
+  since the mark — timers' deadlines moved on, counters counted, a ring
+  buffer's new entries.
+
+Any source line opens the file beside the view at that line, each line
+coloured by how lately it wrote what of the task's memory it holds; click
+one to outline that memory in the pictures.
+
+A re-execution is a container of its own, restored from the last
+checkpoint before the window and run to the instant: the panels stay where
+they are, and replay is exact, so what it finds is what happened.
+
+| path | answers |
+|------|---------|
+| `board/source/{pc}` | whose code it is, and its function, file and line, with every call inlined there |
+| `board/typed/{owner}` | the statics in the owner's RAM, each with its type, and every type they are made of |
+| `board/types/{owner}/{ids}` | more of the owner's types, by number |
+| `board/stack/{owner}` | the owner's stack stepped back, each frame's code, source lines and variables with their bytes (`--` unknown) |
+| `board/writers/{owner}` | the code that last wrote each word of the owner's RAM, with its source line and the runs of words it holds |
+| `board/file/{path}` | a source file the DWARF names, as the build kept it |
+| `board/watch` | write `range BASE LENGTH` to log every write there from now, `audit` to count who writes what everywhere, `off` |
+| `board/watched` | the writes logged, each with its writer's code and line |
+| `board/audit` | each static and stack with the code that wrote it, and code that wrote on from one into the next |
 
 `build.sh` builds Hubris's `app/demo-stm32h7-nucleo/app-h753.toml`, and
 the G031 and G070 demos to flash in its place, on this host. It builds
