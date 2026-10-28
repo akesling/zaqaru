@@ -13,6 +13,14 @@
 // AT added — sent as a `keys` line on a session of the bench's front door,
 // which hands it to the board's keyboard USART. So what is typed is input
 // the container records like any other, and the board replays it.
+//
+// And the mouse, on the same line, once a click on the screen has locked
+// the pointer to it: a packet of three bytes, 0xf0 with the buttons held
+// in its low bits (left, right, middle), then how far it moved across and
+// up, each a signed byte (see the Doom task's port). Scan codes never
+// begin 0xf0 to 0xf7, so the board tells the two apart. Movement is sent
+// at most every `MOUSE_MS`, what a packet could not carry kept for the
+// next, so a fast flick is not three bytes a pixel down a 115200-baud line.
 
 /// KeyboardEvent.code to set 1 scan codes, extended ones as two bytes.
 const SCAN_CODES = {
@@ -35,6 +43,9 @@ const SCAN_CODES = {
   MetaLeft: [0x1d], MetaRight: [0xe0, 0x1d],
 };
 
+const MOUSE_MS = 30;
+const MOUSE = 0xf0;
+
 const hex = (bytes) => bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
 
 export class ScreenView {
@@ -48,7 +59,7 @@ export class ScreenView {
     this.held = new Set();
     this.shown = 0; // frames drawn, and since when, for the rate
     this.since = performance.now();
-    body.innerHTML = `<canvas class="screen-canvas" tabindex="0" title="click, then play: arrows move, Ctrl or ⌘ fires, Space opens, Alt strafes, Shift runs, Esc for the menu"></canvas>
+    body.innerHTML = `<canvas class="screen-canvas" tabindex="0" title="click, then play: the mouse turns, walks and fires (right button strafes); arrows move, Ctrl or ⌘ fires, Space opens, Alt strafes, Shift runs; Esc lets the mouse go, and again for the menu"></canvas>
       <div class="dim screen-status">no frame yet</div>`;
     this.canvas = body.querySelector("canvas");
     this.status = body.querySelector(".screen-status");
@@ -61,7 +72,38 @@ export class ScreenView {
       for (const code of this.held) this.send(code, false);
       this.held.clear();
     });
-    this.canvas.addEventListener("pointerdown", () => this.canvas.focus());
+    this.canvas.addEventListener("pointerdown", () => {
+      this.canvas.focus();
+      if (document.pointerLockElement !== this.canvas) this.canvas.requestPointerLock?.();
+    });
+    this.buttons = 0; // held, as the packet's low bits have them
+    this.sentButtons = 0;
+    this.moved = [0, 0]; // across and up, not yet sent
+    // Browser buttons 0, 1, 2 are left, middle, right; the packet's bits
+    // are left, right, middle.
+    const bit = (button) => [1, 4, 2][button] ?? 0;
+    this.canvas.addEventListener("mousemove", (event) => {
+      if (document.pointerLockElement !== this.canvas) return;
+      this.moved[0] += event.movementX;
+      this.moved[1] -= event.movementY;
+    });
+    this.canvas.addEventListener("mousedown", (event) => {
+      if (document.pointerLockElement !== this.canvas) return;
+      event.preventDefault();
+      this.buttons |= bit(event.button);
+    });
+    this.canvas.addEventListener("mouseup", (event) => {
+      if (document.pointerLockElement !== this.canvas) return;
+      this.buttons &= ~bit(event.button);
+    });
+    this.canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+    // The pointer let go (Esc, another window): its buttons are let go too.
+    document.addEventListener("pointerlockchange", () => {
+      if (document.pointerLockElement === this.canvas) return;
+      this.buttons = 0;
+      this.moved = [0, 0];
+    });
+    setInterval(() => this.sendMouse(), MOUSE_MS);
     const tick = () => {
       this.poll();
       requestAnimationFrame(tick);
@@ -85,6 +127,18 @@ export class ScreenView {
     const code = SCAN_CODES[name];
     const bytes = down ? code : [...code.slice(0, -1), code.at(-1) | 0x80];
     this.type(`keys ${hex(bytes)}`);
+  }
+
+  /// A mouse packet, when the mouse has moved or a button changed: at most
+  /// a signed byte of movement each way, the rest kept for the next.
+  sendMouse() {
+    const [x, y] = this.moved;
+    if (!x && !y && this.buttons === this.sentButtons) return;
+    const clamp = (n) => Math.max(-127, Math.min(127, Math.trunc(n)));
+    const [dx, dy] = [clamp(x), clamp(y)];
+    this.moved = [x - dx, y - dy];
+    this.sentButtons = this.buttons;
+    this.type(`keys ${hex([MOUSE | this.buttons, dx & 0xff, dy & 0xff])}`);
   }
 
   /// Asks for a newer frame than the one drawn, one ask at a time.
