@@ -244,6 +244,12 @@ pub struct Board {
     /// what was sent to the host.
     multicast: u64,
     last_multicast: Option<String>,
+    /// The NOR flash on the QUADSPI, if the configuration put one there:
+    /// kept to put on whatever part goes on the bench next.
+    nor: Option<armv6m::quadspi::Nor>,
+    /// The USART a keyboard is wired to, as `keys` types on it (0 for
+    /// USART1).
+    pub keyboard: Option<usize>,
 }
 
 /// How many trace records the board keeps, and serves at a time.
@@ -280,6 +286,11 @@ pub struct Configuration {
     pub wiring: Vec<String>,
     /// Which board this is, as Hubris names it: `nucleo-h753zi`.
     pub name: String,
+    /// A file to put on a 16 MiB NOR flash on the QUADSPI, for the image to
+    /// map: a game's data, say.
+    pub nor: Option<String>,
+    /// The USART a keyboard is wired to, sending scan codes: 0 for USART1.
+    pub keyboard: Option<usize>,
 }
 
 /// A user LED on the board: which pin, and which level lights it.
@@ -358,6 +369,7 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
     let (mut chip, mut image, mut probe, mut led, mut archive) = (None, None, None, None, None);
     let mut wiring = Vec::new();
     let mut name = String::new();
+    let (mut nor, mut keyboard) = (None, None);
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -379,6 +391,8 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
                 armv6m::devices::Wiring::parse(&line)?;
                 wiring.push(line);
             }
+            "nor" => nor = Some(value.to_string()),
+            "keyboard" => keyboard = Some(parse_usart(value).ok_or_else(|| format!("keyboard `{value}`: expected a USART, `USART3`"))?),
             _ => return Err(format!("unknown key `{key}`")),
         }
     }
@@ -393,7 +407,29 @@ pub fn parse(text: &str) -> Result<Configuration, String> {
         leds: led.map_or_else(|| Led::of(part.name), |led| vec![led]),
         wiring,
         name,
+        nor,
+        keyboard,
     })
+}
+
+/// `USART3` or `UART7`: its number from 0.
+fn parse_usart(text: &str) -> Option<usize> {
+    let upper = text.to_ascii_uppercase();
+    let n: usize = upper.strip_prefix("USART").or_else(|| upper.strip_prefix("UART"))?.parse().ok()?;
+    (1..=8).contains(&n).then_some(n - 1)
+}
+
+/// Standard base64, for bytes in JSON.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let word = chunk.iter().enumerate().fold(0u32, |word, (i, &b)| word | u32::from(b) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ALPHABET[(word >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
 }
 
 /// What the host heard, as a line: a datagram's text and where from, or
@@ -462,7 +498,10 @@ impl Board {
     /// - `wire LINE` wires a part to the board's buses now, as a board
     ///   file's `i2c` and `spi` lines do; `unwire` leaves the next part put
     ///   on the bench with nothing wired, and `rewire` with what the board
-    ///   file wires — for a board other than the bench's own.
+    ///   file wires — for a board other than the bench's own;
+    /// - `keys 1c 9c` types on the keyboard the board file wires, if it
+    ///   wires one: those bytes arrive on its USART, scan codes as an AT
+    ///   keyboard sends them.
     pub fn command(&mut self, line: &str) -> Result<(), String> {
         let (verb, rest) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
         match verb {
@@ -474,6 +513,9 @@ impl Board {
                 machine.trace().on = true;
                 self.name.clear();
                 if matches!(machine.bus.soc, armv6m::bus::Soc::H7(_)) {
+                    if let Some(nor) = &self.nor {
+                        machine.attach_nor(nor.clone())?;
+                    }
                     for line in &self.wiring {
                         let wired = armv6m::devices::Wiring::parse(line).and_then(|w| machine.attach(w));
                         if let Err(why) = wired {
@@ -574,8 +616,23 @@ impl Board {
                 self.machine.drive(port as usize, pin, level);
                 Ok(())
             }
+            "keys" => {
+                let port = self.keyboard.ok_or("the board has no keyboard")?;
+                let hex: String = rest.split_whitespace().collect();
+                let bytes = (0..hex.len())
+                    .step_by(2)
+                    .map(|i| hex.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
+                    .collect::<Option<Vec<u8>>>()
+                    .ok_or_else(|| format!("keys `{}`: expected scan codes in hex, `1c 9c`", rest.trim()))?;
+                // A byte the USART is not ready for is lost, as a key typed
+                // at a board not listening is.
+                for byte in bytes {
+                    self.machine.receive(port, byte);
+                }
+                Ok(())
+            }
             "" => Ok(()),
-            other => Err(format!("`{other}`: the board takes `part NAME`, `image TEXT`, `pin PIN LEVEL`, `udp PORT TEXT`, `ping`, `temperature C`, `speed X`, `pause`, `resume`, `advance D`, `wire LINE`, `unwire` and `rewire`")),
+            other => Err(format!("`{other}`: the board takes `part NAME`, `image TEXT`, `pin PIN LEVEL`, `udp PORT TEXT`, `ping`, `keys HEX`, `temperature C`, `speed X`, `pause`, `resume`, `advance D`, `wire LINE`, `unwire` and `rewire`")),
         }
     }
 
@@ -998,7 +1055,7 @@ impl Board {
             _ => String::new(),
         };
         format!(
-            r#"{{"name":{},"chip":{},"core":{},"image":{},"state":{},"speed":{},"paused":{},"ratio":{:.4},"skipped_ms":{:.3},"clocks":{{{}}},"mode":{},"privileged":{},"simulated_ms":{:.3},"time_ps":{},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"wired":[{}],"gpio":[{}],"parts":[{}],"trace_next":{},"exceptions":{{{}}},"registers":{{{}}}}}"#,
+            r#"{{"name":{},"chip":{},"core":{},"image":{},"state":{},"speed":{},"paused":{},"ratio":{:.4},"skipped_ms":{:.3},"clocks":{{{}}},"mode":{},"privileged":{},"simulated_ms":{:.3},"time_ps":{},"instructions":{},"led":{},"led_pin":{},"leds":[{}],"faults":{},"probe":{},"debugger":{},"serial":{},"heard":[{}],"wired":[{}],"gpio":[{}],"parts":[{}],"trace_next":{},"display":{},"keyboard":{},"exceptions":{{{}}},"registers":{{{}}}}}"#,
             quoted(&self.name),
             quoted(&self.chip),
             quoted(core_name(m.core)),
@@ -1060,8 +1117,38 @@ impl Board {
                 .collect::<Vec<_>>()
                 .join(","),
             self.trace_next,
+            m.screen().map_or("null".into(), |(screen, frames)| format!(
+                r#"{{"width":{},"height":{},"frames":{frames}}}"#,
+                screen.width, screen.height
+            )),
+            self.keyboard.map_or("null".into(), |port| quoted(&format!("USART{}", port + 1))),
             exceptions.join(","),
             registers.join(","),
+        )
+    }
+
+    /// What the panel on the board's LTDC shows, if it has been shown a
+    /// frame since `since` (a count of frames): its size, and its pixels in
+    /// base64 — palette indices and the palette, RGB, or RGB. Just the count
+    /// if nothing is new, and `off` if there is no panel or it is dark.
+    pub fn display_json(&self, since: u64) -> String {
+        let frames = self.machine.frames_shown();
+        if frames == since {
+            return format!(r#"{{"frame":{frames}}}"#);
+        }
+        let Some((screen, frames)) = self.machine.screen() else {
+            return format!(r#"{{"frame":{frames},"off":true}}"#);
+        };
+        let (format, palette, pixels) = match &screen.pixels {
+            armv6m::ltdc::Pixels::Indexed { indices, palette } => {
+                let rgb: Vec<u8> = palette.iter().flat_map(|c| [(c >> 16) as u8, (c >> 8) as u8, *c as u8]).collect();
+                ("indexed", base64(&rgb), base64(indices))
+            }
+            armv6m::ltdc::Pixels::Rgb(rgb) => ("rgb", String::new(), base64(rgb)),
+        };
+        format!(
+            r#"{{"frame":{frames},"width":{},"height":{},"format":"{format}","palette":"{palette}","pixels":"{pixels}"}}"#,
+            screen.width, screen.height
         )
     }
 
@@ -1760,6 +1847,17 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         };
         // Recording what crosses the pins and buses, for a probe to show.
         machine.trace().on = true;
+        let mut nor = None;
+        if let Some(path) = &configuration.nor {
+            let made = self
+                .read_file(path.as_bytes())
+                .map_err(|errno| format!("{errno:?}"))
+                .and_then(|contents| armv6m::quadspi::Nor::new(&contents, 16 << 20));
+            match made.and_then(|made| machine.attach_nor(made.clone()).map(|()| made)) {
+                Ok(made) => nor = Some(made),
+                Err(why) => self.board_says(&format!("board: nor {path}: {why}")),
+            }
+        }
         for line in &configuration.wiring {
             let wired = armv6m::devices::Wiring::parse(line).and_then(|w| machine.attach(w));
             if let Err(why) = wired {
@@ -1828,6 +1926,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             wiring: configuration.wiring,
             multicast: 0,
             last_multicast: None,
+            nor,
+            keyboard: configuration.keyboard,
         }))
     }
 
@@ -1924,11 +2024,25 @@ mod tests {
                 leds: vec![Led { port: 2, pin: 6, active_low: true, color: "green" }],
                 wiring: vec![],
                 name: String::new(),
+                nor: None,
+                keyboard: None,
             }
         );
         let wired = parse("chip stm32h753\nimage /f.bin\ni2c I2C2 0x48 tmp117\nspi SPI3 PA15 rot PD0\n").unwrap();
         assert_eq!(wired.wiring, ["i2c I2C2 0x48 tmp117", "spi SPI3 PA15 rot PD0"]);
         assert!(parse("image /f.bin\ni2c I2C2 0x48 lm75").is_err());
+        let doom = parse("chip stm32h753\nimage /f.bin\nnor /hubris/doom1.wad\nkeyboard USART3\n").unwrap();
+        assert_eq!((doom.nor.as_deref(), doom.keyboard), (Some("/hubris/doom1.wad"), Some(2)));
+        assert!(parse("image /f.bin\nkeyboard SPI1").is_err());
+    }
+
+    #[test]
+    fn base64_is_the_standard_alphabet_padded() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(&[0xFF, 0xEF]), "/+8=");
     }
 
     #[test]
