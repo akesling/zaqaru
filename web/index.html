@@ -24,6 +24,10 @@
   #events-panel { background: Canvas; padding: 6px 10px; overflow: auto; min-height: 0; display: flex; flex-direction: column; }
   #events-panel h2 { display: flex; gap: 8px; align-items: center; }
   #events { overflow: auto; flex: 1; }
+  #custom-filter { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; font-size: 11px; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  #custom-filter[hidden] { display: none; }
+  #custom-filter select, #custom-filter input { font: inherit; font-size: 11px; flex: 1 1 9em; min-width: 0; max-width: 16em; }
+  #custom-filter select.on, #custom-filter input:not(:placeholder-shown) { outline: 1px solid var(--accent); }
   #store { background: Canvas; overflow: auto; min-height: 0; padding: 6px 10px; }
   h2 { margin: 0 0 4px; font-size: 11px; font-weight: 600; opacity: .7; text-transform: uppercase; letter-spacing: .04em; position: sticky; top: 0; background: Canvas; z-index: 1; }
   h2 .path { text-transform: none; letter-spacing: 0; font-weight: 600; }
@@ -316,8 +320,9 @@
 <main>
   <section id="events-panel">
     <h2>timeline
-      <select id="filter" title="the idle polls that found nothing are left out, and repeats of one exchange within a syscall are folded, unless 'everything' is chosen"><option value="all">syscalls, exchanges and Hubris's</option><option value="syscall">syscalls</option><option value="exchange">exchanges with the host</option><option value="hubris">the board's Hubris tasks</option><option value="raw">everything, unfolded</option></select>
+      <select id="filter" title="the idle polls that found nothing are left out, and repeats of one exchange within a syscall are folded, unless 'everything' is chosen"><option value="all">syscalls, exchanges and Hubris's</option><option value="syscall">syscalls</option><option value="exchange">exchanges with the host</option><option value="hubris">the board's Hubris tasks</option><option value="raw">everything, unfolded</option><option value="custom">custom…</option></select>
     </h2>
+      <div id="custom-filter" hidden title="rows that have every value chosen: a field leaves out the rows it is no part of (a syscall chosen, the board's records). The dropdowns offer what the timeline holds, most frequent first, and grow with it."><select data-field="process"></select><select data-field="syscall"></select><select data-field="path"></select><select data-field="task"></select><select data-field="call"></select><input data-field="text" type="search" placeholder="text…" size="12"><button type="button" id="custom-clear" title="choose nothing: every row">clear</button> <span id="custom-shown" class="dim"></span></div>
     <div id="events"></div>
   </section>
   <div id="store">

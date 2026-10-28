@@ -21,6 +21,7 @@ import { request as requestUsb } from "./usb.js";
 import * as bench from "./bench.js";
 import { MemoryView } from "./memory.js";
 import { ScreenView } from "./screen.js";
+import { FIELDS, Options, emptySpec, isEmpty, matches } from "./filters.js";
 
 const worker = new Worker("./worker.js", { type: "module" });
 const $ = (id) => document.getElementById(id);
@@ -359,6 +360,7 @@ worker.onmessage = (event) => {
     status(`${message.listening.length ? `listening on ${message.listening.join(", ")}` : ""}${message.idle && finished === null ? " · idle" : ""}`);
     extendEvents();
     renderEvents(true);
+    drawCustomFilter();
     drawLanes();
     // Whether the panels were following the frontier, before a finish stops the play.
     const following = playing !== null;
@@ -501,26 +503,71 @@ function emptyPoll(e) {
 // arrive before the last one kept, the list is built again from the start.
 let built = null;
 
+// The custom filter (see `filters.js`): what is chosen, kept for this
+// viewer, and the dropdowns' options, counted as the rows are built.
+let customSpec = emptySpec();
+try {
+  customSpec = { ...customSpec, ...JSON.parse(localStorage.getItem("timeline-filter") ?? "{}") };
+} catch {
+  // No storage here: start from nothing chosen.
+}
+let customOptions = new Options();
+
+/// What the list is built for: the filter, and with a custom one, what it
+/// chooses.
+function filterKey() {
+  const filter = $("filter").value;
+  return filter === "custom" ? `custom ${JSON.stringify(customSpec)}` : filter;
+}
+
+/// A row's fields, for the custom filter.
+function fieldsOf(kind, index) {
+  if (kind === "syscall") {
+    const t = timeline[index];
+    const line = (trace[index] ?? t.name ?? "").replace(/^\[\d+\] /, "");
+    return { process: nameOf(t.pid), syscall: line.match(/^(\w+)\(/)?.[1] ?? t.name, text: line };
+  }
+  if (kind === "exchange") {
+    const e = exchanges[index];
+    const pid = timeline[e.syscall]?.pid;
+    return { process: pid === undefined ? null : nameOf(pid), path: e.path, text: `${e.op} /${e.path} ${e.error ?? e.text ?? ""}` };
+  }
+  const record = hubris[index];
+  const { who, text } = hubrisLine(record);
+  const call = record.ch === "SYS" ? bench.syscallLine(record).name : record.ch === "FAULT" ? "fault" : "board";
+  return { task: who, call, text };
+}
+
 function rebuildEvents() {
-  built = { filter: $("filter").value, timeline: 0, exchanges: 0, hubris: 0, stamp: -1, groups: new Map() };
+  built = { filter: filterKey(), timeline: 0, exchanges: 0, hubris: 0, stamp: -1, groups: new Map() };
   events = [];
+  if ($("filter").value === "custom") customOptions = new Options();
   extendEvents();
 }
 
 function extendEvents() {
   const filter = $("filter").value;
-  if (!built || built.filter !== filter) return rebuildEvents();
+  if (!built || built.filter !== filterKey()) return rebuildEvents();
   const raw = filter === "raw";
+  // Custom: every kind, folded as "all" is, each row counted for the
+  // dropdowns and shown if it passes.
+  const custom = filter === "custom";
+  const passes = (kind, index) => {
+    if (!custom) return true;
+    const fields = fieldsOf(kind, index);
+    customOptions.note(fields);
+    return matches(customSpec, fields);
+  };
   // What was drawn at the frontier for want of its syscall's instant.
   while (events.length && events.at(-1).provisional) events.pop();
   if (events.some((e) => e.provisional)) return rebuildEvents();
   const fresh = [];
-  if (filter === "all" || filter === "raw" || filter === "hubris") {
-    for (let i = built.hubris; i < hubris.length; i++) fresh.push({ at: hubris[i].at, kind: "hubris", index: i, order: 2, count: 1 });
+  if (filter === "all" || filter === "raw" || filter === "hubris" || custom) {
+    for (let i = built.hubris; i < hubris.length; i++) if (passes("hubris", i)) fresh.push({ at: hubris[i].at, kind: "hubris", index: i, order: 2, count: 1 });
   }
   built.hubris = hubris.length;
   if (filter !== "hubris" && filter !== "exchange") {
-    for (let i = built.timeline; i < timeline.length; i++) fresh.push({ at: timeline[i].at, kind: "syscall", index: i, order: 1, count: 1 });
+    for (let i = built.timeline; i < timeline.length; i++) if (passes("syscall", i)) fresh.push({ at: timeline[i].at, kind: "syscall", index: i, order: 1, count: 1 });
   }
   built.timeline = timeline.length;
   if (filter !== "hubris" && filter !== "syscall") {
@@ -534,6 +581,7 @@ function extendEvents() {
       const settled = e.syscall < timeline.length;
       if (!settled) break;
       if (!raw && emptyPoll(e)) continue;
+      if (!passes("exchange", i)) continue;
       if (e.syscall !== built.stamp) {
         built.stamp = e.syscall;
         built.groups = new Map();
@@ -552,6 +600,8 @@ function extendEvents() {
     // The rest wait on their syscall: drawn at the frontier for now.
     for (; i < exchanges.length; i++) {
       if (!raw && emptyPoll(exchanges[i])) continue;
+      // Counted once it is placed, not now as well.
+      if (custom && !matches(customSpec, fieldsOf("exchange", i))) continue;
       pending.push({ at: frontier, kind: "exchange", index: i, order: 0, count: 1, provisional: true });
     }
     fresh.sort(byInstant);
@@ -667,7 +717,7 @@ function rowHtml(event) {
 
 function renderEvents(force = false) {
   const list = $("events");
-  const filter = $("filter").value;
+  const filter = filterKey();
   const now = position();
   const from = Math.max(0, now - WINDOW);
   const to = Math.min(events.length, now + WINDOW);
@@ -726,8 +776,60 @@ $("events").onclick = (click) => {
 };
 
 $("filter").onchange = () => {
+  $("custom-filter").hidden = $("filter").value !== "custom";
   rebuildEvents();
   renderEvents(true);
+  drawCustomFilter(true);
+};
+
+// The custom filter's dropdowns: their options made again from what the
+// timeline holds now and then as it grows, and at once when the list is
+// built again; never under a dropdown that is open, which a new set of
+// options would close.
+let customDrawn = 0;
+function drawCustomFilter(force = false) {
+  const box = $("custom-filter");
+  if (box.hidden || (!force && performance.now() - customDrawn < 500)) return;
+  customDrawn = performance.now();
+  for (const [field, any] of FIELDS) {
+    const select = box.querySelector(`[data-field="${field}"]`);
+    if (document.activeElement === select && !force) continue;
+    const html = [`<option value="">${any}</option>`, ...customOptions.list(field, customSpec[field]).map(([value, count]) => `<option value="${escape(value)}">${escape(value)} (${count.toLocaleString()})</option>`)].join("");
+    if (select.shownOptions !== html) {
+      select.innerHTML = html;
+      select.shownOptions = html;
+    }
+    select.value = customSpec[field];
+    select.classList.toggle("on", !!customSpec[field]);
+  }
+  const text = box.querySelector('[data-field="text"]');
+  if (document.activeElement !== text) text.value = customSpec.text;
+  $("custom-shown").textContent = isEmpty(customSpec) ? "" : `${events.length.toLocaleString()} rows`;
+}
+
+function chooseCustom(field, value) {
+  customSpec = { ...customSpec, [field]: value };
+  try {
+    localStorage.setItem("timeline-filter", JSON.stringify(customSpec));
+  } catch {
+    // Kept for this page only.
+  }
+  rebuildEvents();
+  renderEvents(true);
+  drawCustomFilter(true);
+}
+
+// A page restored with "custom" already chosen shows its dropdowns.
+$("custom-filter").hidden = $("filter").value !== "custom";
+for (const select of $("custom-filter").querySelectorAll("select")) select.onchange = () => chooseCustom(select.dataset.field, select.value);
+let customTyping = null;
+$("custom-filter").querySelector('[data-field="text"]').oninput = (event) => {
+  clearTimeout(customTyping);
+  customTyping = setTimeout(() => chooseCustom("text", event.target.value), 200);
+};
+$("custom-clear").onclick = () => {
+  customSpec = emptySpec();
+  chooseCustom("text", "");
 };
 
 /// Seeks to `at` and, once there, opens what `focus` names.
