@@ -86,6 +86,11 @@
   body.opening.bench #panels > .panel[data-pattern="board"] { flex: 1 1 34em; max-height: none; }
   body.opening.bench #panels > .panel[data-pattern="usb"] { flex: 1 1 100%; }
   body.opening.bench #panels > #memory { display: block; flex: 1 1 100%; }
+  body.opening.bench #panels > #screen:not([hidden]) { display: block; flex: 1 1 100%; }
+  #screen { max-height: none; resize: none; }
+  .screen-canvas { display: block; width: 100%; max-width: 960px; aspect-ratio: 8 / 5; margin: 0 auto; image-rendering: pixelated; background: #000; outline: none; }
+  .screen-canvas:focus { box-shadow: 0 0 0 2px var(--accent, #4a8); }
+  .screen-status { text-align: center; margin-top: 4px; }
   body.opening.bench #panels > #terminal:not(#edge), body.opening.bench #panels > .panel[data-pattern="board"]:not(#edge), body.opening.bench #panels > .panel[data-pattern="usb"]:not(#edge) { display: block; }
   .panel.terminal { max-height: none; }
   #term-out { min-height: 18em; max-height: 60vh; overflow: auto; }

@@ -20,6 +20,7 @@
 import { request as requestUsb } from "./usb.js";
 import * as bench from "./bench.js";
 import { MemoryView } from "./memory.js";
+import { ScreenView } from "./screen.js";
 
 const worker = new Worker("./worker.js", { type: "module" });
 const $ = (id) => document.getElementById(id);
@@ -761,6 +762,7 @@ function buildPanels() {
   if (terminalPort) makeTerminalPanel();
   for (const pattern of OPEN) if (readable.includes(pattern)) makePanel(pattern, pattern, $("panels"));
   if (readable.includes("board")) makeMemoryPanel();
+  if (readable.includes("board")) makeScreenPanel();
   // The host's side of the boundary, which is not a path of the
   // container's store but is what the page is to it: its edge, its console.
   makeEdgePanel();
@@ -791,6 +793,19 @@ function makeMemoryPanel() {
     colorOf: bench.taskColor,
     update,
   });
+}
+
+// The panel on the board's LTDC, if it has one, and a keyboard for it:
+// see `screen.js`. Shown once it has a frame to show, first of all.
+function makeScreenPanel() {
+  const element = document.createElement("section");
+  element.className = "panel screen-panel";
+  element.id = "screen";
+  element.hidden = true;
+  element.innerHTML = `<h2><span class="path">screen</span> — the panel on the board's LTDC; click it to type at the board</h2><div class="body"></div>`;
+  $("panels").prepend(element);
+  equipPanel(element);
+  new ScreenView(element.querySelector(".body"), { read, type: boardControl });
 }
 
 function makeEdgePanel() {
