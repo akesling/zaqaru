@@ -201,9 +201,16 @@ export class Inspector {
   }
 
   /// Where the value at `address` came from, back through every write:
-  /// see `trail.js`. With `from`, going on from where a story stopped.
-  async readTrail(address, label, from = null) {
-    const trail = from && this.trail?.address === address ? this.trail : { address, label, hops: [] };
+  /// see `trail.js`. From `from`, `{ at, time }`, if given; going on with
+  /// the story told so far if `more`.
+  async readTrail(address, label, from = null, more = false) {
+    // From the write the inspector shows, not one made since: the board
+    // runs on while it is looked at.
+    if (!from) {
+      const [stamp, writer] = this.view.latestIn(address, address + 1);
+      if (stamp && this.view.inspected?.writers[writer]?.pc !== undefined) from = { at: address, time: stamp * 1e6 };
+    }
+    const trail = more ? this.trail : { address, label, hops: [] };
     trail.from = from;
     trail.end = null;
     trail.error = null;
@@ -739,7 +746,7 @@ export class Inspector {
     }
     if (t("[data-trail-more]") && this.trail?.end?.kind === "more") {
       const { at, time } = this.trail.end;
-      this.readTrail(this.trail.address, this.trail.label, { at, time });
+      this.readTrail(this.trail.address, this.trail.label, { at, time }, true);
       return true;
     }
     if (t("[data-goto]")) {
