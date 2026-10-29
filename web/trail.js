@@ -48,8 +48,10 @@ export function next(last) {
 /// the last write to it as things stand (`read`), or at `trail.from` (`{
 /// at, time }`) to go on from where a story stopped. `query(options,
 /// path)` reads from a re-execution; `update()` after each window; and it
-/// stops between windows once `wanted()` says not.
-export async function follow(trail, { read, query, update = () => {}, wanted = () => true, hops = HOPS }) {
+/// stops between windows once `wanted()` says not. `cache`, a Map, keeps
+/// each window's answer for the next story that runs the same one: the
+/// board's past does not change.
+export async function follow(trail, { read, query, update = () => {}, wanted = () => true, hops = HOPS, cache = null }) {
   let at, time;
   if (trail.from) {
     ({ at, time } = trail.from);
@@ -68,7 +70,9 @@ export async function follow(trail, { read, query, update = () => {}, wanted = (
     if (taken >= hops) return (trail.end = { kind: "more", at, time });
     trail.running = { at, time, window };
     update();
-    const answer = await query({ time, follow: { from: Math.max(0, time - window) } }, `board/why/${at}`);
+    const key = `${at} ${time} ${window}`;
+    const answer = cache?.get(key) ?? (await query({ time, follow: { from: Math.max(0, time - window) } }, `board/why/${at}`));
+    cache?.set(key, answer);
     const steps = answer?.steps ?? [];
     const step = next(steps.at(-1));
     if (step.widen && window < WIDEST) {

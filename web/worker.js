@@ -271,6 +271,55 @@ function checkpointDue() {
   return budget >= 1 || cost <= (budget / (1 - budget)) * ranSinceCheckpoint;
 }
 
+/// Live: whether a checkpoint is due by the board's time — `BOARD_EVERY`
+/// of it since the last, within the same budget — looked at most every
+/// `BOARD_LOOK_MS`. An idle container retires nothing while its board runs
+/// on, so by its count alone a board left running would have no checkpoint
+/// after the one it began with, and everything asked of its past would
+/// re-execute it from there.
+const BOARD_EVERY = 2.5e11;
+const BOARD_LOOK_MS = 100;
+let boardLooked = 0;
+function boardCheckpointDue() {
+  const now = performance.now();
+  if (now - boardLooked < BOARD_LOOK_MS) return false;
+  boardLooked = now;
+  const last = checkpoints.entries.at(-1);
+  let board;
+  try {
+    board = live.value("board").time_ps;
+  } catch {
+    return false;
+  }
+  if (typeof board !== "number" || board < (last.board ?? 0) + BOARD_EVERY) return false;
+  const cost = checkpoints.estimate ?? 0;
+  return budget >= 1 || cost <= (budget / (1 - budget)) * ranSinceCheckpoint;
+}
+
+/// How close together the checkpoints taken by the board's time are kept,
+/// by how far behind the latest they are: `[within, apart]`, picoseconds of
+/// the board's. Near the present, where most is asked, every one; further
+/// back, fewer, so that what is kept stays bounded as the run goes on.
+const THINNED = [
+  [1e13, BOARD_EVERY],
+  [1.2e14, 2e12],
+  [Infinity, 2e13],
+];
+
+/// Forgets the checkpoints taken by the board's time that `THINNED` says
+/// are closer to their neighbours than they need be.
+function thin() {
+  const entries = checkpoints.entries;
+  const latest = entries.at(-1).board;
+  if (typeof latest !== "number") return;
+  for (let i = 1; i < entries.length - 1; i++) {
+    const entry = entries[i];
+    if (!entry.byBoard) continue;
+    const apart = THINNED.find(([within]) => latest - entry.board < within)[1];
+    if ((entries[i + 1].board ?? Infinity) - (entries[i - 1].board ?? -Infinity) <= apart && checkpoints.drop(i)) i--;
+  }
+}
+
 /// A checkpoint, with where the container's board stood at it, in
 /// picoseconds of the board's time — null with no board — which is what a
 /// seek in the board's time picks its checkpoint by.
@@ -283,11 +332,14 @@ function keep(at, container) {
     // No board.
   }
   checkpoints.entries[index].board = board;
+  return index;
 }
 
-function checkpoint() {
-  keep(frontier, live);
+function checkpoint(byBoard = false) {
+  const index = keep(frontier, live);
+  checkpoints.entries[index].byBoard = byBoard;
   ranSinceCheckpoint = 0;
+  if (byBoard) thin();
 }
 
 /// Live: one slice of the frontier, at most `by` instructions; answers the
@@ -331,6 +383,7 @@ function slice(by) {
     finished = turn.status;
     checkpoint();
   } else if (checkpointDue()) checkpoint();
+  else if (boardCheckpointDue()) checkpoint(true);
   sendDisplay();
   return turn.kind;
 }

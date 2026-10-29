@@ -156,13 +156,33 @@ export class Checkpoints {
     return widest;
   }
 
-  /// The checkpoint at or before `at`: its index.
+  /// The checkpoint at or before `at`: its index. Of several at the same
+  /// count — an idle container's, taken as its board ran on — the first,
+  /// which stands where the container got to it.
   before(at) {
     let found = 0;
     this.entries.forEach((entry, index) => {
-      if (entry.at <= at) found = index;
+      if (entry.at <= at && entry.at > this.entries[found].at) found = index;
     });
     return found;
+  }
+
+  /// Forgets checkpoint `index`, neither the first nor the last: the pages
+  /// it changed go into the next one's delta, unless the next changed them
+  /// again, and a full map it kept is carried on to the next. Every other
+  /// checkpoint restores as before.
+  drop(index) {
+    if (index <= 0 || index >= this.entries.length - 1) return false;
+    const gone = this.entries[index];
+    const next = this.entries[index + 1];
+    if (gone.full && !next.full) next.full = apply(gone.full, next.delta);
+    for (const [page, bytes] of gone.delta.changed) {
+      if (next.delta.changed.has(page)) this.held -= bytes.length;
+      else next.delta.changed.set(page, bytes);
+    }
+    this.entries.splice(index, 1);
+    this.materialised = null;
+    return true;
   }
 
   get length() {

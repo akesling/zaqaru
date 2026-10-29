@@ -63,6 +63,7 @@ export class Inspector {
     this.source = null; // { file, line, whole }
     this.history = null; // { key, address, size, type, owner, answer | error }
     this.trail = null; // { address, label, hops, end, running, error }: see trail.js
+    this.windows = new Map(); // the stories' windows run so far: see trail.js
     this.audit = null; // { back, answer | error | running }
     this.snapshot = null; // { stamp, owners: Map(owner → { statics, bytes }) }
     this.compared = null;
@@ -222,7 +223,7 @@ export class Inspector {
     update();
     try {
       const query = (options, path) => this.view.query(options, path, (p) => wanted() && this.progressed("trail", trail.running, p));
-      await follow(trail, { read: (path) => this.view.read(path), query, update, wanted });
+      await follow(trail, { read: (path) => this.view.read(path), query, update, wanted, cache: this.windows });
     } catch (why) {
       trail.error = String(why);
     }

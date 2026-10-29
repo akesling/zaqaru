@@ -72,3 +72,12 @@ test("bytes never written, or written by no instruction, end before any window",
   await follow(trail, { read: async () => ({ words: [9, 0], writers: [{ code: "the probe" }] }), query });
   assert.deepEqual(trail.end, { kind: "writer", by: { code: "the probe" } });
 });
+
+test("a window run once is not run again", async () => {
+  let runs = 0;
+  const query = async () => (runs++, { steps: [{ what: "read" }] });
+  const read = async () => ({ words: [5000, 0], writers: [by] });
+  const cache = new Map();
+  for (let i = 0; i < 2; i++) await follow({ address: 8, hops: [] }, { read, query, cache });
+  assert.equal(runs, 1);
+});
