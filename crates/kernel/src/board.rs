@@ -1542,6 +1542,38 @@ impl Board {
         )
     }
 
+    /// Where the value at `address` came from, as `why_json` says, and
+    /// everything else it depended on (`armv6m::provenance::Provenance::
+    /// influences`), each as a step — what was held since before and the
+    /// write that put it there, what came in off a bus, a register's, a
+    /// constant — with `via` saying whether it chose which value (`address`)
+    /// or went into it (`value`). Pointers, and constants the code loaded
+    /// from beside itself, which say only which table, are left out.
+    pub fn influences_json(&self, address: u32, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
+        use armv6m::provenance::What;
+        let Some(p) = &self.machine.provenance else {
+            return r#"{"following":false,"steps":[],"influences":[]}"#.to_string();
+        };
+        let pointer = |value: u32| self.machine.bus.ram_at(value).is_some() || value >= 0x0800_0000;
+        let all = p.influences(address, 128);
+        let total = all.len();
+        let leaves: Vec<String> = all
+            .into_iter()
+            .filter(|(_, node, ..)| match node.what {
+                What::Held { addr, size, value, .. } => addr.wrapping_sub(node.pc) >= 4096 && !(size == 4 && pointer(value)),
+                What::Register { value, .. } => !pointer(value),
+                _ => true,
+            })
+            .take(64)
+            .filter_map(|(_, node, byte, via)| {
+                let step = self.why_steps(p, vec![(node, byte)], map, read, 4).pop()?;
+                Some(format!(r#"{{"via":"{}",{}"#, if via { "address" } else { "value" }, &step[1..]))
+            })
+            .collect();
+        let why = self.why_json(address, map, read);
+        format!(r#"{},"influences":[{}],"considered":{total}}}"#, &why[..why.len() - 1], leaves.join(","))
+    }
+
     /// Follows the `length` bytes at `address` forward from the board's
     /// time `from`, in picoseconds: see
     /// `armv6m::Machine::follow_forward_from`.

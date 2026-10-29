@@ -312,3 +312,44 @@ begin:
     assert!(p.memory.contains_key(&0x2400_0200), "what was made of it is tagged");
     assert!(!p.memory.contains_key(&0x2400_0201), "what was not is not");
 }
+
+#[test]
+fn a_value_depends_on_what_it_was_made_of_and_what_chose_it() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100      @ a table
+    movs r1, #0x50
+    strb r1, [r3, #2]
+    ldr r4, =0x24000180      @ an index
+    movs r1, #2
+    strb r1, [r4]
+    ldr r2, =0x24000190      @ something to add
+    movs r1, #7
+    strb r1, [r2]
+begin:
+    ldrb r5, [r4]
+    ldrb r6, [r3, r5]        @ the entry the index chooses
+    ldrb r7, [r2]
+    add r6, r7               @ and what is added to it
+    ldr r0, =0x24000200
+    strb r6, [r0]
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 9), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let held: Vec<(u32, bool)> = p
+        .influences(0x2400_0200, 16)
+        .iter()
+        .filter_map(|&(_, node, _, via)| match node.what {
+            What::Held { addr, .. } => Some((addr, via)),
+            _ => None,
+        })
+        .collect();
+    assert!(held.contains(&(0x2400_0102, false)), "the entry: {held:?}");
+    assert!(held.contains(&(0x2400_0190, false)), "what was added: {held:?}");
+    assert!(held.contains(&(0x2400_0180, true)), "the index, which chose: {held:?}");
+}

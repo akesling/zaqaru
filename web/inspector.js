@@ -22,6 +22,7 @@
 // memory in the pictures.
 
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
+import { depend, dependsSummary, grouped, pathTo, timeStrip } from "./depends.js";
 import { progressHtml } from "./progress.js";
 import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
 import { HOPS, byteOf, folded, follow, functionOf, leafText, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, summary } from "./trail.js";
@@ -248,6 +249,69 @@ export class Inspector {
     }
     trail.running = null;
     if (this.trail === trail) this.draw(true);
+  }
+
+  /// Everything the story's value depended on: see `depends.js`. Kept on
+  /// the story, and gone on with from where it stopped.
+  async readDepends() {
+    const trail = this.trail;
+    if (!trail?.hops[0]) return;
+    trail.tab = "depends";
+    const graph = trail.depends ?? { address: trail.address, nodes: [], origins: [], from: { at: trail.hops[0].at, time: trail.hops[0].time } };
+    trail.depends = graph;
+    graph.stopped = false;
+    const wanted = () => this.trail === trail && trail.tab === "depends" && !graph.stopped;
+    const update = () => this.trail === trail && this.draw(true);
+    const query = (options, path) => this.view.query(options, path, (p) => wanted() && this.progressed("depends", graph.running, p));
+    try {
+      await depend(graph, { read: (path) => this.view.read(path), query, update, wanted, cache: this.windows });
+    } catch (why) {
+      graph.error = String(why);
+    }
+    graph.running = null;
+    update();
+  }
+
+  dependsHtml(t) {
+    const e = this.e;
+    const graph = t.depends;
+    if (!graph) return "";
+    const said = dependsSummary(graph);
+    const asked = graph.nodes[0]?.time ?? graph.from?.time ?? 0;
+    const before = (ps) => (ps === null || ps === undefined ? "" : `<span class="dim">${span(asked - ps)} before</span>`);
+    const points = [
+      ...graph.nodes.map((n) => ({ t: n.time / 1000, kind: "step", label: `${shortPlace(n.what ?? "")} written` })),
+      ...graph.origins.filter((o) => o.leaf.t !== undefined).map((o) => ({ t: o.leaf.t, kind: "origin", label: e(shortPlace(o.leaf.where ?? o.leaf.register ?? "")) })),
+    ];
+    const origin = (o) => {
+      const leaf = o.leaf;
+      const at = leaf.byte ?? leaf.addr;
+      const value = leaf.value !== undefined ? `<b>0x${(leaf.what === "held" && leaf.size > 1 ? byteOf(leaf) ?? leaf.value : leaf.value).toString(16)}</b> ` : "";
+      const place = leaf.what === "read" ? `off <b>${e(leaf.register)}</b>${leaf.record ? ` <a data-stand="${Math.floor(leaf.record.t / 1000) + 1}">trace record ${leaf.record.n}</a>` : ""}` : leaf.what === "register" ? `in ${e(leaf.register)}` : leaf.what === "store" ? `made by the code` : `from ${e(shortPlace(leaf.where))}`;
+      const line = lineOf(leaf);
+      const by = leaf.code ? ` <span class="dim">by</span> ${e(functionOf(leaf))}${line?.file ? ` ${this.lineLink(line)}` : ""}` : "";
+      const via = o.via === "address" ? ` <span class="chip" style="--chip:#bf8700" title="it chose which value — an index, a coordinate — rather than being one">chose</span>` : "";
+      const path = o.node !== null ? pathTo(graph, o.node) : [];
+      const trailOf = path.length ? ` <a data-retrail="${path[0].at},${path[0].time}" title="the story of the value this was found in">story</a>` : "";
+      const pathText = path.length > 1 ? ` <span class="dim" title="${e(path.map((n) => shortPlace(n.what ?? "")).join(" ← "))}">${path.length} writes back</span>` : "";
+      return `<li${at !== undefined ? ` data-lit="${at}"` : ""}>${value}${place}${by}${via} ${before(leaf.t !== undefined ? leaf.t * 1000 : null)}${pathText}${trailOf}</li>`;
+    };
+    const groups = grouped(graph)
+      .map((g) => {
+        const families = g.families
+          .map((f) => `<li><details${g.families.length <= 2 ? " open" : ""}><summary><b>${e(f.name)}</b> <span class="dim">×${f.origins.length}</span></summary><ol>${f.origins.slice(0, 40).map(origin).join("")}</ol>${f.origins.length > 40 ? `<div class="dim">and ${f.origins.length - 40} more</div>` : ""}</details></li>`)
+          .join("");
+        return `<div class="depends-kind"><div class="depends-label">${e(g.label)}</div><ul>${families}</ul></div>`;
+      })
+      .join("");
+    let html = "";
+    if (said) html += `<div class="story-summary">${e(said)}</div>`;
+    html += timeStrip(points);
+    html += groups;
+    if (graph.running) html += `<div class="dim">window ${graph.nodes.length + 1}: following everything over the ${span(graph.running.window)} before the write at ${(graph.running.time / 1e9).toFixed(3)} ms, ${graph.queue?.length ?? 0} values waiting</div><div data-progress="depends">${progressHtml(graph.running.progress)}</div>`;
+    else if (graph.left) html += `<div class="story-end dim">${graph.left} value${graph.left === 1 ? "" : "s"} not yet followed · <a data-depends title="follow the next 40">keep going</a></div>`;
+    if (graph.error) html += `<div class="dim">${e(graph.error)}</div>`;
+    return html;
   }
 
   /// Where the byte at `address` went after `from` (picoseconds of the
@@ -787,9 +851,12 @@ export class Inspector {
     const index = this.stories.indexOf(t);
     const nav = `<button type="button" data-story="${index - 1}" ${index > 0 ? "" : "disabled"} title="the story before">‹</button><button type="button" data-story="${index + 1}" ${index < this.stories.length - 1 ? "" : "disabled"} title="the story after">›</button>`;
     const value = stepsOf(t)[0]?.step;
-    const head = `<div class="story-head"><span class="controls">${nav}</span> <b>where ${e(t.label ?? hex(t.address))}${value && byteOf(value) !== null ? ` = ${byte(byteOf(value))}` : ""} came from</b> <span class="dim">${hex(t.address)}</span> <span class="controls">${t.running ? `<button type="button" data-story-stop>stop</button>` : ""}${t.hops[0] ? `<button type="button" data-reach="${t.address},${t.hops[0].time}" title="follow this value forward from here: everywhere it, and anything made of it, went">where it went</button>` : ""}<button type="button" data-close="trail" title="close the story; ‹ brings it back">close</button></span></div>`;
-    let html = `<div class="mem-story">${head}`;
+    const head = `<div class="story-head"><span class="controls">${nav}</span> <b>where ${e(t.label ?? hex(t.address))}${value && byteOf(value) !== null ? ` = ${byte(byteOf(value))}` : ""} came from</b> <span class="dim">${hex(t.address)}</span> <span class="controls">${t.running || (t.tab === "depends" && t.depends?.running) ? `<button type="button" data-story-stop>stop</button>` : ""}${t.hops[0] ? `<button type="button" data-reach="${t.address},${t.hops[0].time}" title="follow this value forward from here: everywhere it, and anything made of it, went">where it went</button>` : ""}<button type="button" data-close="trail" title="close the story; ‹ brings it back">close</button></span></div>`;
+    const tabs = t.hops[0] ? `<div class="story-tabs controls"><button type="button" data-story-tab="story"${t.tab !== "depends" ? ' class="on"' : ""}>its way back</button><button type="button" data-story-tab="depends"${t.tab === "depends" ? ' class="on"' : ""} title="every value it was made of or chosen by, each followed back in turn">everything it depended on</button></div>` : "";
+    let html = `<div class="mem-story">${head}${tabs}`;
+    if (t.tab === "depends") return `${html}${this.dependsHtml(t)}</div>`;
     if (said) html += `<div class="story-summary">${e(said)}</div>`;
+    html += timeStrip(stepsOf(t).map(({ step }) => ({ t: step.t, kind: step.what === "read" || step === stepsOf(t).at(-1)?.step ? "origin" : "step", label: e(`${step.what} ${shortPlace(step.where ?? step.register ?? "")}`) })).filter((p) => p.t !== undefined));
     if (rows) html += `<ol class="story-steps">${rows}</ol>`;
     if (t.running?.window) html += `<div class="dim">step ${t.hops.length + 1} back (at most ${HOPS} before it asks): following every value over the ${span(t.running.window)} before the write at ${(t.running.time / 1e9).toFixed(3)} ms</div><div data-progress="trail">${progressHtml(t.running.progress)}</div>`;
     else if (t.running) html += `<div class="dim">reading when it was last written…</div>`;
@@ -1092,6 +1159,19 @@ export class Inspector {
       this.draw(true);
       return true;
     }
+    if (t("[data-story-tab]") && this.trail) {
+      const tab = t("[data-story-tab]").dataset.storyTab;
+      if (tab === "depends" && !this.trail.depends) this.readDepends();
+      else {
+        this.trail.tab = tab;
+        this.draw(true);
+      }
+      return true;
+    }
+    if (t("[data-depends]")) {
+      this.readDepends();
+      return true;
+    }
     if (t("[data-story]")) {
       const story = this.stories[Number(t("[data-story]").dataset.story)];
       if (story) {
@@ -1101,6 +1181,11 @@ export class Inspector {
       return true;
     }
     if (t("[data-story-stop]") && this.trail) {
+      if (this.trail.tab === "depends" && this.trail.depends) {
+        this.trail.depends.stopped = true;
+        this.draw(true);
+        return true;
+      }
       this.trail.stopped = true;
       this.draw(true);
       return true;

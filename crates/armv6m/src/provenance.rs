@@ -319,6 +319,50 @@ impl Provenance {
         out
     }
 
+    /// Everything the byte at `address` depended on, where each came into
+    /// the window: the origin its own way back reaches ([`story`]), and
+    /// the origins of whatever it was made of besides — the other values
+    /// arithmetic merged into it, and the values the addresses it was
+    /// looked up at were worked out from, and theirs in turn. Each with the
+    /// byte it is about and whether it was reached through an address (it
+    /// chose which value, rather than being one). At most `most`, each once.
+    ///
+    /// [`story`]: Provenance::story
+    pub fn influences(&self, address: u32, most: usize) -> Vec<(Tag, &Node, u32, bool)> {
+        let story = self.story(address, 64);
+        let mut out: Vec<(Tag, &Node, u32, bool)> = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        for &(tag, node, byte) in &story {
+            match node.what {
+                What::Merge => queue.push_back((node.parents[1], false)),
+                What::Load { .. } => queue.push_back((node.parents[1], true)),
+                What::Store { .. } | What::Bytes { .. } => {}
+                What::Register { n: 13 | 15, .. } => {}
+                _ => out.push((tag, node, byte, false)),
+            }
+        }
+        let mut seen: std::collections::HashSet<Tag> = story.iter().map(|&(tag, ..)| tag).collect();
+        while let Some((at, via)) = queue.pop_front() {
+            if out.len() >= most || seen.len() > 1 << 16 {
+                break;
+            }
+            if at == 0 || !seen.insert(at) {
+                continue;
+            }
+            let Some(node) = self.node(at) else { continue };
+            match node.what {
+                What::Bytes { lanes, .. } => queue.extend(lanes.map(|l| (l, via))),
+                What::Merge => queue.extend(node.parents.map(|p| (p, via))),
+                What::Load { .. } => queue.extend([(node.parents[0], via), (node.parents[1], true)]),
+                What::Store { .. } if node.parents[0] != 0 => queue.push_back((node.parents[0], via)),
+                What::Register { n: 13 | 15, .. } => {}
+                What::Held { addr, .. } => out.push((at, node, addr, via)),
+                _ => out.push((at, node, 0, via)),
+            }
+        }
+        out
+    }
+
     /// A value's history, newest first: the node `tag`, then what it came
     /// from — along each merge's first parent, the second noted — at most
     /// `depth` nodes.
