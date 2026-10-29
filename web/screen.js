@@ -56,8 +56,11 @@ export class ScreenView {
   /// `body` is the panel's body; `read` reads a store path at the instant
   /// in view; `type` sends a line to the board's front door; `live` says
   /// whether the page is following the live run, whose frames are sent.
-  constructor(body, { read, type, live = () => false }) {
+  /// `ask(x, y)`, if given, is asked where a pixel came from: an
+  /// Alt-click on the screen.
+  constructor(body, { read, type, live = () => false, ask = null }) {
     this.read = read;
+    this.ask = ask;
     this.type = type;
     this.live = live;
     this.pushedAt = 0;
@@ -66,7 +69,7 @@ export class ScreenView {
     this.held = new Set();
     this.shown = 0; // frames drawn, and since when, for the rate
     this.since = performance.now();
-    body.innerHTML = `<canvas class="screen-canvas" tabindex="0" title="click, then play: the mouse turns, walks and fires (right button strafes); arrows move, Ctrl or ⌘ fires, Space opens, Alt strafes, Shift runs; Esc lets the mouse go, and again for the menu"></canvas>
+    body.innerHTML = `<canvas class="screen-canvas" tabindex="0" title="click, then play: the mouse turns, walks and fires (right button strafes); arrows move, Ctrl or ⌘ fires, Space opens, Alt strafes, Shift runs; Esc lets the mouse go, and again for the menu. Alt-click a pixel to ask where it came from"></canvas>
       <div class="dim screen-status">no frame yet</div>`;
     this.canvas = body.querySelector("canvas");
     this.status = body.querySelector(".screen-status");
@@ -79,7 +82,15 @@ export class ScreenView {
       for (const code of this.held) this.send(code, false);
       this.held.clear();
     });
-    this.canvas.addEventListener("pointerdown", () => {
+    this.canvas.addEventListener("pointerdown", (event) => {
+      // Alt-click, the pointer free: where that pixel came from, not a game.
+      if (event.altKey && this.ask && document.pointerLockElement !== this.canvas) {
+        event.preventDefault();
+        const box = this.canvas.getBoundingClientRect();
+        const x = Math.floor(((event.clientX - box.left) / box.width) * this.canvas.width);
+        const y = Math.floor(((event.clientY - box.top) / box.height) * this.canvas.height);
+        return this.ask(x, y);
+      }
       this.canvas.focus();
       if (document.pointerLockElement !== this.canvas) this.canvas.requestPointerLock?.();
     });

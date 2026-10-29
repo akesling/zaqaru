@@ -1,7 +1,7 @@
 // Checks `trail.js` under Node: node --test web/trail.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW, byteOf, folded, follow, functionOf, isPlumbing, leafText, next, shortPlace, ownerOf, placeOwner, span, summary } from "./trail.js";
+import { WINDOW, byteOf, folded, follow, functionOf, isPlumbing, leafText, next, shortFunction, shortPlace, ownerOf, placeOwner, span, summary } from "./trail.js";
 
 const by = { pc: 0x0800_1234, code: "doom: R_DrawColumn" };
 const held = (addr, stamp, writer = by) => ({ what: "held", addr, ram: true, written: stamp ? { stamp, by: writer } : null });
@@ -92,7 +92,11 @@ test("plumbing is told apart from the code that makes a value", () => {
   assert.ok(isPlumbing(copied) && isPlumbing(loadedForCopy));
   assert.ok(!isPlumbing(drawn) && !isPlumbing(fromWad));
   assert.equal(functionOf(copied), "copy_forward_aligned_words");
-  assert.equal(functionOf({ lines: [{ function: "<drv::I2c as drv::Read>::read::{closure#1}>", line: 764 }] }), "{closure#1}");
+  assert.equal(shortFunction("<drv_stm32xx_i2c::I2cController>::read::{closure#1}"), "I2cController::read::{closure#1}");
+  assert.equal(shortFunction("compiler_builtins::mem::impls::copy_forward_aligned_words"), "copy_forward_aligned_words");
+  assert.equal(shortFunction("R_DrawColumn"), "R_DrawColumn");
+  assert.equal(shortFunction("<task_doom::Display as core::fmt::Write>::write_str"), "Display::write_str");
+  assert.equal(shortFunction("task_jefe::main::{closure#0}"), "main::{closure#0}");
   assert.equal(ownerOf(drawn), "doom");
   assert.equal(placeOwner(copied), "display");
   assert.equal(placeOwner(fromWad), null);

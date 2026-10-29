@@ -967,7 +967,18 @@ function makeScreenPanel() {
   element.innerHTML = `<h2><span class="path">screen</span> — the panel on the board's LTDC; click it to type at the board</h2><div class="body"></div>`;
   $("panels").prepend(element);
   equipPanel(element);
-  screenView = new ScreenView(element.querySelector(".body"), { read, type: boardControl, live: () => boardTime === null && playing !== null });
+  screenView = new ScreenView(element.querySelector(".body"), { read, type: boardControl, live: () => boardTime === null && playing !== null, ask: askPixel });
+}
+
+/// Where a pixel of the board's screen came from: the byte the display
+/// scans out for it, its story told in the memory panel.
+async function askPixel(x, y) {
+  const layer = (await read("board/scanned").catch(() => null))?.layers?.[0];
+  if (!layer || !memoryView || x >= layer.width || y >= layer.height) return;
+  const address = layer.address + y * layer.pitch + x * layer.bytes;
+  memoryView.goTo(address);
+  memoryView.inspector.readTrail(address, `the screen's pixel (${x}, ${y})`);
+  memoryView.element.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function makeEdgePanel() {

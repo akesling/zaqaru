@@ -106,9 +106,37 @@ export function lineOf(step) {
 /// The function a step's code is in, by its source if known: `R_DrawSpan`.
 export function functionOf(step) {
   const line = lineOf(step);
-  const name = (line?.function ?? step.code ?? "").replace(/^\S+: /, "").replace(/ \+ 0x[0-9a-f]+$/, "").replace(/^.*::/, "");
-  // What is left of a generic's angle brackets once its path is gone.
-  return name.includes("<") ? name : name.replace(/>+$/, "");
+  const full = (line?.function ?? step.code ?? "").replace(/^\S+: /, "").replace(/ \+ 0x[0-9a-f]+$/, "");
+  return shortFunction(full);
+}
+
+/// A function's name without its path: its own, and for a closure or a
+/// method, what it is of — `I2cController::read::{closure#1}`,
+/// `R_DrawColumn`.
+export function shortFunction(full) {
+  // The path's segments, angle brackets kept whole.
+  const segments = [];
+  let depth = 0;
+  let at = 0;
+  for (let i = 0; i < full.length; i++) {
+    if (full[i] === "<") depth++;
+    else if (full[i] === ">") depth--;
+    else if (depth === 0 && full.startsWith("::", i)) {
+      segments.push(full.slice(at, i));
+      at = i + 2;
+      i++;
+    }
+  }
+  segments.push(full.slice(at));
+  // `<path::Type as Trait>` or `<path::Type>`: the type's own name.
+  const clean = segments.map((seg) => seg.replace(/^<(?:[\w:]*::)?(\w+)(?:<[^>]*>)?(?: as [^>]*)?>$/, "$1").replace(/^<(.*)>$/, "$1"));
+  const last = clean.length - 1;
+  let from = last;
+  // A closure, a shim — `{closure#1}`, `{{closure}}` — is said with
+  // what it is in, and that with what it is of if it is a method.
+  while (from > 0 && /^\{/.test(clean[from])) from--;
+  if (from > 0 && /^[A-Z]/.test(clean[from - 1])) from--;
+  return clean.slice(from).join("::");
 }
 
 /// Whose code a step's is, where the code says: `doom`, or null.

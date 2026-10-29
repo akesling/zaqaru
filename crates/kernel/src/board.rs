@@ -1571,6 +1571,7 @@ impl Board {
             .filter(|(_, node, ..)| match node.what {
                 What::Held { addr, size, value, .. } => addr.wrapping_sub(node.pc) >= 4096 && !(size == 4 && pointer(value)),
                 What::Register { value, .. } => !pointer(value),
+                What::Store { size: 4, value, .. } => !pointer(value),
                 _ => true,
             })
             .take(64)

@@ -84,7 +84,7 @@ export function family(origin) {
   if (origin.kind === "bus") return leaf.register ?? (shortPlace(leaf.where ?? "").replace(/\s\+\s0x[0-9a-f]+.*$/, "") || "a peripheral");
   if (origin.kind === "constant") return `made in ${functionOf(leaf) || "the code"}`;
   const place = shortPlace(leaf.where ?? "");
-  return place.replace(/(\[\d+\]|\s\+\s0x[0-9a-f]+|, entry \d+).*$/, "") || "somewhere";
+  return place.replace(/^the NOR: /, "").replace(/(\[\d+\]|\s\+\s0x[0-9a-f]+|, entry \d+).*$/, "") || "somewhere";
 }
 
 const KINDS = [
@@ -112,7 +112,7 @@ export function grouped(graph) {
 }
 
 /// What a value depended on, in a sentence.
-export function dependsSummary(graph, most = 5) {
+export function dependsSummary(graph, most = 3) {
   const groups = grouped(graph);
   if (!groups.length) return null;
   const parts = groups.map((g) => {
@@ -149,5 +149,5 @@ export function timeStrip(points, width = 640, height = 34) {
   const dots = points
     .map((p) => `<circle cx="${x(p.t).toFixed(1)}" cy="14" r="${p.kind === "origin" ? 4 : 3}" class="${p.kind}"><title>${p.label}</title></circle>`)
     .join("");
-  return `<svg class="time-strip" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}"><line x1="8" x2="${width - 8}" y1="14" y2="14" class="axis"/>${ticks}${dots}</svg>`;
+  return `<svg class="time-strip" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" height="${height}"><line x1="8" x2="${width - 8}" y1="14" y2="14" class="axis"/>${ticks}${dots}</svg>`;
 }
