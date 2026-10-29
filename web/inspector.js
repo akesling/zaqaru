@@ -978,11 +978,21 @@ export class Inspector {
     this.draw(true);
     try {
       makers.answer = await this.view.query({ time, follow: { from: Math.max(0, time - 4e10) } }, `board/makers/${v.address}/${v.size}`, (p) => this.progressed("makers", makers, p));
-      // A byte by byte map of maker, for painting.
+      // The makers by function and line — a loop unrolled stores from
+      // several instructions of one line — and a byte by byte map of them.
+      const groups = [];
+      const groupOf = (makers.answer.makers ?? []).map((maker) => {
+        const line = lineOf(maker);
+        const key = `${functionOf(maker)} ${line?.file ?? ""}:${line?.line ?? ""}`;
+        let index = groups.findIndex((g) => g.key === key);
+        if (index < 0) index = groups.push({ key, maker }) - 1;
+        return index;
+      });
       const of = new Int16Array(v.size).fill(-1);
-      for (const [offset, length, maker] of makers.answer.runs ?? []) of.fill(maker, offset, offset + length);
+      for (const [offset, length, maker] of makers.answer.runs ?? []) of.fill(maker < 0 ? -1 : groupOf[maker], offset, offset + length);
       makers.of = of;
-      makers.counts = (makers.answer.makers ?? []).map((_, i) => of.reduce((n, m) => n + (m === i), 0));
+      makers.groups = groups.map((g) => g.maker);
+      makers.counts = groups.map((_, i) => of.reduce((n, m) => n + (m === i), 0));
     } catch (why) {
       makers.error = String(why);
     }
@@ -996,7 +1006,7 @@ export class Inspector {
     if (!m) return "";
     if (m.running) return `<div class="dim">following everything over the frame's 40 ms, for who made each byte</div><div data-progress="makers">${progressHtml(m.progress)}</div>`;
     if (m.error) return `<div class="dim">${e(m.error)}</div>`;
-    const list = (m.answer?.makers ?? [])
+    const list = (m.groups ?? [])
       .map((maker, i) => ({ maker, i, count: m.counts[i] }))
       .sort((a, b) => b.count - a.count)
       .map(({ maker, i, count }) => {
