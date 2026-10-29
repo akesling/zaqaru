@@ -104,7 +104,9 @@ export function lineOf(step) {
 /// The function a step's code is in, by its source if known: `R_DrawSpan`.
 export function functionOf(step) {
   const line = lineOf(step);
-  return (line?.function ?? step.code ?? "").replace(/^\S+: /, "").replace(/ \+ 0x[0-9a-f]+$/, "").replace(/^.*::/, "");
+  const name = (line?.function ?? step.code ?? "").replace(/^\S+: /, "").replace(/ \+ 0x[0-9a-f]+$/, "").replace(/^.*::/, "");
+  // What is left of a generic's angle brackets once its path is gone.
+  return name.includes("<") ? name : name.replace(/>+$/, "");
 }
 
 /// Whose code a step's is, where the code says: `doom`, or null.

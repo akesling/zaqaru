@@ -91,6 +91,7 @@ test("plumbing is told apart from the code that makes a value", () => {
   assert.ok(isPlumbing(copied) && isPlumbing(loadedForCopy));
   assert.ok(!isPlumbing(drawn) && !isPlumbing(fromWad));
   assert.equal(functionOf(copied), "copy_forward_aligned_words");
+  assert.equal(functionOf({ lines: [{ function: "<drv::I2c as drv::Read>::read::{closure#1}>", line: 764 }] }), "{closure#1}");
   assert.equal(ownerOf(drawn), "doom");
   assert.equal(placeOwner(copied), "display");
   assert.equal(placeOwner(fromWad), null);
