@@ -22,7 +22,7 @@
 // memory in the pictures.
 
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
-import { depend, dependsSummary, grouped, pathTo, timeStrip } from "./depends.js";
+import { alike, depend, dependsSummary, grouped, pathTo, timeStrip } from "./depends.js";
 import { progressHtml } from "./progress.js";
 import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
 import { HOPS, byteOf, folded, follow, functionOf, leafText, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, summary } from "./trail.js";
@@ -301,7 +301,7 @@ export class Inspector {
       ...graph.nodes.map((n) => ({ t: n.time / 1000, kind: "step", label: `${shortPlace(n.what ?? "")} written` })),
       ...graph.origins.filter((o) => o.leaf.t !== undefined).map((o) => ({ t: o.leaf.t, kind: "origin", label: e(shortPlace(o.leaf.where ?? o.leaf.register ?? "")) })),
     ];
-    const origin = (o) => {
+    const origin = ({ origin: o, count }) => {
       const leaf = o.leaf;
       const at = leaf.byte ?? leaf.addr;
       const value = leaf.value !== undefined ? `<b>0x${(leaf.what === "held" && leaf.size > 1 ? byteOf(leaf) ?? leaf.value : leaf.value).toString(16)}</b> ` : "";
@@ -312,7 +312,7 @@ export class Inspector {
       const path = o.node !== null ? pathTo(graph, o.node) : [];
       const trailOf = path.length ? ` <a data-retrail="${path[0].at},${path[0].time}" title="the story of the value this was found in">story</a>` : "";
       const pathText = path.length > 1 ? ` <span class="dim" title="${e(path.map((n) => shortPlace(n.what ?? "")).join(" ← "))}">${path.length} writes back</span>` : "";
-      return `<li${at !== undefined ? ` data-lit="${at}"` : ""}>${value}${place}${by}${via} ${before(leaf.t !== undefined ? leaf.t * 1000 : null)}${pathText}${trailOf}</li>`;
+      return `<li${at !== undefined ? ` data-lit="${at}"` : ""}>${value}${place}${by}${via}${count > 1 ? ` <span class="dim">×${count}</span>` : ""} ${before(leaf.t !== undefined ? leaf.t * 1000 : null)}${pathText}${trailOf}</li>`;
     };
     const groups = grouped(graph)
       .map((g) => {
@@ -323,7 +323,7 @@ export class Inspector {
             // between, newest first.
             const chain = f.origins[0].node !== null ? pathTo(graph, f.origins[0].node) : [];
             const how = chain.length > 1 ? `<div class="depends-how dim">${chain.map((n) => `<a data-goto="${n.at}" title="${e(n.what ?? "")}">${e(shortPlace(n.what ?? "").replace(/(\[\d+\]).*$/, "$1"))}</a>`).join(" ← ")} ← <b>${e(f.name)}</b></div>` : "";
-            return `<li><details${g.families.length <= 2 ? " open" : ""}><summary><b>${e(f.name)}</b> <span class="dim">×${f.origins.length}</span>${runs.length ? ` <a data-runs='${e(JSON.stringify(runs))}' title="outline them in the pictures">show</a>` : ""}</summary>${how}<ol>${f.origins.slice(0, 40).map(origin).join("")}</ol>${f.origins.length > 40 ? `<div class="dim">and ${f.origins.length - 40} more</div>` : ""}</details></li>`;
+            return `<li><details${g.families.length <= 2 ? " open" : ""}><summary><b>${e(f.name)}</b> <span class="dim">×${f.origins.length}</span>${runs.length ? ` <a data-runs='${e(JSON.stringify(runs))}' title="outline them in the pictures">show</a>` : ""}</summary>${how}<ol>${alike(f.origins).slice(0, 40).map(origin).join("")}</ol>${alike(f.origins).length > 40 ? `<div class="dim">and ${alike(f.origins).length - 40} more</div>` : ""}</details></li>`;
           })
           .join("");
         return `<div class="depends-kind"><div class="depends-label">${e(g.label)}</div><ul>${families}</ul></div>`;

@@ -1,7 +1,7 @@
 // Checks `depends.js` under Node: node --test web/depends.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { depend, dependsSummary, family, grouped, pathTo, timeStrip } from "./depends.js";
+import { alike, depend, dependsSummary, family, grouped, pathTo, timeStrip } from "./depends.js";
 
 const by = { pc: 0x0800_1234, code: "doom: R_DrawColumn" };
 const held = (addr, stamp, via = "value") => ({ what: "held", ram: true, addr, byte: addr, size: 1, value: 1, via, where: `doom .uninit: ZONE_AXI[${addr & 0xffff}] (AXI SRAM + 0x1)`, written: { stamp, by } });
@@ -67,4 +67,10 @@ test("a strip of time spreads what was a microsecond before and what was a secon
 test("places are grouped without which element, entry or offset; constants by the code that made them", () => {
   assert.equal(family({ kind: "rom", leaf: { where: "the NOR: the WAD's directory, entry 552" } }), "the WAD's directory");
   assert.equal(family({ kind: "constant", leaf: { code: "doom: G_BuildTiccmd + 0x10", lines: [{ function: "G_BuildTiccmd", file: "g_game.c", line: 332 }] } }), "made in G_BuildTiccmd");
+});
+
+test("the same origin found again and again is one, with how many", () => {
+  const status = { kind: "bus", via: "address", leaf: { what: "held", where: "USART3 + 0x1c", value: 0, pc: 8 } };
+  const other = { ...status, leaf: { ...status.leaf, value: 0x20 } };
+  assert.deepEqual(alike([status, status, other, status]).map((a) => a.count), [3, 1]);
 });

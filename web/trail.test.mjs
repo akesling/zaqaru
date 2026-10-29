@@ -95,6 +95,7 @@ test("plumbing is told apart from the code that makes a value", () => {
   assert.equal(shortFunction("<drv_stm32xx_i2c::I2cController>::read::{closure#1}"), "I2cController::read::{closure#1}");
   assert.equal(shortFunction("compiler_builtins::mem::impls::copy_forward_aligned_words"), "copy_forward_aligned_words");
   assert.equal(shortFunction("R_DrawColumn"), "R_DrawColumn");
+  assert.equal(shortFunction("core::ptr::read_volatile::<u32>"), "read_volatile");
   assert.equal(shortFunction("<task_doom::Display as core::fmt::Write>::write_str"), "Display::write_str");
   assert.equal(shortFunction("task_jefe::main::{closure#0}"), "main::{closure#0}");
   assert.equal(ownerOf(drawn), "doom");

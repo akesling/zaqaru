@@ -128,6 +128,8 @@ export function shortFunction(full) {
     }
   }
   segments.push(full.slice(at));
+  // A function's generic arguments, `read_volatile::<u32>`, are not a name.
+  for (let i = segments.length - 1; i > 0; i--) if (segments[i].startsWith("<")) segments.splice(i, 1);
   // `<path::Type as Trait>` or `<path::Type>`: the type's own name.
   const clean = segments.map((seg) => seg.replace(/^<(?:[\w:]*::)?(\w+)(?:<[^>]*>)?(?: as [^>]*)?>$/, "$1").replace(/^<(.*)>$/, "$1"));
   const last = clean.length - 1;

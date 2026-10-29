@@ -111,6 +111,21 @@ export function grouped(graph) {
   }).filter((g) => g.families.length);
 }
 
+/// The origins of a family that are the same — the same place, value and
+/// code, as a value read again and again is — as one, with how many:
+/// `[{ origin, count }]`.
+export function alike(origins) {
+  const out = new Map();
+  for (const origin of origins) {
+    const leaf = origin.leaf;
+    const key = `${leaf.what} ${leaf.where ?? leaf.register ?? ""} ${leaf.value} ${leaf.pc ?? ""} ${origin.via}`;
+    const entry = out.get(key);
+    if (entry) entry.count++;
+    else out.set(key, { origin, count: 1 });
+  }
+  return [...out.values()];
+}
+
 /// What a value depended on, in a sentence.
 export function dependsSummary(graph, most = 3) {
   const groups = grouped(graph);
@@ -138,6 +153,7 @@ export function pathTo(graph, id) {
 /// was a microsecond before and what was a second before are both seen.
 export function timeStrip(points, width = 640, height = 34) {
   if (points.length < 2) return "";
+  width = 1000;
   const latest = Math.max(...points.map((p) => p.t));
   const earliest = Math.min(...points.map((p) => p.t));
   const scale = (t) => Math.log10(1 + (latest - t)) / Math.log10(1 + Math.max(1, latest - earliest));
@@ -149,5 +165,5 @@ export function timeStrip(points, width = 640, height = 34) {
   const dots = points
     .map((p) => `<circle cx="${x(p.t).toFixed(1)}" cy="14" r="${p.kind === "origin" ? 4 : 3}" class="${p.kind}"><title>${p.label}</title></circle>`)
     .join("");
-  return `<svg class="time-strip" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" height="${height}"><line x1="8" x2="${width - 8}" y1="14" y2="14" class="axis"/>${ticks}${dots}</svg>`;
+  return `<svg class="time-strip" viewBox="0 0 ${width} ${height}"><line x1="8" x2="${width - 8}" y1="14" y2="14" class="axis"/>${ticks}${dots}</svg>`;
 }
