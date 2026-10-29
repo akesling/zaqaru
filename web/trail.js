@@ -95,9 +95,15 @@ export async function follow(trail, { read, query, update = () => {}, wanted = (
 const PLUMBING = /^(memcpy|memmove|__aeabi_mem\w*|copy_(forward|backward)\w*|safe_copy\w*|copy_nonoverlapping|copy_from_slice|clone_from_slice)$|::(memcpy|memmove|copy_(forward|backward)\w*)$/;
 const PLUMBING_FILES = /(^|\/)(mem\/impls\.rs|compiler_builtins\/|memcpy|memmove)/;
 
+/// The source line a step's code is at: the innermost the compiler did
+/// not make up (line 0 is code of its own, of no line).
+export function lineOf(step) {
+  return step.lines?.find((l) => l.line > 0) ?? step.lines?.[0] ?? null;
+}
+
 /// The function a step's code is in, by its source if known: `R_DrawSpan`.
 export function functionOf(step) {
-  const line = step.lines?.[0];
+  const line = lineOf(step);
   return (line?.function ?? step.code ?? "").replace(/^\S+: /, "").replace(/ \+ 0x[0-9a-f]+$/, "").replace(/^.*::/, "");
 }
 
@@ -218,7 +224,7 @@ export function summary(trail) {
   const made = [...steps].reverse().find((s) => s.what === "store" && !isPlumbing(s));
   const parts = [`${head} ${origin}`];
   if (made) {
-    const line = made.lines?.[0];
+    const line = lineOf(made);
     const where = line?.file ? ` (${line.file.split("/").pop()}:${line.line})` : "";
     const owner = ownerOf(made);
     parts.push(`was stored by ${functionOf(made)}${where}${owner ? ` in ${owner}` : ""}`);

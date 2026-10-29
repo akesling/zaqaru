@@ -24,7 +24,7 @@
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
 import { progressHtml } from "./progress.js";
 import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
-import { HOPS, byteOf, folded, follow, functionOf, leafText, next, ownerOf, placeOwner, shortPlace, span, stepsOf, summary } from "./trail.js";
+import { HOPS, byteOf, folded, follow, functionOf, leafText, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, summary } from "./trail.js";
 
 const MODES = [
   ["variables", "variables"],
@@ -295,14 +295,28 @@ export class Inspector {
       const a = r.answer;
       const went = a.went ?? a.shown;
       const ownerOfRun = (run) => /^([\w-]+) (\.[\w.]+|stack)/.exec(run.where ?? "")?.[1];
-      const rows = went
-        .map((run) => {
-          const owner = ownerOfRun(run);
-          const line = run.lines?.[0];
-          const by = line?.file ? `${e((line.function ?? "").replace(/^.*::/, ""))} ${this.lineLink(line)}` : e(run.code ?? "");
-          const when = run.t !== null && run.t !== undefined ? ` <a class="dim when" data-stand="${Math.floor(run.t / 1000) + 1}" title="stand the board here">${span(run.t * 1000 - r.from)} after</a>` : "";
-          const still = run.still === undefined ? "" : run.still ? ` <span class="chip" style="--chip:#2da44e">still there</span>` : ` <span class="dim">since overwritten</span>`;
-          return `<li data-lit="${run.addr}"><a data-goto="${run.addr}">${e(shortPlace(run.where))}</a>${owner ? ` ${this.ownerChip(owner)}` : ""}${run.length > 1 ? ` <span class="dim">${run.length} bytes</span>` : ""} <span class="dim">by</span> ${by}${when}${run.writes > 1 ? ` <span class="dim">×${run.writes}</span>` : ""}${still}</li>`;
+      const row = (run) => {
+        const line = lineOf(run);
+        const by = `${e(functionOf(run))}${line?.file ? ` ${this.lineLink(line)}` : ""}`;
+        const when = run.t !== null && run.t !== undefined ? ` <a class="dim when" data-stand="${Math.floor(run.t / 1000) + 1}" title="stand the board here">${span(run.t * 1000 - r.from)} after</a>` : "";
+        const still = run.still === undefined ? "" : run.still ? ` <span class="chip" style="--chip:#2da44e">still there</span>` : ` <span class="dim">since overwritten</span>`;
+        return `<li data-lit="${run.addr}"><a data-goto="${run.addr}">${e(shortPlace(run.where))}</a>${run.length > 1 ? ` <span class="dim">${run.length} bytes</span>` : ""} <span class="dim">by</span> ${by}${when}${run.writes > 1 ? ` <span class="dim">×${run.writes}</span>` : ""}${still}</li>`;
+      };
+      // By what they are in — a static, a stack — each a line, its places
+      // inside it.
+      const groups = new Map();
+      for (const run of went) {
+        const key = `${ownerOfRun(run) ?? ""} ${shortPlace(run.where).replace(/(\[\d+\]|\s\+\s0x[0-9a-f]+).*$/, "")}`;
+        if (!groups.has(key)) groups.set(key, { owner: ownerOfRun(run), name: shortPlace(run.where).replace(/(\[\d+\]|\s\+\s0x[0-9a-f]+).*$/, ""), runs: [] });
+        groups.get(key).runs.push(run);
+      }
+      const rows = [...groups.values()]
+        .map((g) => {
+          const still = g.runs.filter((run) => run.still).length;
+          const bytes = g.runs.reduce((n, run) => n + run.length, 0);
+          const lit = JSON.stringify(g.runs.map((run) => [run.addr, run.length]));
+          const head = `<b>${e(g.name)}</b>${g.owner ? ` ${this.ownerChip(g.owner)}` : ""} <span class="dim">${g.runs.length} place${g.runs.length === 1 ? "" : "s"}, ${bytes} byte${bytes === 1 ? "" : "s"}${still ? `, ${still} still there` : ""}</span> <a data-runs='${e(lit)}' title="outline them in the pictures">show</a>`;
+          return g.runs.length === 1 ? `<li>${head}<ol>${row(g.runs[0])}</ol></li>` : `<li><details><summary>${head}</summary><ol>${g.runs.map(row).join("")}</ol></details></li>`;
         })
         .join("");
       const owners = [...new Set(went.map(ownerOfRun).filter(Boolean))];
@@ -700,7 +714,7 @@ export class Inspector {
       return `<a data-goto="${address}" title="${e(`${hex(address)} · ${step.where ?? ""}`)}">${e(short(step.where) || hex(address))}</a>${owner ? ` ${this.ownerChip(owner)}` : ""}`;
     };
     const by = (step) => {
-      const line = step.lines?.[0];
+      const line = lineOf(step);
       const owner = ownerOf(step);
       return `${e(functionOf(step))}${line?.file ? ` ${this.lineLink(line)}` : ""}${owner && owner !== placeOwner(step) ? ` <span class="dim">in</span> ${this.ownerChip(owner)}` : ""}`;
     };
@@ -720,7 +734,7 @@ export class Inspector {
           return `<li${lit}><span class="verb">stored</span> ${v === null ? "" : `<b>${byte(v)}</b> `}to ${place(step)} by ${by(step)} ${when(step)}</li>`;
         case "held": {
           const other = step.ram && step.written?.by?.pc !== undefined ? ` <a data-retrail="${address},${step.written.stamp * 1e6}" title="follow this value back instead">follow this one</a>` : "";
-          const went = ` <a data-reach="${address},${step.t * 1000 - 1000}" title="everywhere this value went from here, and anything made of it">where else it went</a>`;
+          const went = ` <a data-reach="${address},${step.t * 1000 - 1000}" data-label="${e(shortPlace(step.where))}" title="everywhere this value went from here, and anything made of it">where else it went</a>`;
           return `<li${lit}><span class="verb">loaded</span> ${v === null ? "" : `<b>${byte(v)}</b> `}from ${place(step)} by ${by(step)} ${when(step)}${other}${went}</li>`;
         }
         case "read":
@@ -1051,7 +1065,7 @@ export class Inspector {
     }
     if (t("[data-reach]")) {
       const [address, from] = t("[data-reach]").dataset.reach.split(",").map(Number);
-      this.readReach(address, null, Math.max(0, from));
+      this.readReach(address, t("[data-reach]").dataset.label ?? this.trail?.label ?? null, Math.max(0, from));
       return true;
     }
     if (t("[data-reach-window]") && this.reach) {

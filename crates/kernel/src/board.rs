@@ -1749,6 +1749,9 @@ impl Board {
                         .origins(node.parents[1], 8)
                         .into_iter()
                         .filter(|(_, leaf)| !matches!(leaf.what, What::Held { addr, .. } if addr.wrapping_sub(leaf.pc) < 4096))
+                        // Nor does a pointer — which table, which the load's
+                        // own address already says — only what indexed it.
+                        .filter(|(_, leaf)| !matches!(leaf.what, What::Held { size: 4, value, .. } | What::Register { value, .. } if self.machine.bus.ram_at(value).is_some() || value >= 0x0800_0000))
                         .map(|(_, leaf)| (leaf, if let What::Held { addr, .. } = leaf.what { addr } else { 0 }))
                         .collect();
                     if leaves.is_empty() {
