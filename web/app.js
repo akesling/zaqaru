@@ -352,9 +352,9 @@ worker.onmessage = (event) => {
     if (message.checkpointing) checkpointing = { ...message.checkpointing, count: message.checkpoints };
     frontier = message.frontier;
     finished = message.finished;
-    timeline.push(...message.timeline);
-    trace.push(...message.trace);
-    exchanges.push(...message.exchanges);
+    append(timeline, message.timeline);
+    append(trace, message.trace);
+    append(exchanges, message.exchanges);
     takeHubris(message.hubris);
     $("slider").max = frontier;
     status(`${message.listening.length ? `listening on ${message.listening.join(", ")}` : ""}${message.idle && finished === null ? " · idle" : ""}`);
@@ -606,16 +606,24 @@ function extendEvents() {
     }
     fresh.sort(byInstant);
     if (fresh.length && events.length && byInstant(fresh[0], events.at(-1)) < 0) {
-      events.push(...fresh, ...pending);
+      append(events, fresh);
+      append(events, pending);
       events.sort(byInstant);
       return;
     }
-    events.push(...fresh, ...pending);
+    append(events, fresh);
+    append(events, pending);
     return;
   }
   fresh.sort(byInstant);
   if (fresh.length && events.length && byInstant(fresh[0], events.at(-1)) < 0) return rebuildEvents();
-  events.push(...fresh);
+  append(events, fresh);
+}
+
+/// `items` added to the end of `list`: a spread of as many as a long run
+/// sends would overflow the stack.
+function append(list, items) {
+  for (const item of items) list.push(item);
 }
 
 function byInstant(a, b) {

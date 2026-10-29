@@ -210,6 +210,8 @@ export class Inspector {
     this.trail = trail;
     const wanted = () => this.trail === trail;
     const update = () => wanted() && this.draw(true);
+    trail.running = { at: from?.at ?? address, time: from?.time ?? null, window: 0 };
+    update();
     try {
       await follow(trail, { read: (path) => this.view.read(path), query: (options, path) => this.view.query(options, path), update, wanted });
     } catch (why) {
@@ -588,7 +590,8 @@ export class Inspector {
       html += `<div class="trail-hop dim">${lead}: ${at(hop.at, hop.what)} — the board run again over the ${window(hop.window)} to ${when(hop.time / 1000)}</div>`;
       html += hop.steps.length ? `<ol class="mem-why">${steps(hop.steps)}</ol>` : "";
     });
-    if (t.running) html += `<div class="dim">running the board again over the ${window(t.running.window)} before ${(t.running.time / 1e9).toFixed(3)} ms, following everything…</div>`;
+    if (t.running?.window) html += `<div class="dim">running the board again over the ${window(t.running.window)} before ${(t.running.time / 1e9).toFixed(3)} ms, following everything…</div>`;
+    else if (t.running) html += `<div class="dim">reading when it was last written…</div>`;
     if (t.error) html += `<div class="dim">${e(t.error)}</div>`;
     const end = t.end;
     const last = end?.step;
@@ -717,7 +720,7 @@ export class Inspector {
     }
     if (t("[data-why]")) {
       const target = nodeOf(t("[data-why]").dataset.why);
-      if (target) this.readTrail(target.address, target.name.split("::").slice(-2).join("::"));
+      if (target) this.readTrail(target.address, target.name);
       return true;
     }
     if (t("[data-trail]")) {
@@ -796,7 +799,8 @@ export class Inspector {
       node = node.children?.find((c) => c.name === name);
       if (!node) return null;
     }
-    return { key, owner, address: node.address, size: node.size, type: node.type };
+    const name = [root.name.split("::").pop(), ...path].join(".").replaceAll(".[", "[");
+    return { key, owner, name, address: node.address, size: node.size, type: node.type };
   }
 }
 

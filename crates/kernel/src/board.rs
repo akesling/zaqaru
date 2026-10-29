@@ -1338,7 +1338,7 @@ impl Board {
             text = if text.is_empty() { at } else { format!("{text} ({at})") };
         }
         if let Some(lump) = self.wad_lump(address) {
-            text = format!("{text}: {lump}");
+            text = if text.is_empty() { format!("the NOR: {lump}") } else { format!("{text}: {lump}") };
         }
         if text.is_empty() {
             text = format!("{address:#010x}: nothing the chip or the archive names");
