@@ -8,6 +8,7 @@ const held = (addr, stamp, writer = by) => ({ what: "held", addr, ram: true, wri
 
 test("a history's last step says where to go on, or that it ends", () => {
   assert.deepEqual(next(held(0x2400_0010, 7)), { at: 0x2400_0010, time: 7e6 });
+  assert.deepEqual(next({ ...held(0x2400_0010, 7), byte: 0x2400_0012 }), { at: 0x2400_0012, time: 7e6 });
   assert.deepEqual(next(held(0x2400_0010, 0)), { end: "unwritten" });
   assert.deepEqual(next(held(0x2400_0010, 7, { code: "DMA" })), { end: "writer" });
   assert.deepEqual(next({ what: "held", addr: 0x9000_0000, ram: false }), { end: "rom" });

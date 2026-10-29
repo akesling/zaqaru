@@ -571,7 +571,7 @@ export class Inspector {
         case "read":
           return `<li><b>came in off ${e(s.register)}</b>: ${hex(s.value)}${s.record ? `, trace record ${s.record.n}` : ""}, read by ${by(s)} ${when(s.t)}</li>`;
         case "held": {
-          const again = nested && s.ram && s.written?.by?.pc !== undefined ? ` <a data-retrail="${s.addr},${s.written.stamp * 1e6}" title="follow this value back instead">follow this one</a>` : "";
+          const again = nested && s.ram && s.written?.by?.pc !== undefined ? ` <a data-retrail="${s.byte ?? s.addr},${s.written.stamp * 1e6}" title="follow this value back instead">follow this one</a>` : "";
           return `<li>${hex(s.value)} loaded from ${at(s.addr, s.where)} by ${by(s)} ${when(s.t)}${again}</li>`;
         }
         case "register":

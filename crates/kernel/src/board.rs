@@ -1414,8 +1414,8 @@ impl Board {
         let Some(p) = &self.machine.provenance else {
             return r#"{"following":false,"steps":[]}"#.to_string();
         };
-        let tag = p.memory.get(&address).copied().unwrap_or(0);
-        let steps = self.why_steps(p, tag, map, read, 32);
+        let story: Vec<_> = p.story(address, 32).into_iter().map(|(_, node, byte)| (node, byte)).collect();
+        let steps = self.why_steps(p, story, map, read, 32);
         format!(
             r#"{{"following":true,"everything":{},"since_ns":{},"address":{address},"what":{},"steps":[{}]}}"#,
             p.everything,
@@ -1474,10 +1474,11 @@ impl Board {
         format!(r#"{{"following":true,"since_ns":{},"runs":{total},"shown":[{}]}}"#, p.since / 1000, out.join(","))
     }
 
+    /// A history's steps as JSON: each node, with the byte it is about.
     fn why_steps(
         &self,
         p: &armv6m::provenance::Provenance,
-        tag: armv6m::provenance::Tag,
+        story: Vec<(&armv6m::provenance::Node, u32)>,
         map: Option<&Result<armv6m::hubris::Image, String>>,
         read: ReadFile,
         depth: usize,
@@ -1485,7 +1486,7 @@ impl Board {
         use crate::system::server::quoted;
         use armv6m::provenance::What;
         let mut out = Vec::new();
-        for (_, node) in p.history(tag, depth) {
+        for (node, byte) in story {
             let lines: Vec<String> = self.lines_at(node.pc, map, read).iter().map(dwarf::line_json).collect();
             let common = format!(
                 r#""t":{},"pc":{},"code":{},"lines":[{}]"#,
@@ -1509,12 +1510,13 @@ impl Board {
                     )
                 }
                 What::Merge => {
-                    let other = self.why_steps(p, node.parents[1], map, read, depth / 2);
+                    let other = p.history(node.parents[1], depth / 2).into_iter().map(|(_, node)| (node, 0)).collect();
+                    let other = self.why_steps(p, other, map, read, depth / 2);
                     format!(r#"{{"what":"merge","other":[{}],{common}}}"#, other.join(","))
                 }
                 What::Held { addr, size, value, written } => format!(
-                    r#"{{"what":"held","addr":{addr},"size":{size},"value":{value},"where":{},"ram":{},"written":{},{common}}}"#,
-                    quoted(&self.describe(addr, map)),
+                    r#"{{"what":"held","addr":{addr},"size":{size},"value":{value},"byte":{byte},"where":{},"ram":{},"written":{},{common}}}"#,
+                    quoted(&self.describe(byte.max(addr), map)),
                     self.machine.bus.ram_at(addr).is_some(),
                     written.map_or("null".into(), |mark| format!(
                         r#"{{"stamp":{},"by":{}}}"#,
@@ -1522,6 +1524,8 @@ impl Board {
                         self.writer_json(mark.writer, map, read)
                     ))
                 ),
+                // Followed through, lane by lane: never a step of its own.
+                What::Bytes { .. } => continue,
                 What::Register { n, value } => format!(
                     r#"{{"what":"register","register":"{}","value":{value},{common}}}"#,
                     match n {

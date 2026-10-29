@@ -209,3 +209,40 @@ fn following_everything_from_an_instant_changes_nothing() {
     run(&mut plain);
     assert_eq!((followed.retired, followed.time, &followed.cpu), (plain.retired, plain.time, &plain.cpu));
 }
+
+#[test]
+fn a_bytes_story_follows_its_lane_through_a_word_copy() {
+    let source = ".thumb_func\nreset:
+    movs r2, #0x33
+    ldr r3, =0x24000100
+    movs r1, #7
+    strb r1, [r3]            @ byte 0: a constant
+    strb r2, [r3, #1]        @ byte 1: a register's, from before
+    adr r7, table
+    ldrb r7, [r7]
+    strb r7, [r3, #2]        @ byte 2: flash's
+    strb r1, [r3, #3]
+    ldr r4, [r3]             @ the four, as a word
+    ldr r6, =0x24000200
+    str r4, [r6]             @ copied
+    bkpt #1
+    .align 2
+table:
+    .byte 0xC4, 0, 0, 0
+    .ltorg
+";
+    let mut m = h753(source);
+    m.follow_everything_from(m.time + 1);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let story = |address: u32| -> Vec<(What, u32)> { p.story(address, 8).iter().map(|&(_, node, byte)| (node.what, byte)).collect() };
+    let flash = story(0x2400_0202);
+    assert!(matches!(flash[0], (What::Store { addr: 0x2400_0200, size: 4, .. }, 0x2400_0202)), "{flash:?}");
+    assert!(matches!(flash[1], (What::Store { addr: 0x2400_0102, size: 1, value: 0xC4 }, 0x2400_0102)), "{flash:?}");
+    assert!(matches!(flash[2], (What::Held { value: 0xC4, written: None, .. }, _)), "{flash:?}");
+    let register = story(0x2400_0201);
+    assert!(matches!(register[1], (What::Store { addr: 0x2400_0101, value: 0x33, .. }, _)), "{register:?}");
+    assert!(matches!(register[2], (What::Register { n: 2, value: 0x33 }, _)), "{register:?}");
+    let constant = story(0x2400_0203);
+    assert!(matches!(constant[..], [_, (What::Store { addr: 0x2400_0103, value: 7, .. }, _)]), "{constant:?}");
+}

@@ -18,8 +18,9 @@ export const WIDEST = 1e12;
 export const HOPS = 16;
 
 /// What the last step of a window's history says to do next: follow the
-/// bytes it was held in back to the write that put them there (`{ at,
-/// time }`), run the window again wider (`{ widen }`), or end (`{ end }`):
+/// byte it was held in (`byte`, of the `addr` loaded) back to the write
+/// that put it there (`{ at, time }`), run the window again wider (`{
+/// widen }`), or end (`{ end }`):
 /// `bus` off a peripheral, `rom` out of flash or a NOR or a register,
 /// `constant` made by the code, `unwritten` never written, `writer` written
 /// by no instruction — DMA, the probe — or `unfollowed`.
@@ -36,7 +37,7 @@ export function next(last) {
       if (!last.written) return { end: "unwritten" };
       if (last.written.by?.pc === undefined) return { end: "writer" };
       // The stamp is the write's microsecond plus one: its end.
-      return { at: last.addr, time: last.written.stamp * 1e6 };
+      return { at: last.byte ?? last.addr, time: last.written.stamp * 1e6 };
     default:
       return { end: "unfollowed" };
   }

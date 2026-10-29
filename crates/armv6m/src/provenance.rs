@@ -59,6 +59,10 @@ pub enum What {
     Store { addr: u32, size: u32, value: u32 },
     /// A value made of two tagged ones.
     Merge,
+    /// Bytes loaded together that came from different places: the tag of
+    /// each, by its place in the value — what a word copy of bytes stored
+    /// one by one carries, and what a byte's story follows its own lane of.
+    Bytes { addr: u32, lanes: [Tag; 4] },
     /// Following everything: `size` bytes at `addr` that held `value`
     /// before following began, the first time one was loaded; and the last
     /// write to them then, if they are RAM.
@@ -125,10 +129,20 @@ impl Provenance {
         out
     }
 
-    /// The tag of the bytes `[addr, addr + size)`.
+    /// The tag of the bytes `[addr, addr + size)`: theirs, if they share
+    /// one; or what each was, lane by lane.
     pub fn of_memory(&mut self, addr: u32, size: u32, pc: u32, time: u64) -> Tag {
         let tags: Vec<Tag> = (0..size).map(|i| self.memory.get(&addr.wrapping_add(i)).copied().unwrap_or(0)).collect();
-        self.union(tags, pc, time)
+        if tags.iter().all(|&t| t == tags[0]) {
+            return tags[0];
+        }
+        if size > 4 {
+            return self.union(tags, pc, time);
+        }
+        let mut lanes = [0; 4];
+        lanes[..tags.len()].copy_from_slice(&tags);
+        let first = tags.iter().copied().find(|&t| t != 0).unwrap_or(0);
+        self.add(Node { what: What::Bytes { addr, lanes }, pc, time, parents: [first, 0] })
     }
 
     /// Following everything, bytes loaded untagged are what they held
@@ -209,6 +223,42 @@ impl Provenance {
                 None => *computed.get_or_insert_with(|| self.union(from_registers.iter().copied(), pc, time)),
             };
         }
+    }
+
+    /// The history of the byte at `address`, newest first, each node with
+    /// the byte it is about: through stores and loads of words, the lane
+    /// the byte is in; through a merge — arithmetic — the first parent's,
+    /// the byte no longer told apart. At most `depth` nodes.
+    pub fn story(&self, address: u32, depth: usize) -> Vec<(Tag, &Node, u32)> {
+        let mut out = Vec::new();
+        let mut tag = self.memory.get(&address).copied().unwrap_or(0);
+        // The byte followed, and its place in the value the next node holds.
+        let (mut byte, mut lane) = (address, 0);
+        while let Some(node) = self.node(tag) {
+            let mut next = node.parents[0];
+            match node.what {
+                What::Store { addr, size, .. } => {
+                    lane = byte.wrapping_sub(addr).min(size.saturating_sub(1));
+                    out.push((tag, node, byte));
+                }
+                What::Bytes { addr, lanes } => {
+                    byte = addr.wrapping_add(lane);
+                    next = lanes[lane.min(3) as usize];
+                    lane = 0;
+                }
+                What::Held { addr, size, .. } => out.push((tag, node, addr.wrapping_add(lane.min(size.saturating_sub(1))))),
+                What::Merge => {
+                    lane = 0;
+                    out.push((tag, node, byte));
+                }
+                _ => out.push((tag, node, byte)),
+            }
+            if out.len() >= depth {
+                break;
+            }
+            tag = next;
+        }
+        out
     }
 
     /// A value's history, newest first: the node `tag`, then what it came
