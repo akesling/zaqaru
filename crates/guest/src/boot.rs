@@ -200,6 +200,10 @@ pub unsafe extern "C" fn zaqaru_stop_at(target: i64) -> i32 {
     }
 }
 
+/// How often a run toward the board's instant says where it has got to:
+/// see [`zaqaru_stop_at_board`]. A host with nothing mounted there ignores it.
+const PROGRESS_TURNS: u32 = 16;
+
 /// Runs the container until its board stands at an instant of the
 /// board's own — `kind` 0: just after its `target`th instruction; 1: the
 /// first instruction boundary at or after `target` picoseconds of its
@@ -247,9 +251,22 @@ pub unsafe extern "C" fn zaqaru_stop_at_board(kind: i32, target: i64, bound: i64
     let bound = if bound < 0 { u64::MAX } else { bound as u64 };
     let mut last = None;
     let mut stalled = 0;
+    let mut turns = 0u32;
     loop {
         let hold = system.hold_board(instructions, time);
         let here = (system.retired(), hold.map(|h| (h.instructions, h.time)));
+        // Where it has got to, every so many turns, for whoever waits on
+        // it: the board's time and instructions, the container's.
+        turns = turns.wrapping_add(1);
+        if turns % PROGRESS_TURNS == 0 {
+            let mut line = String::new();
+            push_decimal(&mut line, hold.map_or(0, |h| h.time) as i64);
+            line.push(' ');
+            push_decimal(&mut line, hold.map_or(0, |h| h.instructions) as i64);
+            line.push(' ');
+            push_decimal(&mut line, system.retired() as i64);
+            let _ = HostStore::default().write(&[b"zaqaru", b"progress"], line.as_bytes());
+        }
         stalled = if last == Some(here) { stalled + 1 } else { 0 };
         last = Some(here);
         if hold.is_some_and(|h| h.there) || system.retired() > bound || stalled >= STALLED_TURNS {

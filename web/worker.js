@@ -522,14 +522,14 @@ async function stand(at, board = null) {
 const FOLLOW_BACK = 2e12;
 async function standBoard(board) {
   const began = performance.now();
-  viewer = await boardAt(board);
+  viewer = await boardAt(board, reporter("stand"));
   return performance.now() - began;
 }
 
 /// A container restored and run to where its board stands at `time`: see
 /// `standBoard`. Its own, so that a seek made while it runs on cannot
 /// change which one it is.
-async function boardAt({ time, follow = false, watch = null, back = FOLLOW_BACK }) {
+async function boardAt({ time, follow = false, watch = null, back = FOLLOW_BACK }, report = null) {
   // `follow: { from }`: everything followed, from that instant.
   const everything = typeof follow === "object" && follow !== null ? Math.max(0, Math.round(follow.from)) : null;
   const from = everything ?? (follow || watch ? time - (watch ? back : FOLLOW_BACK) : time);
@@ -547,8 +547,27 @@ async function boardAt({ time, follow = false, watch = null, back = FOLLOW_BACK 
       // No board at that checkpoint: nothing to follow or watch.
     }
   }
-  container.stopAtBoard({ time }, live ? frontier : -1);
+  const start = checkpoints.entries[index]?.board ?? 0;
+  const watching = everything !== null || follow || watch ? from : null;
+  container.stopAtBoard({ time }, live ? frontier : -1, report && ((at) => report({ start, from: watching, to: time, board: at.board })));
   return container;
+}
+
+/// What tells the page how far a run toward an instant has got, at most
+/// every `PROGRESS_MS`: `{ type: "progress", id, start, from, to, board,
+/// elapsed }` — the board's time at the checkpoint it began from, where
+/// following or watching begins (null for neither), the instant, where it
+/// has got to, and the milliseconds it has taken.
+const PROGRESS_MS = 150;
+function reporter(id) {
+  const began = performance.now();
+  let last = 0;
+  return (at) => {
+    const now = performance.now();
+    if (now - last < PROGRESS_MS) return;
+    last = now;
+    postMessage({ type: "progress", id, ...at, elapsed: now - began });
+  };
 }
 
 /// One path read at an instant of the board's, from a container stood
@@ -557,7 +576,7 @@ async function boardAt({ time, follow = false, watch = null, back = FOLLOW_BACK 
 /// panels' own instant is left as it was.
 async function query(id, board, path) {
   const began = performance.now();
-  const container = await boardAt(board);
+  const container = await boardAt(board, reporter(id));
   const answer = read(container, path, path);
   postMessage({ type: "value", id, path, restored: performance.now() - began, ...answer });
 }

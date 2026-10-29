@@ -22,7 +22,8 @@
 // memory in the pictures.
 
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
-import { follow } from "./trail.js";
+import { progressHtml } from "./progress.js";
+import { HOPS, follow } from "./trail.js";
 
 const MODES = [
   ["variables", "variables"],
@@ -192,7 +193,7 @@ export class Inspector {
     this.draw(true);
     const history = this.history;
     try {
-      history.answer = await this.view.query({ watch: `range ${target.address} ${Math.max(1, target.size)}`, back: this.back }, "board/watched");
+      history.answer = await this.view.query({ watch: `range ${target.address} ${Math.max(1, target.size)}`, back: this.back }, "board/watched", (p) => this.progressed("history", history, p));
     } catch (why) {
       history.error = String(why);
     }
@@ -220,7 +221,8 @@ export class Inspector {
     trail.running = { at: from?.at ?? address, time: from?.time ?? null, window: 0 };
     update();
     try {
-      await follow(trail, { read: (path) => this.view.read(path), query: (options, path) => this.view.query(options, path), update, wanted });
+      const query = (options, path) => this.view.query(options, path, (p) => wanted() && this.progressed("trail", trail.running, p));
+      await follow(trail, { read: (path) => this.view.read(path), query, update, wanted });
     } catch (why) {
       trail.error = String(why);
     }
@@ -233,12 +235,21 @@ export class Inspector {
     this.draw(true);
     const audit = this.audit;
     try {
-      audit.answer = await this.view.query({ watch: "audit", back: this.back }, "board/audit");
+      audit.answer = await this.view.query({ watch: "audit", back: this.back }, "board/audit", (p) => this.progressed("audit", audit, p));
     } catch (why) {
       audit.error = String(why);
     }
     audit.running = false;
     if (this.audit === audit) this.draw(true);
+  }
+
+  /// How far the re-execution behind `kind` — a history, a story, an
+  /// audit — has got: kept on `on`, and its bar redrawn in place.
+  progressed(kind, on, report) {
+    if (!on) return;
+    on.progress = report;
+    const box = this.box.querySelector(`[data-progress="${kind}"]`);
+    if (box) box.innerHTML = progressHtml(report);
   }
 
   /// Every task's typed statics' bytes, as they are now.
@@ -535,7 +546,7 @@ export class Inspector {
     const e = this.e;
     const h = this.history;
     const head = `<div class="mem-history"><div class="dim">every write to ${e(node.name)} over the last <span class="controls">${this.backsHtml()}</span> <a data-close="history">close</a></div>`;
-    if (h.running) return `${head}<div class="dim">re-running the board to here, watching it…</div></div>`;
+    if (h.running) return `${head}<div class="dim">running the board again to here, watching every write to it</div><div data-progress="history">${progressHtml(h.progress)}</div></div>`;
     if (h.error) return `${head}<div class="dim">${e(h.error)}</div></div>`;
     const a = h.answer;
     if (!a?.watching) return `${head}<div class="dim">nothing watched: no board at the checkpoint it began from</div></div>`;
@@ -601,7 +612,7 @@ export class Inspector {
       html += `<div class="trail-hop dim">${lead}: ${at(hop.at, hop.what)} — the board run again over the ${window(hop.window)} to ${when(hop.time / 1000)}</div>`;
       html += hop.steps.length ? `<ol class="mem-why">${steps(hop.steps)}</ol>` : "";
     });
-    if (t.running?.window) html += `<div class="dim">running the board again over the ${window(t.running.window)} before ${(t.running.time / 1e9).toFixed(3)} ms, following everything…</div>`;
+    if (t.running?.window) html += `<div class="dim">step ${t.hops.length + 1} back (at most ${HOPS} before it asks): following every value over the ${window(t.running.window)} before the write at ${(t.running.time / 1e9).toFixed(3)} ms</div><div data-progress="trail">${progressHtml(t.running.progress)}</div>`;
     else if (t.running) html += `<div class="dim">reading when it was last written…</div>`;
     if (t.error) html += `<div class="dim">${e(t.error)}</div>`;
     const end = t.end;
@@ -625,7 +636,7 @@ export class Inspector {
     const head = `<div class="dim">who wrote what, across the whole board, over the last <span class="controls">${this.backsHtml()}</span> <span class="controls"><button type="button" data-audit>${this.audit ? "audit again" : "audit"}</button></span></div>`;
     const a = this.audit;
     if (!a) return `${head}<div class="dim">re-runs the board to here counting which code writes which word, and says any code that wrote on from one variable into the next</div>`;
-    if (a.running) return `${head}<div class="dim">re-running the board to here, counting every write…</div>`;
+    if (a.running) return `${head}<div class="dim">running the board again to here, counting every write</div><div data-progress="audit">${progressHtml(a.progress)}</div>`;
     if (a.error) return `${head}<div class="dim">${e(a.error)}</div>`;
     const r = a.answer;
     if (!r?.auditing) return `${head}<div class="dim">nothing audited: no board at the checkpoint it began from</div>`;

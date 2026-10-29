@@ -22,6 +22,7 @@ import * as bench from "./bench.js";
 import { MemoryView } from "./memory.js";
 import { ScreenView } from "./screen.js";
 import { FIELDS, Options, emptySpec, isEmpty, matches } from "./filters.js";
+import { progressHtml } from "./progress.js";
 
 const worker = new Worker("./worker.js", { type: "module" });
 const $ = (id) => document.getElementById(id);
@@ -69,7 +70,7 @@ let values = {}; // the last state's values, by concrete path
 let pinned = null; // { at, values } when pinned
 let pending = null; // { at, kind, ... }: what to focus once the state at `at` arrives
 let nextRead = 0;
-const reads = new Map(); // id -> { resolve, reject }
+const reads = new Map(); // id -> { resolve, reject, progress }
 
 const FILES = "processes/{pid}/files/{path}";
 const DESCRIPTORS = "processes/{pid}/descriptors";
@@ -125,6 +126,13 @@ function seekBoard(time) {
 /// way there: what the values section and its `why`s are made of.
 let followValues = false;
 
+/// How far a stand in the board's time has got, under the instant; null
+/// once it is there.
+function standProgress(report) {
+  const box = document.querySelector(".board .stand-progress");
+  if (box) box.innerHTML = report ? progressHtml(report) : "";
+}
+
 /// Back from an instant of the board's to the live run.
 function backToLive() {
   boardTime = null;
@@ -156,11 +164,12 @@ function drain() {
 /// or the one stood at), from a container re-executed there with
 /// `options` on the way: `{ watch, back }` to watch writes from `back`
 /// picoseconds before. What `memory.js` asks a variable's history and an
-/// audit with; the panels stay where they are.
-function query(options, path) {
+/// audit with; the panels stay where they are. `progress(report)` is told
+/// how far the re-execution has got: see `progress.js`.
+function query(options, path, progress = null) {
   return new Promise((resolve, reject) => {
     const id = nextRead++;
-    reads.set(id, { resolve, reject });
+    reads.set(id, { resolve, reject, progress });
     const time = boardTime ?? (Number.isFinite(liveBoardTime) ? liveBoardTime : null);
     if (time === null) return reject("no board time to stand at yet");
     worker.postMessage({ type: "query", id, board: { time, follow: false, ...options }, path });
@@ -384,7 +393,13 @@ worker.onmessage = (event) => {
     screenView?.pushed(message.value);
     return;
   }
+  if (message.type === "progress") {
+    if (message.id === "stand") standProgress(message);
+    else reads.get(message.id)?.progress?.(message);
+    return;
+  }
   if (message.type === "state") {
+    standProgress(null);
     busy = false;
     lastState = performance.now();
     seekCost = message.took ?? 0;
@@ -1427,7 +1442,7 @@ const renderers = {
     // A skeleton made once, and each part of it replaced only when what it
     // shows changes: the board isn't redrawn under the pointer on every read.
     if (!panel.body.querySelector(".board > .drawing")) {
-      panel.body.innerHTML = `<div class="board"><div class="instant"></div><div class="drawing"></div><div class="status"></div><div class="where"></div><div class="clock"><span class="clock-text"></span> <span class="clock-controls"></span></div><div class="dim clock-tree"></div>
+      panel.body.innerHTML = `<div class="board"><div class="instant"></div><div class="stand-progress"></div><div class="drawing"></div><div class="status"></div><div class="where"></div><div class="clock"><span class="clock-text"></span> <span class="clock-controls"></span></div><div class="dim clock-tree"></div>
         <div class="timeline"><div class="timeline-head"></div><canvas class="timeline-canvas"></canvas><div class="timeline-readout dim">&nbsp;</div></div>
         <div class="values"></div><div class="probes"></div>
         <details class="more"><summary>LEDs, faults, the network, the core's registers</summary><div class="more-body"></div></details></div>`;

@@ -518,6 +518,13 @@ export class MountTable {
   }
   write(path, data) {
     if (path.length === 3 && this.isLogPath(path) && text(path[2]) === "timeline") this.syscalls++;
+    // Where a run toward an instant has got to: for whoever waits on it,
+    // not the container's own.
+    if (path.length === 2 && text(path[0]) === "zaqaru" && text(path[1]) === "progress") {
+      const [board, instructions, retired] = text(data).split(" ").map(Number);
+      this.progress?.({ board, instructions, retired });
+      return { ok: [] };
+    }
     const found = this.resolve(path);
     if (!found) return { error: `nothing is mounted at ${key(path)}` };
     let answer;
@@ -775,9 +782,18 @@ export class Container {
   /// turns, idle ones too, to the one the board arrives in. Not past
   /// `bound` of the container's instructions, if given: whoever asks reads
   /// where the board got to. Not for continuing.
-  stopAtBoard({ instructions, time }, bound = -1) {
+  ///
+  /// `progress({ board, instructions, retired })`, if given, is told where
+  /// it has got to as it goes: the board's time and instructions, the
+  /// container's.
+  stopAtBoard({ instructions, time }, bound = -1, progress = null) {
     const [kind, target] = instructions !== undefined ? [0, instructions] : [1, time];
-    return this.decode(this.instance.exports.zaqaru_stop_at_board(kind, BigInt(target), BigInt(bound)));
+    this.mounts.progress = progress;
+    try {
+      return this.decode(this.instance.exports.zaqaru_stop_at_board(kind, BigInt(target), BigInt(bound)));
+    } finally {
+      this.mounts.progress = null;
+    }
   }
 
   /// Runs to completion; answers the exit status.

@@ -238,6 +238,10 @@
   .mem-trail details { margin: 2px 0; }
   .mem-trail summary { cursor: pointer; }
   .mem-focus { margin: 2px 0 6px; }
+  .progress { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+  .progress .bar { flex: none; width: 160px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+  .progress .bar span { display: block; height: 100%; background: var(--accent); transition: width .15s linear; }
+  .board .stand-progress:empty { display: none; }
   .mem-bytes .b[data-trail] { cursor: pointer; }
   .mem-bytes .b[data-trail]:hover { outline: 1px solid var(--accent); }
   .mem-finding { color: #f85149; margin: 3px 0; }
