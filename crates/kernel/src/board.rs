@@ -1488,8 +1488,10 @@ impl Board {
         let mut out = Vec::new();
         for (node, byte) in story {
             let lines: Vec<String> = self.lines_at(node.pc, map, read).iter().map(dwarf::line_json).collect();
+            // The byte followed, where it is one of those the node is about.
+            let within = |addr: u32, size: u32| if byte.wrapping_sub(addr) < size { byte } else { addr };
             let common = format!(
-                r#""t":{},"pc":{},"code":{},"lines":[{}]"#,
+                r#""byte":{byte},"t":{},"pc":{},"code":{},"lines":[{}]"#,
                 node.time / 1000,
                 node.pc,
                 quoted(&self.code_at(node.pc, map)),
@@ -1498,7 +1500,7 @@ impl Board {
             out.push(match node.what {
                 What::Store { addr, size, value } => format!(
                     r#"{{"what":"store","addr":{addr},"size":{size},"value":{value},"where":{},{common}}}"#,
-                    quoted(&self.describe(addr, map))
+                    quoted(&self.describe(within(addr, size), map))
                 ),
                 What::Read { addr, value } => {
                     let register = armv6m::names::data_register(&self.machine.bus.soc, addr).unwrap_or_default();
@@ -1515,8 +1517,8 @@ impl Board {
                     format!(r#"{{"what":"merge","other":[{}],{common}}}"#, other.join(","))
                 }
                 What::Held { addr, size, value, written } => format!(
-                    r#"{{"what":"held","addr":{addr},"size":{size},"value":{value},"byte":{byte},"where":{},"ram":{},"written":{},{common}}}"#,
-                    quoted(&self.describe(byte.max(addr), map)),
+                    r#"{{"what":"held","addr":{addr},"size":{size},"value":{value},"where":{},"ram":{},"written":{},{common}}}"#,
+                    quoted(&self.describe(within(addr, size), map)),
                     self.machine.bus.ram_at(addr).is_some(),
                     written.map_or("null".into(), |mark| format!(
                         r#"{{"stamp":{},"by":{}}}"#,

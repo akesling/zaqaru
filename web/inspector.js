@@ -564,15 +564,19 @@ export class Inspector {
     const at = (address, where) => `<a data-goto="${address}" title="show ${hex(address)} in the pictures">${e(where ?? hex(address))}</a>`;
     const when = (ns) => `<a class="dim" data-stand="${Math.floor(ns / 1000) + 1}" title="stand the board here">t=${(ns / 1e6).toFixed(3)} ms</a>`;
     const by = (s) => (s.lines?.length ? this.writerHtml(s) : e(s.code ?? "?"));
+    // A word's value as the byte followed, where the step is about one of its bytes.
+    const lane = (s) => s.size > 1 && s.byte - s.addr >= 0 && s.byte - s.addr < s.size;
+    const value = (s) => (lane(s) ? `${hex((s.value >>> (8 * (s.byte - s.addr))) & 0xff)} <span class="dim">(of ${hex(s.value)})</span>` : hex(s.value));
+    const place = (s) => (lane(s) ? s.byte : s.addr);
     const step = (s, last, nested) => {
       switch (s.what) {
         case "store":
-          return `<li>${hex(s.value)} stored to ${at(s.addr, s.where)} by ${by(s)} ${when(s.t)}${last ? ` — <b>made by that code: a constant</b>` : ""}</li>`;
+          return `<li>${value(s)} stored to ${at(place(s), s.where)} by ${by(s)} ${when(s.t)}${last ? ` — <b>made by that code: a constant</b>` : ""}</li>`;
         case "read":
           return `<li><b>came in off ${e(s.register)}</b>: ${hex(s.value)}${s.record ? `, trace record ${s.record.n}` : ""}, read by ${by(s)} ${when(s.t)}</li>`;
         case "held": {
           const again = nested && s.ram && s.written?.by?.pc !== undefined ? ` <a data-retrail="${s.byte ?? s.addr},${s.written.stamp * 1e6}" title="follow this value back instead">follow this one</a>` : "";
-          return `<li>${hex(s.value)} loaded from ${at(s.addr, s.where)} by ${by(s)} ${when(s.t)}${again}</li>`;
+          return `<li>${value(s)} loaded from ${at(place(s), s.where)} by ${by(s)} ${when(s.t)}${again}</li>`;
         }
         case "register":
           return `<li>held in ${e(s.register)} as the window began</li>`;
