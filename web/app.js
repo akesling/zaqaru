@@ -393,7 +393,7 @@ worker.onmessage = (event) => {
     screenView?.pushed(message.value);
     return;
   }
-  if (message.type === "progress") {
+  if (message.type === "rerun") {
     if (message.id === "stand") standProgress(message);
     else reads.get(message.id)?.progress?.(message);
     return;
