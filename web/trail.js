@@ -87,3 +87,121 @@ export async function follow(trail, { read, query, update = () => {}, wanted = (
   }
   return null;
 }
+
+// ---- telling it ----------------------------------------------------------------
+
+/// Code that moves bytes and makes nothing of them — memcpy and its kin,
+/// the kernel's copies between tasks — by its function and file.
+const PLUMBING = /^(memcpy|memmove|__aeabi_mem\w*|copy_(forward|backward)\w*|safe_copy\w*|copy_nonoverlapping|copy_from_slice|clone_from_slice)$|::(memcpy|memmove|copy_(forward|backward)\w*)$/;
+const PLUMBING_FILES = /(^|\/)(mem\/impls\.rs|compiler_builtins\/|memcpy|memmove)/;
+
+/// The function a step's code is in, by its source if known: `R_DrawSpan`.
+export function functionOf(step) {
+  const line = step.lines?.[0];
+  return (line?.function ?? step.code ?? "").replace(/^\S+: /, "").replace(/ \+ 0x[0-9a-f]+$/, "").replace(/^.*::/, "");
+}
+
+/// Whose code a step's is, where the code says: `doom`, or null.
+export function ownerOf(step) {
+  return /^([\w-]+): /.exec(step.code ?? "")?.[1] ?? null;
+}
+
+/// Whose memory a step's place is, where it says: `display`, or null.
+export function placeOwner(step) {
+  return /^([\w-]+) (\.[\w.]+|stack|code)(:|$| \()/.exec(step.where ?? "")?.[1] ?? null;
+}
+
+/// Whether a step is a byte moved by plumbing: a store or a load by code
+/// that only copies.
+export function isPlumbing(step) {
+  if (step.what !== "store" && step.what !== "held") return false;
+  const line = step.lines?.[0];
+  return PLUMBING.test(functionOf(step)) || PLUMBING_FILES.test(line?.file ?? "");
+}
+
+/// A story's steps, latest first, across its windows, each with the
+/// window it is of: `[{ step, hop }]`.
+export function stepsOf(trail) {
+  return trail.hops.flatMap((hop, h) => hop.steps.map((step) => ({ step, hop: h })));
+}
+
+/// The steps as what to show: runs of plumbing folded into one `{ copies:
+/// [{ step, hop }] }` each, every other step `{ step, hop }` as it is.
+export function folded(steps) {
+  const out = [];
+  for (const entry of steps) {
+    if (isPlumbing(entry.step)) {
+      const last = out.at(-1);
+      if (last?.copies) last.copies.push(entry);
+      else out.push({ copies: [entry] });
+    } else out.push(entry);
+  }
+  // A lone load or store by plumbing says nothing folded.
+  return out.map((entry) => (entry.copies?.length === 1 ? entry.copies[0] : entry));
+}
+
+/// A span of the board's time, in picoseconds, in words.
+export function span(ps) {
+  ps = Math.abs(ps);
+  if (ps < 1e6) return `${Math.round(ps / 1e3)} ns`;
+  if (ps < 1e9) return `${+(ps / 1e6).toPrecision(3)} µs`;
+  if (ps < 1e12) return `${+(ps / 1e9).toPrecision(3)} ms`;
+  return `${+(ps / 1e12).toPrecision(3)} s`;
+}
+
+/// The byte a step is about, of the value it moved.
+export function byteOf(step) {
+  if (step.value === undefined) return null;
+  const lane = step.size > 1 && step.byte - step.addr >= 0 && step.byte - step.addr < step.size ? step.byte - step.addr : 0;
+  return (step.value >>> (8 * lane)) & 0xff;
+}
+
+/// Where a story's value came from, in words, from how it ended.
+export function originText(trail) {
+  const end = trail.end;
+  const last = end?.step;
+  switch (end?.kind) {
+    case "bus":
+      return `came in off ${last.register}${last.record ? ` (trace record ${last.record.n})` : ""}`;
+    case "rom":
+      return `came from ${last.where}`;
+    case "constant":
+      return `is a constant the code made`;
+    case "unwritten":
+      return `has never been written: it is what the RAM held at reset`;
+    case "writer":
+      return `was written by ${end.by?.code ?? last?.written?.by?.code ?? "something not an instruction"}`;
+    case "register":
+      return `sat in ${last?.register ?? "a register"} longer than the widest window`;
+    case "unfollowed":
+      return `was written by something not followed (the probe, or DMA)`;
+    default:
+      return null;
+  }
+}
+
+/// A story in one sentence: where the value came from, what made it, and
+/// how it got here.
+export function summary(trail) {
+  const steps = stepsOf(trail).map((e) => e.step);
+  const origin = originText(trail);
+  if (!steps.length || !origin) return null;
+  const value = byteOf(steps[0]);
+  const head = value === null ? "It" : `0x${value.toString(16).padStart(2, "0")}`;
+  // The oldest store by code that is not plumbing: what made the value.
+  const made = [...steps].reverse().find((s) => s.what === "store" && !isPlumbing(s));
+  const parts = [`${head} ${origin}`];
+  if (made) {
+    const line = made.lines?.[0];
+    const where = line?.file ? ` (${line.file.split("/").pop()}:${line.line})` : "";
+    const owner = ownerOf(made);
+    parts.push(`was stored by ${functionOf(made)}${where}${owner ? ` in ${owner}` : ""}`);
+  }
+  const copies = steps.filter((s) => s.what === "store" && isPlumbing(s) && (!made || s.t > made.t));
+  if (copies.length) {
+    const into = placeOwner(steps[0]);
+    const later = made ? `, ${span((steps[0].t - made.t) * 1000)} later` : "";
+    parts.push(`and was copied ${copies.length === 1 ? "once" : `${copies.length} times`}${into ? ` into ${into}` : ""}${later}`);
+  }
+  return `${parts.join(", ")}.`;
+}

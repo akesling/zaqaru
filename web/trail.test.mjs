@@ -1,7 +1,7 @@
 // Checks `trail.js` under Node: node --test web/trail.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW, follow, next } from "./trail.js";
+import { WINDOW, byteOf, folded, follow, functionOf, isPlumbing, next, ownerOf, placeOwner, span, summary } from "./trail.js";
 
 const by = { pc: 0x0800_1234, code: "doom: R_DrawColumn" };
 const held = (addr, stamp, writer = by) => ({ what: "held", addr, ram: true, written: stamp ? { stamp, by: writer } : null });
@@ -80,4 +80,38 @@ test("a window run once is not run again", async () => {
   const cache = new Map();
   for (let i = 0; i < 2; i++) await follow({ address: 8, hops: [] }, { read, query, cache });
   assert.equal(runs, 1);
+});
+
+const drawn = { what: "store", addr: 0x2400_8080, size: 1, value: 0xbf, byte: 0x2400_8080, where: "doom .uninit: task_doom::ZONE_AXI + 0x8080 (AXI SRAM + 0x5941c)", code: "doom: V_DrawPatch + 0x12", lines: [{ function: "V_DrawPatch", file: "doomgeneric/v_video.c", line: 189 }], t: 43105713000 };
+const copied = { what: "store", addr: 0x3800_0028, size: 4, value: 0x4f4fbfbf, byte: 0x3800_0028, where: "display .frame: drv_stm32h7_ltdc::FRAME_SHOWN + 0x28 (SRAM4 + 0x28)", code: "kernel: compiler_builtins::mem::impls::copy_forward_aligned_words + 0x8", lines: [{ function: "compiler_builtins::mem::impls::copy_forward_aligned_words", file: "mem/impls.rs", line: 130 }], t: 43105732000 };
+const loadedForCopy = { ...copied, what: "held", where: drawn.where, addr: drawn.addr, byte: drawn.addr };
+const fromWad = { what: "held", ram: false, addr: 0x9000_1000, size: 1, value: 0xbf, byte: 0x9000_1000, where: "the NOR: WAD lump STCFN068 + 0x5b", code: "doom: V_DrawPatch + 0x10", lines: drawn.lines, t: 43105713000 };
+
+test("plumbing is told apart from the code that makes a value", () => {
+  assert.ok(isPlumbing(copied) && isPlumbing(loadedForCopy));
+  assert.ok(!isPlumbing(drawn) && !isPlumbing(fromWad));
+  assert.equal(functionOf(copied), "copy_forward_aligned_words");
+  assert.equal(ownerOf(drawn), "doom");
+  assert.equal(placeOwner(copied), "display");
+  assert.equal(placeOwner(fromWad), null);
+  assert.equal(placeOwner({ where: "i2c_driver stack (AXI SRAM + 0xd3ea)" }), "i2c_driver");
+  assert.equal(byteOf(copied), 0xbf);
+});
+
+test("a run of copies folds into one, the rest stays as it is", () => {
+  const steps = [copied, loadedForCopy, drawn, fromWad].map((step) => ({ step, hop: 0 }));
+  const shown = folded(steps);
+  assert.equal(shown.length, 3);
+  assert.equal(shown[0].copies.length, 2);
+  assert.equal(shown[1].step, drawn);
+});
+
+test("a story says in a sentence where its value came from, what made it and how it got here", () => {
+  const trail = { hops: [{ steps: [copied, loadedForCopy, drawn, fromWad] }], end: { kind: "rom", step: fromWad } };
+  assert.equal(
+    summary(trail),
+    "0xbf came from the NOR: WAD lump STCFN068 + 0x5b, was stored by V_DrawPatch (v_video.c:189) in doom, and was copied once into display, 19 µs later.",
+  );
+  assert.equal(span(19e6), "19 µs");
+  assert.equal(span(2.5e9), "2.5 ms");
 });

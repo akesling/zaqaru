@@ -23,7 +23,7 @@
 
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
 import { progressHtml } from "./progress.js";
-import { HOPS, follow } from "./trail.js";
+import { HOPS, byteOf, folded, follow, functionOf, next, ownerOf, placeOwner, span, stepsOf, summary } from "./trail.js";
 
 const MODES = [
   ["variables", "variables"],
@@ -40,6 +40,8 @@ const BACKS = [
   [1e18, "since it started"],
 ];
 const CONTEXT = 12; // lines of source either side of the one shown
+/// Types that only wrap another, whose fields a name leaves out.
+const WRAPPERS = /^(core::mem::(maybe_uninit::)?|core::cell::|)(MaybeUninit|ManuallyDrop|UnsafeCell|StaticCell|Cell|RefCell|SyncUnsafeCell)</;
 const SERVED = 4096; // bytes a read of memory answers with
 const LOG = 16; // ring buffer entries shown, the latest
 
@@ -64,6 +66,8 @@ export class Inspector {
     this.history = null; // { key, address, size, type, owner, answer | error }
     this.trail = null; // { address, label, hops, end, running, error }: see trail.js
     this.windows = new Map(); // the stories' windows run so far: see trail.js
+    this.stories = []; // every story asked for, oldest first, to go back and forth among
+    this.lit = null; // the step the pointer is on: its bytes outlined in the pictures
     this.audit = null; // { back, answer | error | running }
     this.snapshot = null; // { stamp, owners: Map(owner → { statics, bytes }) }
     this.compared = null;
@@ -212,12 +216,18 @@ export class Inspector {
       const [stamp, writer] = this.view.latestIn(address, address + 1);
       if (stamp && this.view.inspected?.writers[writer]?.pc !== undefined) from = { at: address, time: stamp * 1e6 };
     }
-    const trail = more ? this.trail : { address, label, hops: [] };
+    let trail = this.trail;
+    if (!more) {
+      trail = { address, label, hops: [], asked: from?.time ?? null };
+      // A new story drops the ones gone back from, as a browser does.
+      this.stories = [...this.stories.slice(0, this.stories.indexOf(this.trail) + 1), trail];
+    }
     trail.from = from;
     trail.end = null;
     trail.error = null;
+    trail.stopped = false;
     this.trail = trail;
-    const wanted = () => this.trail === trail;
+    const wanted = () => this.trail === trail && !trail.stopped;
     const update = () => wanted() && this.draw(true);
     trail.running = { at: from?.at ?? address, time: from?.time ?? null, window: 0 };
     update();
@@ -227,8 +237,13 @@ export class Inspector {
     } catch (why) {
       trail.error = String(why);
     }
+    // Stopped: where it would have gone on from, to go on from there.
+    if (trail.stopped && !trail.end) {
+      const after = next(trail.hops.at(-1)?.steps.at(-1));
+      trail.end = after.at !== undefined ? { kind: "stopped", at: after.at, time: after.time } : { kind: "stopped" };
+    }
     trail.running = null;
-    update();
+    if (this.trail === trail) this.draw(true);
   }
 
   async runAudit() {
@@ -351,8 +366,8 @@ export class Inspector {
     else if (this.mode === "stack") body = this.stackHtml(owner);
     else if (this.mode === "writers") body = this.writersHtml(owner);
     else body = this.variablesHtml(owner);
-    if (this.trail) body = this.trailHtml() + body;
-    box.innerHTML = `${head}<div class="mem-views"><div class="mem-view">${body}</div>${this.sourceHtml()}</div>`;
+    const story = this.trail ? this.trailHtml() : "";
+    box.innerHTML = `${head}${story}<div class="mem-views"><div class="mem-view">${body}</div>${this.sourceHtml()}</div>`;
     box.onmouseover = (event) => this.hovered(event);
     this.warm();
     const near = box.querySelector(".near");
@@ -360,7 +375,7 @@ export class Inspector {
       this.focusShown = this.view.focus;
       near.scrollIntoView({ block: "nearest" });
     }
-    this.view.setArrows(this.arrows ?? []);
+    this.view.setArrows([...(this.arrows ?? []), ...this.storyArrows()]);
   }
 
   scheduleText(doing) {
@@ -580,56 +595,105 @@ export class Inspector {
     const e = this.e;
     const t = this.trail;
     const hex = (n) => `0x${(n >>> 0).toString(16)}`;
-    const at = (address, where) => `<a data-goto="${address}" title="show ${hex(address)} in the pictures">${e(where ?? hex(address))}</a>`;
-    const when = (ns) => `<a class="dim" data-stand="${Math.floor(ns / 1000) + 1}" title="stand the board here">t=${(ns / 1e6).toFixed(3)} ms</a>`;
-    const by = (s) => (s.lines?.length ? this.writerHtml(s) : e(s.code ?? "?"));
-    // A word's value as the byte followed, where the step is about one of its bytes.
-    const lane = (s) => s.size > 1 && s.byte - s.addr >= 0 && s.byte - s.addr < s.size;
-    const value = (s) => (lane(s) ? `${hex((s.value >>> (8 * (s.byte - s.addr))) & 0xff)} <span class="dim">(of ${hex(s.value)})</span>` : hex(s.value));
-    const place = (s) => (lane(s) ? s.byte : s.addr);
-    const step = (s, last, nested) => {
-      switch (s.what) {
+    const byte = (n) => `0x${n.toString(16).padStart(2, "0")}`;
+    // A place: its static and offset, whose memory it is beside it; the
+    // memory's own name on hover.
+    const short = (where) => (where ?? "").replace(/^[\w-]+ [.\w]+: /, "").replace(/ \((.*)\)$/, "").replace(/\b(\w+::)+/g, "");
+    const place = (step) => {
+      const address = step.byte ?? step.addr;
+      const owner = placeOwner(step);
+      return `<a data-goto="${address}" title="${e(`${hex(address)} · ${step.where ?? ""}`)}">${e(short(step.where) || hex(address))}</a>${owner ? ` ${this.ownerChip(owner)}` : ""}`;
+    };
+    const by = (step) => {
+      const line = step.lines?.[0];
+      const owner = ownerOf(step);
+      return `${e(functionOf(step))}${line?.file ? ` ${this.lineLink(line)}` : ""}${owner && owner !== placeOwner(step) ? ` <span class="dim">in</span> ${this.ownerChip(owner)}` : ""}`;
+    };
+    // Each step's time, as how long before the one above it.
+    let above = null;
+    const when = (step) => {
+      const ago = above === null ? "" : `${span((above - step.t) * 1000)} before`;
+      above = step.t;
+      return `<a class="dim when" data-stand="${Math.floor(step.t / 1000) + 1}" title="t=${(step.t / 1e6).toFixed(3)} ms of the board's: stand it here">${ago || `t=${(step.t / 1e6).toFixed(3)} ms`}</a>`;
+    };
+    const stepHtml = ({ step }) => {
+      const address = step.byte ?? step.addr;
+      const lit = address !== undefined ? ` data-lit="${address}"` : "";
+      const v = byteOf(step);
+      switch (step.what) {
         case "store":
-          return `<li>${value(s)} stored to ${at(place(s), s.where)} by ${by(s)} ${when(s.t)}${last ? ` — <b>made by that code: a constant</b>` : ""}</li>`;
-        case "read":
-          return `<li><b>came in off ${e(s.register)}</b>: ${hex(s.value)}${s.record ? `, trace record ${s.record.n}` : ""}, read by ${by(s)} ${when(s.t)}</li>`;
+          return `<li${lit}><span class="verb">stored</span> ${v === null ? "" : `<b>${byte(v)}</b> `}to ${place(step)} by ${by(step)} ${when(step)}</li>`;
         case "held": {
-          const again = nested && s.ram && s.written?.by?.pc !== undefined ? ` <a data-retrail="${s.byte ?? s.addr},${s.written.stamp * 1e6}" title="follow this value back instead">follow this one</a>` : "";
-          return `<li>${value(s)} loaded from ${at(place(s), s.where)} by ${by(s)} ${when(s.t)}${again}</li>`;
+          const other = step.ram && step.written?.by?.pc !== undefined ? ` <a data-retrail="${address},${step.written.stamp * 1e6}" title="follow this value back instead">follow this one</a>` : "";
+          return `<li${lit}><span class="verb">loaded</span> ${v === null ? "" : `<b>${byte(v)}</b> `}from ${place(step)} by ${by(step)} ${when(step)}${other}</li>`;
         }
+        case "read":
+          return `<li${lit}><span class="verb">read</span> <b>${hex(step.value)}</b> off <b>${e(step.register)}</b>${step.record ? ` <a data-record="${step.record.n}" data-stand="${Math.floor(step.record.t / 1000) + 1}" title="stand the board at the trace record">trace record ${step.record.n}</a>` : ""} by ${by(step)} ${when(step)}</li>`;
         case "register":
-          return `<li>held in ${e(s.register)} as the window began</li>`;
+          return `<li><span class="verb">held</span> in ${e(step.register)} as the window began</li>`;
         case "merge":
-          return `<li>made of two values by ${by(s)} ${when(s.t)}<details><summary class="dim">the other</summary><ol>${steps(s.other, true)}</ol></details></li>`;
+          return `<li${lit}><span class="verb">made</span> of two values by ${by(step)} ${when(step)}<details><summary class="dim">the other</summary><ol>${step.other.map((o) => stepHtml({ step: o })).join("")}</ol></details></li>`;
         default:
           return "";
       }
     };
-    const steps = (list, nested = false) => list.map((s, i) => step(s, i === list.length - 1, nested)).join("");
-    const window = (ps) => (ps >= 1e12 ? `${ps / 1e12} s` : `${ps / 1e9} ms`);
-    let html = `<div class="mem-trail"><div class="dim">where the value at ${at(t.address, t.label)} came from, write by write <a data-close="trail">close</a></div>`;
-    t.hops.forEach((hop, i) => {
-      const lead = i === 0 ? "as it stands" : `which was written there`;
-      html += `<div class="trail-hop dim">${lead}: ${at(hop.at, hop.what)} — the board run again over the ${window(hop.window)} to ${when(hop.time / 1000)}</div>`;
-      html += hop.steps.length ? `<ol class="mem-why">${steps(hop.steps)}</ol>` : "";
-    });
-    if (t.running?.window) html += `<div class="dim">step ${t.hops.length + 1} back (at most ${HOPS} before it asks): following every value over the ${window(t.running.window)} before the write at ${(t.running.time / 1e9).toFixed(3)} ms</div><div data-progress="trail">${progressHtml(t.running.progress)}</div>`;
+    // The steps, latest first, a run of copies folded into a line of its own.
+    let rows = "";
+    let hop = 0;
+    for (const entry of folded(stepsOf(t))) {
+      const first = entry.copies ? entry.copies[0] : entry;
+      if (first.hop !== hop) {
+        hop = first.hop;
+        rows += `<li class="story-hop dim">which was written there earlier</li>`;
+      }
+      if (!entry.copies) {
+        rows += stepHtml(entry);
+        continue;
+      }
+      const stores = entry.copies.filter((c) => c.step.what === "store");
+      const from = entry.copies.at(-1).step;
+      const to = entry.copies[0].step;
+      const names = [...new Set(entry.copies.map((c) => functionOf(c.step)))].join(", ");
+      const summaryRow = `<span class="verb">copied</span> from ${place(from)} to ${place(to)} by ${e(names)}${stores.length > 1 ? ` <span class="dim">(${stores.length} copies)</span>` : ""} ${when(to)}`;
+      above = from.t;
+      rows += `<li class="story-copies"><details><summary>${summaryRow}</summary><ol>${entry.copies.map(stepHtml).join("")}</ol></details></li>`;
+    }
+    const said = summary(t);
+    const ends = {
+      more: () => `followed ${t.hops.length} writes back · <a data-trail-more title="go on, from the last write">keep going</a>`,
+      stopped: () => `stopped${t.end.at !== undefined ? ` · <a data-trail-more title="go on from where it stopped">go on</a>` : ""}`,
+    };
+    const end = t.end && (ends[t.end.kind]?.() ?? null);
+    const index = this.stories.indexOf(t);
+    const nav = `<button type="button" data-story="${index - 1}" ${index > 0 ? "" : "disabled"} title="the story before">‹</button><button type="button" data-story="${index + 1}" ${index < this.stories.length - 1 ? "" : "disabled"} title="the story after">›</button>`;
+    const value = stepsOf(t)[0]?.step;
+    const head = `<div class="story-head"><span class="controls">${nav}</span> <b>where ${e(t.label ?? hex(t.address))}${value && byteOf(value) !== null ? ` = ${byte(byteOf(value))}` : ""} came from</b> <span class="dim">${hex(t.address)}</span> <span class="controls">${t.running ? `<button type="button" data-story-stop>stop</button>` : ""}<button type="button" data-close="trail" title="close the story; ‹ brings it back">close</button></span></div>`;
+    let html = `<div class="mem-story">${head}`;
+    if (said) html += `<div class="story-summary">${e(said)}</div>`;
+    if (rows) html += `<ol class="story-steps">${rows}</ol>`;
+    if (t.running?.window) html += `<div class="dim">step ${t.hops.length + 1} back (at most ${HOPS} before it asks): following every value over the ${span(t.running.window)} before the write at ${(t.running.time / 1e9).toFixed(3)} ms</div><div data-progress="trail">${progressHtml(t.running.progress)}</div>`;
     else if (t.running) html += `<div class="dim">reading when it was last written…</div>`;
     if (t.error) html += `<div class="dim">${e(t.error)}</div>`;
-    const end = t.end;
-    const last = end?.step;
-    const ends = {
-      bus: () => `it came in from outside, off ${e(last.register)}`,
-      rom: () => `it came from ${e(last.where)}`,
-      constant: () => `the code that stored it made it`,
-      unwritten: () => `never written since the board started: what the RAM held at reset`,
-      writer: () => `written by ${e(end.by?.code ?? last?.written?.by?.code ?? "something not an instruction")}`,
-      register: () => `it sat in ${e(last?.register ?? "a register")} longer than the widest window: followed no further`,
-      unfollowed: () => `nothing followed in the window wrote it: the probe, or DMA`,
-      more: () => `followed ${t.hops.length} writes back <a data-trail-more title="go on, from the last write">keep going</a>`,
-    };
-    if (end) html += `<div class="trail-end">${(ends[end.kind] ?? (() => e(end.kind)))()}</div>`;
+    if (end) html += `<div class="story-end dim">${end}</div>`;
     return `${html}</div>`;
+  }
+
+  /// A task's name in its colour, as the owners' list shows it.
+  ownerChip(name) {
+    const owner = this.view.owners.find((o) => o.name === name);
+    return `<span class="chip" style="--chip:${owner?.color ?? "var(--dim)"}">${this.e(name)}</span>`;
+  }
+
+  /// The story's way through memory, as arrows from where each value was
+  /// to where it went next.
+  storyArrows() {
+    if (!this.trail) return [];
+    const places = stepsOf(this.trail)
+      .map(({ step }) => step.byte ?? step.addr)
+      .filter((a) => a !== undefined);
+    const arrows = [];
+    for (let i = places.length - 1; i > 0; i--) if (places[i] !== places[i - 1]) arrows.push([places[i], places[i - 1]]);
+    return arrows;
   }
 
   auditHtml() {
@@ -704,6 +768,12 @@ export class Inspector {
   }
 
   hovered(event) {
+    const lit = event.target.closest("[data-lit]");
+    const address = lit ? Number(lit.dataset.lit) : null;
+    if (address !== this.lit) {
+      this.lit = address;
+      this.view.setHighlight(address === null ? null : [[address, 1]]);
+    }
     const hover = this.box.querySelector(".mem-hover");
     const byte = event.target.closest("[data-heat]");
     if (!hover) return;
@@ -756,7 +826,20 @@ export class Inspector {
       this.readTrail(at, null, { at, time });
       return true;
     }
-    if (t("[data-trail-more]") && this.trail?.end?.kind === "more") {
+    if (t("[data-story]")) {
+      const story = this.stories[Number(t("[data-story]").dataset.story)];
+      if (story) {
+        this.trail = story;
+        this.draw(true);
+      }
+      return true;
+    }
+    if (t("[data-story-stop]") && this.trail) {
+      this.trail.stopped = true;
+      this.draw(true);
+      return true;
+    }
+    if (t("[data-trail-more]") && this.trail?.end?.at !== undefined) {
       const { at, time } = this.trail.end;
       this.readTrail(this.trail.address, this.trail.label, { at, time }, true);
       return true;
@@ -818,11 +901,15 @@ export class Inspector {
       root = decode(typed.types, st.type, st.address, (a) => this.view.byteAt(a), st.name);
     }
     let node = root;
+    const named = [root.name.split("::").pop()];
     for (const name of path) {
+      // A wrapper's own field says nothing: `FRAME_SHOWN[40]`, not
+      // `FRAME_SHOWN.value.value.__0[40]`.
+      if (!WRAPPERS.test(node.typeName ?? "") && !(node.children?.length === 1 && /^__\d+$/.test(name))) named.push(name);
       node = node.children?.find((c) => c.name === name);
       if (!node) return null;
     }
-    const name = [root.name.split("::").pop(), ...path].join(".").replaceAll(".[", "[");
+    const name = named.join(".").replaceAll(".[", "[");
     return { key, owner, name, address: node.address, size: node.size, type: node.type };
   }
 }

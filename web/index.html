@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <title>zaqaru — a container, in time</title>
 <style>
-  :root { color-scheme: light dark; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; --accent: #58a6ff; --line: #8884; --dim: #8886; }
+  :root { color-scheme: light dark; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; --accent: #58a6ff; --line: #8884; --dim: #8886; --story-bg: Canvas; }
   body { margin: 0; display: grid; grid-template-rows: auto auto 1fr; height: 100vh; }
   header { padding: 6px 12px; border-bottom: 1px solid var(--line); display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   header input[type=file] { max-width: 200px; }
@@ -230,13 +230,22 @@
   .mem-ticks span { position: absolute; top: 0; width: 2px; height: 10px; background: var(--accent); }
   .mem-why { margin: 2px 0; padding-left: 1.6em; }
   .mem-why a[data-stand] { cursor: pointer; }
-  .mem-trail { margin: 2px 0 8px; padding: 4px 8px; border-left: 2px solid var(--accent); background: color-mix(in srgb, var(--accent) 6%, transparent); }
-  .mem-trail a, .mem-focus a, .mem-words a[data-trail] { color: var(--accent); cursor: pointer; }
-  .mem-trail a[data-stand] { color: inherit; text-decoration: underline dotted; }
-  .mem-trail .trail-hop { margin-top: 4px; }
-  .mem-trail .trail-end { margin-top: 4px; font-weight: 600; }
-  .mem-trail details { margin: 2px 0; }
-  .mem-trail summary { cursor: pointer; }
+  .mem-story { position: sticky; top: 0; z-index: 2; max-height: 45vh; overflow: auto; margin: 4px 0 8px; padding: 6px 10px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 4px; background: var(--story-bg); box-shadow: 0 2px 8px #0003; }
+  .mem-story a, .mem-focus a, .mem-words a[data-trail] { color: var(--accent); cursor: pointer; }
+  .mem-story a.when, .mem-story a[data-stand] { color: inherit; text-decoration: underline dotted; }
+  .mem-story .story-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+  .mem-story .story-head .controls:last-child { margin-left: auto; }
+  .mem-story .story-summary { margin: 6px 0; font-size: 13.5px; line-height: 1.45; }
+  .mem-story .story-steps { margin: 4px 0; padding-left: 1.4em; }
+  .mem-story .story-steps li { margin: 2px 0; }
+  .mem-story .story-steps li[data-lit]:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .mem-story .story-hop { list-style: none; margin: 6px 0 2px -1.4em; border-top: 1px dashed var(--line); padding-top: 3px; }
+  .mem-story .story-copies { list-style: none; margin-left: -1.4em; }
+  .mem-story .story-copies summary { cursor: pointer; }
+  .mem-story .verb { display: inline-block; min-width: 3.6em; opacity: .75; }
+  .mem-story .story-end { margin-top: 4px; }
+  .mem-story details { margin: 2px 0; }
+  .chip { display: inline-block; padding: 0 5px; border-radius: 8px; font-size: 11px; line-height: 15px; color: #fff; background: var(--chip); vertical-align: 1px; }
   .mem-focus { margin: 2px 0 6px; }
   .progress { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
   .progress .bar { flex: none; width: 160px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
