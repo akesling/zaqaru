@@ -86,7 +86,21 @@ impl Format {
             [(pfcr & 7) as usize]
     }
 
-    fn bytes(self) -> usize {
+    /// Its name, as the reference manual's PFCR gives it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::Argb8888 => "ARGB8888",
+            Format::Rgb888 => "RGB888",
+            Format::Rgb565 => "RGB565",
+            Format::Argb1555 => "ARGB1555",
+            Format::Argb4444 => "ARGB4444",
+            Format::L8 => "L8",
+            Format::Al44 => "AL44",
+            Format::Al88 => "AL88",
+        }
+    }
+
+    pub fn bytes(self) -> usize {
         match self {
             Format::Argb8888 => 4,
             Format::Rgb888 => 3,
@@ -129,6 +143,17 @@ pub struct Screen {
     pub width: usize,
     pub height: usize,
     pub pixels: Pixels,
+}
+
+/// A layer's frame in memory: see [`Ltdc::scanned`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scanned {
+    pub address: u32,
+    pub pitch: usize,
+    pub width: usize,
+    pub height: usize,
+    pub format: Format,
+    pub clut: Option<Vec<u32>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,6 +250,33 @@ impl Ltdc {
     /// What the panel shows, its frames read from memory by `read`
     /// (`address`, `length`), which answers `None` where nothing is.
     /// `None` while the controller is off.
+    /// The memory each layer shown scans out: where its frame is, a line's
+    /// pitch, how many pixels a line and how many lines, its format, and
+    /// its CLUT, if it looks one up — what tells memory that is a picture
+    /// from memory that is not, and which pixel each byte of it is.
+    pub fn scanned(&self) -> Vec<Scanned> {
+        if self.size().is_none() {
+            return Vec::new();
+        }
+        self.layers
+            .iter()
+            .filter(|layer| layer.active[CR] & 1 != 0)
+            .map(|layer| {
+                let format = Format::of(layer.active[PFCR]);
+                let pitch = (layer.active[CFBLR] >> 16 & 0x1FFF) as usize;
+                let line = (layer.active[CFBLR] & 0x1FFF) as usize;
+                Scanned {
+                    address: layer.active[CFBAR],
+                    pitch,
+                    width: line.saturating_sub(7) / format.bytes(),
+                    height: (layer.active[CFBLNR] & 0x7FF) as usize,
+                    format,
+                    clut: (layer.active[CR] & 1 << 4 != 0).then(|| layer.clut.clone()),
+                }
+            })
+            .collect()
+    }
+
     pub fn scan(&self, mut read: impl FnMut(u32, usize) -> Option<Vec<u8>>) -> Option<Screen> {
         let (width, height) = self.size()?;
         let (h0, v0) = (self.global(BPCR) >> 16 & 0xFFF, self.global(BPCR) & 0x7FF);
@@ -336,6 +388,16 @@ mod tests {
         let Pixels::Indexed { indices, palette } = screen.pixels else { panic!("not indexed") };
         assert_eq!(indices, frame);
         assert_eq!(palette[7], 0x12_3456);
+    }
+
+    #[test]
+    fn a_layer_says_which_memory_it_scans() {
+        let scanned = doom(0x3000_0000).scanned();
+        assert_eq!(scanned.len(), 1);
+        let layer = &scanned[0];
+        assert_eq!((layer.address, layer.pitch, layer.width, layer.height, layer.format), (0x3000_0000, 320, 320, 200, Format::L8));
+        assert_eq!(layer.clut.as_ref().map(|c| c[7]), Some(0x12_3456));
+        assert!(Ltdc::default().scanned().is_empty(), "nothing scanned while the controller is off");
     }
 
     #[test]

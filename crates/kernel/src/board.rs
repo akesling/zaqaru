@@ -1174,6 +1174,35 @@ impl Board {
         )
     }
 
+    /// The memory the board's display controller scans out, as JSON: each
+    /// layer's frame — its address, a line's pitch in bytes, its width and
+    /// height in pixels, its format, and its colour lookup table as RGB in
+    /// base64, if it has one on — what shows memory that is a picture as
+    /// one, and says which pixel each of its bytes is.
+    pub fn scanned_json(&self) -> String {
+        let layers: Vec<String> = self
+            .machine
+            .scanned()
+            .iter()
+            .map(|layer| {
+                let clut = layer.clut.as_ref().map_or("null".into(), |clut| {
+                    let rgb: Vec<u8> = clut.iter().flat_map(|c| [(c >> 16) as u8, (c >> 8) as u8, *c as u8]).collect();
+                    format!(r#""{}""#, base64(&rgb))
+                });
+                format!(
+                    r#"{{"address":{},"pitch":{},"width":{},"height":{},"bytes":{},"format":"{}","clut":{clut}}}"#,
+                    layer.address,
+                    layer.pitch,
+                    layer.width,
+                    layer.height,
+                    layer.format.bytes(),
+                    layer.format.name()
+                )
+            })
+            .collect();
+        format!(r#"{{"layers":[{}]}}"#, layers.join(","))
+    }
+
     /// Gives the trace the tasks' stacks, from the board's archive, once
     /// for each archive: what says which task the core returns to.
     pub fn give_trace_the_stacks(&mut self, read: impl FnOnce(&[u8]) -> Result<Vec<u8>, crate::errno::Errno>) {

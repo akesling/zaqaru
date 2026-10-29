@@ -920,6 +920,14 @@ impl Machine {
         Some((screen, soc.ltdc.frames))
     }
 
+    /// The memory the LTDC's layers scan out: see [`ltdc::Ltdc::scanned`].
+    pub fn scanned(&self) -> Vec<ltdc::Scanned> {
+        match &self.bus.soc {
+            crate::bus::Soc::H7(soc) => soc.ltdc.scanned(),
+            crate::bus::Soc::G0(_) => Vec::new(),
+        }
+    }
+
     /// How many frames the panel on the LTDC has been shown: a number that
     /// moves when [`Machine::screen`] would show something new.
     pub fn frames_shown(&self) -> u64 {

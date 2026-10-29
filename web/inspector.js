@@ -23,6 +23,7 @@
 
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
 import { progressHtml } from "./progress.js";
+import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
 import { HOPS, byteOf, folded, follow, functionOf, next, ownerOf, placeOwner, span, stepsOf, summary } from "./trail.js";
 
 const MODES = [
@@ -68,6 +69,8 @@ export class Inspector {
     this.windows = new Map(); // the stories' windows run so far: see trail.js
     this.stories = []; // every story asked for, oldest first, to go back and forth among
     this.lit = null; // the step the pointer is on: its bytes outlined in the pictures
+    this.viewing = null; // { key, address, size, name, mode, width, offset }: bytes seen in their own form
+    this.scanned = null; // what the display controller scans out: `board/scanned`'s layers
     this.audit = null; // { back, answer | error | running }
     this.snapshot = null; // { stamp, owners: Map(owner → { statics, bytes }) }
     this.compared = null;
@@ -369,6 +372,11 @@ export class Inspector {
     const story = this.trail ? this.trailHtml() : "";
     box.innerHTML = `${head}${story}<div class="mem-views"><div class="mem-view">${body}</div>${this.sourceHtml()}</div>`;
     box.onmouseover = (event) => this.hovered(event);
+    box.onchange = (event) => {
+      if (!event.target.matches("[data-view-width]") || !this.viewing) return;
+      this.viewing.width = Number(event.target.value) || null;
+      this.draw(true);
+    };
     this.warm();
     const near = box.querySelector(".near");
     if (near && this.focusShown !== this.view.focus) {
@@ -376,6 +384,7 @@ export class Inspector {
       near.scrollIntoView({ block: "nearest" });
     }
     this.view.setArrows([...(this.arrows ?? []), ...this.storyArrows()]);
+    this.paintPicture();
   }
 
   scheduleText(doing) {
@@ -423,11 +432,12 @@ export class Inspector {
     const heat = node.address !== null && node.size && actions ? `<span class="heat" data-heat="${node.address},${node.address + node.size}"></span>` : "";
     const by = latest ? latest(node) : "";
     const act = actions
-      ? `<span class="acts"><a data-history="${e(key)}" title="every write to it over the window, from a re-execution watching it">history</a> <a data-why="${e(key)}" title="where its value came from: each copy and each write back to where it came in, from re-executions following every value">why</a></span>`
+      ? `<span class="acts"><a data-history="${e(key)}" title="every write to it over the window, from a re-execution watching it">history</a> <a data-why="${e(key)}" title="where its value came from: each copy and each write back to where it came in, from re-executions following every value">why</a>${node.bytes && node.size >= 16 ? ` <a data-view="${e(key)}" title="its bytes as a picture, hex or text: any of them a place to ask why">view</a>` : ""}</span>`
       : "";
     const near = this.view.focus !== null && depth === 0 && this.view.focus >= node.address && this.view.focus < node.address + node.size;
     let html = `<div class="mem-node${near ? " near" : ""}${node.unknown ? " unknown" : ""}" style="padding-left:${depth * 1.2}em" data-key="${e(key)}">${toggle}${heat}<span class="name">${e(depth ? node.name : node.name.split("::").slice(-2).join("::"))}</span><span class="ty">: ${e(node.typeName)}</span> = <span class="val">${e(node.value)}</span>${by}${act}</div>`;
     if (this.history?.key === key) html += this.historyHtml(node);
+    if (this.viewing?.key === key) html += this.viewHtml();
     if (open && parts) {
       for (const child of node.children) html += this.nodeHtml(child, `${key}/${child.name}`, depth + 1, actions, latest);
       if (node.more) html += `<div class="dim" style="padding-left:${(depth + 1) * 1.2}em">…${node.more} more of ${node.more + node.children.length}</div>`;
@@ -696,6 +706,115 @@ export class Inspector {
     return arrows;
   }
 
+  // ---- bytes in their own form -------------------------------------------------
+
+  /// Sees a run of bytes in its own form: see `views.js`.
+  async openView(key, address, size, name) {
+    if (this.viewing?.key === key) {
+      this.viewing = null;
+      return this.draw(true);
+    }
+    this.scanned = (await this.view.read("board/scanned").catch(() => null))?.layers ?? [];
+    const bytes = [];
+    for (let a = address; a < address + Math.min(size, 4096); a++) bytes.push(this.view.byteAt(a));
+    const layer = layerFor(this.scanned, address, size);
+    this.viewing = { key, address, size, name, mode: firstView(bytes, layer), width: null, offset: 0 };
+    this.draw(true);
+  }
+
+  /// The bytes being seen, as their view has them: a picture, hex or text.
+  viewHtml() {
+    const e = this.e;
+    const v = this.viewing;
+    const layer = layerFor(this.scanned, v.address, v.size);
+    const modes = [
+      ["picture", "picture"],
+      ["hex", "hex"],
+      ["text", "text"],
+    ]
+      .map(([mode, label]) => `<button type="button" data-view-mode="${mode}"${mode === v.mode ? ' class="on"' : ""}>${label}</button>`)
+      .join("");
+    const close = `<a data-close="viewing">close</a>`;
+    let body;
+    if (v.mode === "picture") {
+      const shape = shapeOf(layer, v.address, v.size, v.width);
+      const said = layer && !v.width ? `as the display scans it: ${shape.width}×${shape.height} ${shape.format}${shape.clut ? " through its colour table" : ""}` : `a byte a pixel, in grey`;
+      const widths = [32, 64, 128, 160, 240, 256, 320].map((w) => `<option value="${w}"${(layer ? v.width === w : w === shape.width) ? " selected" : ""}>${w}</option>`).join("");
+      body = `<div class="dim">${said} · <label>width <select data-view-width>${layer ? `<option value="">the display's</option>` : ""}${widths}</select></label> · click a pixel to ask where it came from</div><canvas class="mem-picture" width="${shape.width}" height="${shape.height}"></canvas><div class="dim mem-picture-readout">&nbsp;</div>`;
+    } else {
+      const page = 512;
+      const from = v.offset;
+      const to = Math.min(v.size, from + page);
+      let rows = "";
+      for (let row = from; row < to; row += 32) {
+        let cells = "";
+        for (let a = v.address + row; a < v.address + Math.min(row + 32, to); a++) {
+          const b = this.view.byteAt(a);
+          const shown = b === null ? "··" : v.mode === "hex" ? b.toString(16).padStart(2, "0") : b >= 0x20 && b < 0x7f ? e(String.fromCharCode(b)) : "·";
+          cells += `<span class="b" data-heat="${a},${a + 1}" data-trail="${a}" title="${e(`${v.name}[${a - v.address}] = ${b === null ? "?" : `0x${b.toString(16)}`}: click to ask where it came from`)}">${shown}</span>`;
+        }
+        rows += `<div><span class="addr">${row.toString(16).padStart(5, "0")}</span> ${cells}</div>`;
+      }
+      const nav = v.size > page ? ` · <button type="button" data-view-page="${from - page}" ${from > 0 ? "" : "disabled"}>‹</button> ${from}–${to - 1} of ${v.size} <button type="button" data-view-page="${from + page}" ${to < v.size ? "" : "disabled"}>›</button>` : "";
+      body = `<div class="dim">click a byte to ask where it came from${nav}</div><div class="mem-bytes mem-${v.mode}">${rows}</div>`;
+    }
+    return `<div class="mem-viewing"><div class="dim"><span class="controls">${modes}</span> ${e(v.name)} ${close}</div>${body}</div>`;
+  }
+
+  /// Paints the picture being seen, and makes each pixel a place to ask
+  /// about; the story's byte, if it is one of them, marked.
+  paintPicture() {
+    const canvas = this.box.querySelector(".mem-picture");
+    const v = this.viewing;
+    if (!canvas || !v) return;
+    const layer = layerFor(this.scanned, v.address, v.size);
+    const shape = shapeOf(layer, v.address, v.size, v.width);
+    const clut = clutBytes(shape.clut);
+    const g = canvas.getContext("2d");
+    const image = g.createImageData(shape.width, shape.height);
+    for (let y = 0; y < shape.height; y++) {
+      for (let x = 0; x < shape.width; x++) {
+        const at = addressOf(shape, x, y);
+        const inside = at >= v.address && at + shape.bytes <= v.address + v.size;
+        const bytes = [];
+        for (let i = 0; i < shape.bytes; i++) bytes.push(inside ? this.view.byteAt(at + i) : null);
+        const c = colour(shape.format, bytes, clut) ?? [40, 40, 48];
+        const p = 4 * (y * shape.width + x);
+        image.data.set([c[0], c[1], c[2], 255], p);
+      }
+    }
+    g.putImageData(image, 0, 0);
+    const marked = this.trail ? pixelOf(shape, this.trail.address) : null;
+    if (marked) {
+      g.strokeStyle = "#ff3df5";
+      g.lineWidth = 1;
+      g.strokeRect(marked.x - 2.5, marked.y - 2.5, 6, 6);
+    }
+    const scale = Math.max(1, Math.min(3, Math.floor(640 / shape.width)));
+    canvas.style.width = `${shape.width * scale}px`;
+    const pixel = (event) => {
+      const box = canvas.getBoundingClientRect();
+      const x = Math.floor(((event.clientX - box.left) / box.width) * shape.width);
+      const y = Math.floor(((event.clientY - box.top) / box.height) * shape.height);
+      const address = addressOf(shape, x, y);
+      return x >= 0 && y >= 0 && x < shape.width && y < shape.height && address >= v.address && address < v.address + v.size ? { x, y, address } : null;
+    };
+    const readout = this.box.querySelector(".mem-picture-readout");
+    canvas.onmousemove = (event) => {
+      const at = pixel(event);
+      if (!at || !readout) return;
+      const b = this.view.byteAt(at.address);
+      const [stamp, writer] = this.view.latestIn(at.address, at.address + 1);
+      const by = stamp ? ` · written <span data-ago="${stamp}"></span> by ${this.writerHtml(this.view.inspected?.writers[writer])}` : "";
+      readout.innerHTML = `(${at.x}, ${at.y}) = ${b === null ? "?" : `0x${b.toString(16).padStart(2, "0")}`} · 0x${at.address.toString(16)}${by}`;
+      this.warm();
+    };
+    canvas.onclick = (event) => {
+      const at = pixel(event);
+      if (at) this.readTrail(at.address, `${v.name} (${at.x}, ${at.y})`);
+    };
+  }
+
   auditHtml() {
     const e = this.e;
     const head = `<div class="dim">who wrote what, across the whole board, over the last <span class="controls">${this.backsHtml()}</span> <span class="controls"><button type="button" data-audit>${this.audit ? "audit again" : "audit"}</button></span></div>`;
@@ -824,6 +943,26 @@ export class Inspector {
     if (t("[data-retrail]")) {
       const [at, time] = t("[data-retrail]").dataset.retrail.split(",").map(Number);
       this.readTrail(at, null, { at, time });
+      return true;
+    }
+    if (t("[data-view]")) {
+      const target = nodeOf(t("[data-view]").dataset.view);
+      if (target) this.openView(target.key, target.address, target.size, target.name);
+      return true;
+    }
+    if (t("[data-view-raw]")) {
+      const [address, size] = t("[data-view-raw]").dataset.viewRaw.split(",").map(Number);
+      this.openView(`raw ${address}`, address, size, t("[data-view-raw]").dataset.name);
+      return true;
+    }
+    if (t("[data-view-mode]") && this.viewing) {
+      this.viewing.mode = t("[data-view-mode]").dataset.viewMode;
+      this.draw(true);
+      return true;
+    }
+    if (t("[data-view-page]") && this.viewing) {
+      this.viewing.offset = Math.max(0, Number(t("[data-view-page]").dataset.viewPage));
+      this.draw(true);
       return true;
     }
     if (t("[data-story]")) {

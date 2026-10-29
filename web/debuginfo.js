@@ -100,7 +100,8 @@ export const ELEMENTS = 64;
 /// `value` is a one-line rendering; `children` the parts, for what has
 /// them; `target` a pointer's address; `variant` the Rust enum's variant;
 /// `unknown` whether its bytes are not all known; `more` how many
-/// elements of an array are not shown.
+/// elements of an array are not shown; `bytes` whether it is an array of
+/// bytes, to be seen as a picture, hex or text.
 /// `describe(address)` names what a pointer points at, if it can.
 export function decode(types, id, address, byte, name = "", describe = () => null, budget = { nodes: NODES }) {
   budget.nodes--;
@@ -154,6 +155,7 @@ export function decode(types, id, address, byte, name = "", describe = () => nul
       const element = types.get(types.resolve(t.element));
       // Bytes read as bytes: hex, and as text when they are.
       if (element?.kind === "base" && element.size === 1 && element.enc !== "bool") {
+        node.bytes = true;
         const bytes = [];
         for (let i = 0; i < Math.min(t.count, 256); i++) bytes.push(byte(address + i));
         node.value = bytesText(bytes, t.count);

@@ -1133,7 +1133,7 @@ export class MemoryView {
       bytes += `<span class="b" data-heat="${a},${a + 1}" data-trail="${a}">${b === null ? "  " : b.toString(16).padStart(2, "0")}</span>`;
     }
     const more = st.size > shown ? `<span class="dim"> …${st.size - shown} more</span>` : "";
-    return `<div class="mem-static"><div class="mem-static-head"><span class="name" title="${e(st.name)}">${e(shortName(st.name))}</span> <span class="dim">0x${st.base.toString(16)} · ${st.size} B · untyped</span></div><div class="mem-bytes">${bytes}${more}</div></div>`;
+    return `<div class="mem-static"><div class="mem-static-head"><span class="name" title="${e(st.name)}">${e(shortName(st.name))}</span> <span class="dim">0x${st.base.toString(16)} · ${st.size} B · untyped</span>${st.size >= 16 ? ` <a data-view-raw="${st.base},${st.size}" data-name="${e(shortName(st.name))}" title="its bytes as a picture, hex or text: any of them a place to ask why">view</a>` : ""}</div><div class="mem-bytes">${bytes}${more}</div></div>`;
   }
 
   /// Shows `address`: its owner chosen, the inspector on it, and it
