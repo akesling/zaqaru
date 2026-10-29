@@ -12,6 +12,7 @@ test("a history's last step says where to go on, or that it ends", () => {
   assert.deepEqual(next(held(0x2400_0010, 0)), { end: "unwritten" });
   assert.deepEqual(next(held(0x2400_0010, 7, { code: "DMA" })), { end: "writer" });
   assert.deepEqual(next({ what: "held", addr: 0x9000_0000, ram: false }), { end: "rom" });
+  assert.deepEqual(next({ what: "held", addr: 0x4000_4c1c, ram: false }), { end: "bus" }, "a peripheral's status register");
   assert.deepEqual(next({ what: "read" }), { end: "bus" });
   assert.deepEqual(next({ what: "store" }), { end: "constant" });
   assert.deepEqual(next({ what: "register" }), { widen: true });

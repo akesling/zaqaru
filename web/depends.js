@@ -81,7 +81,7 @@ async function walk(graph, { query, update, wanted, budget, cache }) {
 /// element or how far in — `WAD lump COLORMAP`, `ZONE_AXI`, `USART3 RDR`.
 export function family(origin) {
   const leaf = origin.leaf;
-  if (origin.kind === "bus") return leaf.register ?? "a peripheral";
+  if (origin.kind === "bus") return leaf.register ?? (shortPlace(leaf.where ?? "").replace(/\s\+\s0x[0-9a-f]+.*$/, "") || "a peripheral");
   if (origin.kind === "constant") return `made in ${functionOf(leaf) || "the code"}`;
   const place = shortPlace(leaf.where ?? "");
   return place.replace(/(\[\d+\]|\s\+\s0x[0-9a-f]+|, entry \d+).*$/, "") || "somewhere";

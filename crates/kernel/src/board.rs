@@ -1583,6 +1583,62 @@ impl Board {
         format!(r#"{},"influences":[{}],"considered":{total}}}"#, &why[..why.len() - 1], leaves.join(","))
     }
 
+    /// Who made each byte of `[address, address + length)`, as JSON: along
+    /// each byte's own way back, the code that last stored it other than to
+    /// move it — a copy, a kernel's between tasks — or, made before the
+    /// window, the code whose write put it where it was then held. The
+    /// makers, each with its code and line, and runs of bytes `[offset,
+    /// length, maker]`, maker -1 for a byte whose maker is not known.
+    pub fn makers_json(&self, address: u32, length: u32, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
+        use crate::system::server::quoted;
+        use armv6m::provenance::What;
+        let Some(p) = &self.machine.provenance else {
+            return r#"{"following":false,"makers":[],"runs":[]}"#.to_string();
+        };
+        let mut moving = std::collections::HashMap::new();
+        let mut moves = |pc: u32| {
+            *moving.entry(pc).or_insert_with(|| {
+                let code = self.code_at(pc, map);
+                code.starts_with("kernel") || ["memcpy", "memmove", "copy_forward", "copy_backward", "compiler_builtins::mem"].iter().any(|n| code.contains(n))
+            })
+        };
+        let mut makers: Vec<u32> = Vec::new();
+        let mut runs: Vec<(u32, u32, i64)> = Vec::new();
+        for offset in 0..length.min(1 << 20) {
+            let mut maker = None;
+            for (_, node, _) in p.story(address.wrapping_add(offset), 32) {
+                match node.what {
+                    What::Store { .. } if !moves(node.pc) => maker = Some(node.pc),
+                    What::Held { written: Some(mark), .. } if mark.writer < armv6m::bus::BY_EXCEPTION && !moves(mark.writer) => maker = Some(mark.writer),
+                    _ => continue,
+                }
+                break;
+            }
+            let index = maker.map_or(-1, |pc| {
+                makers.iter().position(|&m| m == pc).unwrap_or_else(|| {
+                    makers.push(pc);
+                    makers.len() - 1
+                }) as i64
+            });
+            match runs.last_mut() {
+                Some((_, n, last)) if *last == index => *n += 1,
+                _ => runs.push((offset, 1, index)),
+            }
+        }
+        let makers: Vec<String> = makers
+            .iter()
+            .map(|&pc| {
+                format!(
+                    r#"{{"pc":{pc},"code":{},"lines":[{}]}}"#,
+                    quoted(&self.code_at(pc, map)),
+                    self.lines_at(pc, map, read).iter().map(dwarf::line_json).collect::<Vec<_>>().join(",")
+                )
+            })
+            .collect();
+        let runs: Vec<String> = runs.iter().map(|(o, n, m)| format!("[{o},{n},{m}]")).collect();
+        format!(r#"{{"following":true,"since_ns":{},"address":{address},"length":{length},"makers":[{}],"runs":[{}]}}"#, p.since / 1000, makers.join(","), runs.join(","))
+    }
+
     /// Follows the `length` bytes at `address` forward from the board's
     /// time `from`, in picoseconds: see
     /// `armv6m::Machine::follow_forward_from`.

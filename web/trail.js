@@ -33,6 +33,8 @@ export function next(last) {
     case "store":
       return { end: "constant" };
     case "held":
+      // A peripheral's register: a status, a counter — from outside too.
+      if (!last.ram && last.addr >= 0x4000_0000 && last.addr < 0x6000_0000) return { end: "bus" };
       if (!last.ram) return { end: "rom" };
       if (!last.written) return { end: "unwritten" };
       if (last.written.by?.pc === undefined) return { end: "writer" };

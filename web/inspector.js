@@ -47,6 +47,24 @@ const WRAPPERS = /^(core::mem::(maybe_uninit::)?|core::cell::|)(MaybeUninit|Manu
 const SERVED = 4096; // bytes a read of memory answers with
 const LOG = 16; // ring buffer entries shown, the latest
 
+/// A maker's colour: hues spread around the wheel, the first ones apart.
+function makerHue(i) {
+  return (i * 137.508) % 360;
+}
+function makerColour(i) {
+  return `hsl(${makerHue(i).toFixed(0)} 75% 55%)`;
+}
+/// As RGB for painting; dimmed when another maker is the one pointed at.
+function makerRgb(i, lit) {
+  const h = makerHue(i) / 60;
+  const c = 0.75 * (1 - Math.abs(2 * 0.55 - 1));
+  const x = c * (1 - Math.abs((h % 2) - 1));
+  const [r, g, b] = [[c, x, 0], [x, c, 0], [0, c, x], [0, x, c], [x, 0, c], [c, 0, x]][Math.floor(h) % 6];
+  const m = 0.55 - c / 2;
+  const dim = lit !== null && lit !== undefined && lit !== i ? 0.25 : 1;
+  return [r, g, b].map((v) => Math.round((v + m) * 255 * dim));
+}
+
 export class Inspector {
   /// `view` is the memory panel's `MemoryView`.
   constructor(view, box) {
@@ -299,7 +317,14 @@ export class Inspector {
     const groups = grouped(graph)
       .map((g) => {
         const families = g.families
-          .map((f) => `<li><details${g.families.length <= 2 ? " open" : ""}><summary><b>${e(f.name)}</b> <span class="dim">×${f.origins.length}</span></summary><ol>${f.origins.slice(0, 40).map(origin).join("")}</ol>${f.origins.length > 40 ? `<div class="dim">and ${f.origins.length - 40} more</div>` : ""}</details></li>`)
+          .map((f) => {
+            const runs = f.origins.map((o) => o.leaf.byte ?? o.leaf.addr).filter((a) => a !== undefined).map((a) => [a, 1]);
+            // How the value asked about came to depend on it: the writes
+            // between, newest first.
+            const chain = f.origins[0].node !== null ? pathTo(graph, f.origins[0].node) : [];
+            const how = chain.length > 1 ? `<div class="depends-how dim">${chain.map((n) => `<a data-goto="${n.at}" title="${e(n.what ?? "")}">${e(shortPlace(n.what ?? "").replace(/(\[\d+\]).*$/, "$1"))}</a>`).join(" ← ")} ← <b>${e(f.name)}</b></div>` : "";
+            return `<li><details${g.families.length <= 2 ? " open" : ""}><summary><b>${e(f.name)}</b> <span class="dim">×${f.origins.length}</span>${runs.length ? ` <a data-runs='${e(JSON.stringify(runs))}' title="outline them in the pictures">show</a>` : ""}</summary>${how}<ol>${f.origins.slice(0, 40).map(origin).join("")}</ol>${f.origins.length > 40 ? `<div class="dim">and ${f.origins.length - 40} more</div>` : ""}</details></li>`;
+          })
           .join("");
         return `<div class="depends-kind"><div class="depends-label">${e(g.label)}</div><ul>${families}</ul></div>`;
       })
@@ -917,7 +942,8 @@ export class Inspector {
       const shape = shapeOf(layer, v.address, v.size, v.width);
       const said = layer && !v.width ? `as the display scans it: ${shape.width}×${shape.height} ${shape.format}${shape.clut ? " through its colour table" : ""}` : `a byte a pixel, in grey`;
       const widths = [32, 64, 128, 160, 240, 256, 320].map((w) => `<option value="${w}"${(layer ? v.width === w : w === shape.width) ? " selected" : ""}>${w}</option>`).join("");
-      body = `<div class="dim">${said} · <label>width <select data-view-width>${layer ? `<option value="">the display's</option>` : ""}${widths}</select></label> · click a pixel to ask where it came from</div><canvas class="mem-picture" width="${shape.width}" height="${shape.height}"></canvas><div class="dim mem-picture-readout">&nbsp;</div>`;
+      const colouring = `<span class="controls"><button type="button" data-view-colour="value"${v.colour !== "makers" ? ' class="on"' : ""}>as it is</button><button type="button" data-view-colour="makers"${v.colour === "makers" ? ' class="on"' : ""} title="each byte coloured by the code that made it, past the copies that moved it">who made it</button></span>`;
+      body = `<div class="dim">${colouring} ${said} · <label>width <select data-view-width>${layer ? `<option value="">the display's</option>` : ""}${widths}</select></label> · click a pixel to ask where it came from</div><canvas class="mem-picture" width="${shape.width}" height="${shape.height}"></canvas><div class="dim mem-picture-readout">&nbsp;</div>${v.colour === "makers" ? this.makersHtml() : ""}`;
     } else {
       const page = 512;
       const from = v.offset;
@@ -938,6 +964,50 @@ export class Inspector {
     return `<div class="mem-viewing"><div class="dim"><span class="controls">${modes}</span> ${e(v.name)} ${close}</div>${body}</div>`;
   }
 
+  /// Who made each byte being seen: a re-execution following everything
+  /// over the 40 ms before the last write to them — a frame's drawing and
+  /// its copy — and `board/makers` of them.
+  async readMakers() {
+    const v = this.viewing;
+    if (!v) return;
+    const [stamp] = this.view.latestIn(v.address, v.address + v.size);
+    if (!stamp) return;
+    const time = stamp * 1e6;
+    const makers = { running: true };
+    v.makers = makers;
+    this.draw(true);
+    try {
+      makers.answer = await this.view.query({ time, follow: { from: Math.max(0, time - 4e10) } }, `board/makers/${v.address}/${v.size}`, (p) => this.progressed("makers", makers, p));
+      // A byte by byte map of maker, for painting.
+      const of = new Int16Array(v.size).fill(-1);
+      for (const [offset, length, maker] of makers.answer.runs ?? []) of.fill(maker, offset, offset + length);
+      makers.of = of;
+      makers.counts = (makers.answer.makers ?? []).map((_, i) => of.reduce((n, m) => n + (m === i), 0));
+    } catch (why) {
+      makers.error = String(why);
+    }
+    makers.running = false;
+    if (this.viewing === v) this.draw(true);
+  }
+
+  makersHtml() {
+    const e = this.e;
+    const m = this.viewing.makers;
+    if (!m) return "";
+    if (m.running) return `<div class="dim">following everything over the frame's 40 ms, for who made each byte</div><div data-progress="makers">${progressHtml(m.progress)}</div>`;
+    if (m.error) return `<div class="dim">${e(m.error)}</div>`;
+    const list = (m.answer?.makers ?? [])
+      .map((maker, i) => ({ maker, i, count: m.counts[i] }))
+      .sort((a, b) => b.count - a.count)
+      .map(({ maker, i, count }) => {
+        const line = lineOf(maker);
+        return `<li data-maker="${i}"><span class="swatch" style="background:${makerColour(i)}"></span> <b>${e(functionOf(maker))}</b> ${line?.file ? this.lineLink(line) : ""} <span class="dim">${count} bytes</span></li>`;
+      })
+      .join("");
+    const unknown = m.of ? m.of.reduce((n, x) => n + (x < 0), 0) : 0;
+    return `<ul class="makers">${list}${unknown ? `<li><span class="swatch" style="background:#333"></span> <span class="dim">made before the window: ${unknown} bytes</span></li>` : ""}</ul>`;
+  }
+
   /// Paints the picture being seen, and makes each pixel a place to ask
   /// about; the story's byte, if it is one of them, marked.
   paintPicture() {
@@ -955,7 +1025,8 @@ export class Inspector {
         const inside = at >= v.address && at + shape.bytes <= v.address + v.size;
         const bytes = [];
         for (let i = 0; i < shape.bytes; i++) bytes.push(inside ? this.view.byteAt(at + i) : null);
-        const c = colour(shape.format, bytes, clut) ?? [40, 40, 48];
+        const maker = v.colour === "makers" && v.makers?.of && inside ? v.makers.of[at - v.address] : null;
+        const c = maker !== null && maker !== undefined ? (maker < 0 ? [51, 51, 51] : makerRgb(maker, this.litMaker)) : colour(shape.format, bytes, clut) ?? [40, 40, 48];
         const p = 4 * (y * shape.width + x);
         image.data.set([c[0], c[1], c[2], 255], p);
       }
@@ -1072,6 +1143,12 @@ export class Inspector {
   }
 
   hovered(event) {
+    const maker = event.target.closest("[data-maker]");
+    const litMaker = maker ? Number(maker.dataset.maker) : null;
+    if (litMaker !== this.litMaker) {
+      this.litMaker = litMaker;
+      this.paintPicture();
+    }
     const lit = event.target.closest("[data-lit]");
     const address = lit ? Number(lit.dataset.lit) : null;
     if (address !== this.lit) {
@@ -1147,6 +1224,12 @@ export class Inspector {
     if (t("[data-view-raw]")) {
       const [address, size] = t("[data-view-raw]").dataset.viewRaw.split(",").map(Number);
       this.openView(`raw ${address}`, address, size, t("[data-view-raw]").dataset.name);
+      return true;
+    }
+    if (t("[data-view-colour]") && this.viewing) {
+      this.viewing.colour = t("[data-view-colour]").dataset.viewColour;
+      if (this.viewing.colour === "makers" && !this.viewing.makers) this.readMakers();
+      else this.draw(true);
       return true;
     }
     if (t("[data-view-mode]") && this.viewing) {
