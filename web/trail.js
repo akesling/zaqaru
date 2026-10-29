@@ -180,10 +180,20 @@ export function originText(trail) {
   }
 }
 
+/// A place as a story says it: the static and what in it, without whose
+/// it is (said beside it), the memory's own name (said on hover) or the
+/// modules it is in — `ZONE_AXI[55416]`, `WAD lump COLORMAP + 0x165b: …`.
+export function shortPlace(where) {
+  return (where ?? "")
+    .replace(/^[\w-]+ (\.[\w.]+|stack|code): /, "")
+    .replace(/ \([A-Za-z][\w ]*( \+ 0x[0-9a-f]+)?\)$/, "")
+    .replace(/\b(\w+::)+/g, "");
+}
+
 /// One of the values an address was worked out from, in a few words: its
 /// value and where it was.
 export function leafText(leaf) {
-  const where = (leaf.where ?? "").replace(/^[\w-]+ [.\w]+: /, "").replace(/ \((.*)\)$/, "").replace(/\b(\w+::)+/g, "");
+  const where = shortPlace(leaf.where);
   switch (leaf.what) {
     case "held":
       return `${byteOf(leaf) === null ? "" : `0x${byteOf(leaf).toString(16)} `}from ${where}`;

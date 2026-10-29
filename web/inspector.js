@@ -24,7 +24,7 @@
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
 import { progressHtml } from "./progress.js";
 import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
-import { HOPS, byteOf, folded, follow, functionOf, leafText, next, ownerOf, placeOwner, span, stepsOf, summary } from "./trail.js";
+import { HOPS, byteOf, folded, follow, functionOf, leafText, next, ownerOf, placeOwner, shortPlace, span, stepsOf, summary } from "./trail.js";
 
 const MODES = [
   ["variables", "variables"],
@@ -271,7 +271,7 @@ export class Inspector {
 
   /// The places a value reached, as runs to outline: `[address, length]`.
   reachRuns() {
-    return (this.reach?.answer?.shown ?? []).map((r) => [r.addr, r.length]);
+    return (this.reach?.answer?.went ?? this.reach?.answer?.shown ?? []).map((r) => [r.addr, r.length]);
   }
 
   reachHtml() {
@@ -293,18 +293,25 @@ export class Inspector {
     else if (!r.answer?.following) body = `<div class="dim">nothing followed: no board at the checkpoint it began from</div>`;
     else {
       const a = r.answer;
-      const short = (where) => (where ?? "").replace(/ \((.*)\)$/, "").replace(/\b(\w+::)+/g, "");
-      const rows = a.shown
+      const went = a.went ?? a.shown;
+      const ownerOfRun = (run) => /^([\w-]+) (\.[\w.]+|stack)/.exec(run.where ?? "")?.[1];
+      const rows = went
         .map((run) => {
-          const owner = /^([\w-]+) (\.[\w.]+|stack)/.exec(run.where ?? "")?.[1];
+          const owner = ownerOfRun(run);
           const line = run.lines?.[0];
           const by = line?.file ? `${e((line.function ?? "").replace(/^.*::/, ""))} ${this.lineLink(line)}` : e(run.code ?? "");
-          return `<li data-lit="${run.addr}"><a data-goto="${run.addr}">${e(short(run.where).replace(/^[\w-]+ [.\w]+: /, ""))}</a>${owner ? ` ${this.ownerChip(owner)}` : ""}${run.length > 1 ? ` <span class="dim">${run.length} bytes</span>` : ""} <span class="dim">by</span> ${by}</li>`;
+          const when = run.t !== null && run.t !== undefined ? ` <a class="dim when" data-stand="${Math.floor(run.t / 1000) + 1}" title="stand the board here">${span(run.t * 1000 - r.from)} after</a>` : "";
+          const still = run.still === undefined ? "" : run.still ? ` <span class="chip" style="--chip:#2da44e">still there</span>` : ` <span class="dim">since overwritten</span>`;
+          return `<li data-lit="${run.addr}"><a data-goto="${run.addr}">${e(shortPlace(run.where))}</a>${owner ? ` ${this.ownerChip(owner)}` : ""}${run.length > 1 ? ` <span class="dim">${run.length} bytes</span>` : ""} <span class="dim">by</span> ${by}${when}${run.writes > 1 ? ` <span class="dim">×${run.writes}</span>` : ""}${still}</li>`;
         })
         .join("");
-      const owners = [...new Set(a.shown.map((run) => /^([\w-]+) (\.[\w.]+|stack)/.exec(run.where ?? "")?.[1]).filter(Boolean))];
-      const said = a.bytes ? `It reached ${a.bytes} byte${a.bytes === 1 ? "" : "s"} in ${a.runs} place${a.runs === 1 ? "" : "s"}${owners.length ? `, in ${owners.join(", ")}` : ""}, still there at the end of the window.` : "Nothing holds anything made of it at the end of the window: what it went into was overwritten, or it went nowhere.";
-      body = `<div class="story-summary">${e(said)}</div>${rows ? `<ol class="story-steps">${rows}</ol>` : ""}${a.runs > a.shown.length ? `<div class="dim">and ${a.runs - a.shown.length} more places</div>` : ""}`;
+      const owners = [...new Set(went.map(ownerOfRun).filter(Boolean))];
+      const places = a.places ?? a.runs;
+      const still = went.filter((run) => run.still).length;
+      const said = places
+        ? `It went to ${places} place${places === 1 ? "" : "s"}${owners.length ? ` in ${owners.join(", ")}` : ""}; ${still ? `${still} still hold${still === 1 ? "s" : ""} it` : "none still holds it"} at the end of the window.`
+        : "Nothing was made of it in the window: it went nowhere.";
+      body = `<div class="story-summary">${e(said)}</div>${rows ? `<ol class="story-steps">${rows}</ol>` : ""}${places > went.length ? `<div class="dim">and ${places - went.length} more places</div>` : ""}`;
     }
     return `<div class="mem-story mem-reach">${head}${body}</div>`;
   }
@@ -414,6 +421,24 @@ export class Inspector {
     const box = this.box;
     const shape = [this.view.inspected?.id, this.mode, this.view.selected, this.view.focus, [...this.open].join(","), this.source && JSON.stringify(this.source), this.back].join("|");
     if (!force && box.shape === shape && box.firstChild) return this.warm();
+    // While the pointer is on it, what it shows holds still — a live board
+    // writes on, and a redraw would take the link pointed at away — and is
+    // brought up to date once the pointer leaves.
+    if (!force && this.held && box.firstChild) {
+      this.stale = true;
+      return this.warm();
+    }
+    if (!box.onmouseenter) {
+      box.onmouseenter = () => (this.held = true);
+      box.onmouseleave = () => {
+        this.held = false;
+        if (this.stale) {
+          this.stale = false;
+          this.draw();
+        }
+      };
+    }
+    this.stale = false;
     box.shape = shape;
     const e = this.e;
     const owner = this.view.selected;
@@ -492,7 +517,7 @@ export class Inspector {
     const heat = node.address !== null && node.size && actions ? `<span class="heat" data-heat="${node.address},${node.address + node.size}"></span>` : "";
     const by = latest ? latest(node) : "";
     const act = actions
-      ? `<span class="acts"><a data-history="${e(key)}" title="every write to it over the window, from a re-execution watching it">history</a> <a data-why="${e(key)}" title="where its value came from: each copy and each write back to where it came in, from re-executions following every value">why</a>${node.bytes && node.size >= 16 ? ` <a data-view="${e(key)}" title="its bytes as a picture, hex or text: any of them a place to ask why">view</a>` : ""}</span>`
+      ? `<span class="acts"><a data-history="${e(key)}" title="every write to it over the window, from a re-execution watching it">history</a> <a data-why="${e(key)}" title="where its value came from: each copy and each write back to where it came in, from re-executions following every value">why</a>${(node.bytes || depth === 0) && node.size >= 16 ? ` <a data-view="${e(key)}" title="its bytes as a picture, hex or text: any of them a place to ask why">view</a>` : ""}</span>`
       : "";
     const near = this.view.focus !== null && depth === 0 && this.view.focus >= node.address && this.view.focus < node.address + node.size;
     let html = `<div class="mem-node${near ? " near" : ""}${node.unknown ? " unknown" : ""}" style="padding-left:${depth * 1.2}em" data-key="${e(key)}">${toggle}${heat}<span class="name">${e(depth ? node.name : node.name.split("::").slice(-2).join("::"))}</span><span class="ty">: ${e(node.typeName)}</span> = <span class="val">${e(node.value)}</span>${by}${act}</div>`;
@@ -668,7 +693,7 @@ export class Inspector {
     const byte = (n) => `0x${n.toString(16).padStart(2, "0")}`;
     // A place: its static and offset, whose memory it is beside it; the
     // memory's own name on hover.
-    const short = (where) => (where ?? "").replace(/^[\w-]+ [.\w]+: /, "").replace(/ \((.*)\)$/, "").replace(/\b(\w+::)+/g, "");
+    const short = shortPlace;
     const place = (step) => {
       const address = step.byte ?? step.addr;
       const owner = placeOwner(step);

@@ -1,7 +1,7 @@
 // Checks `trail.js` under Node: node --test web/trail.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW, byteOf, folded, follow, functionOf, isPlumbing, leafText, next, ownerOf, placeOwner, span, summary } from "./trail.js";
+import { WINDOW, byteOf, folded, follow, functionOf, isPlumbing, leafText, next, shortPlace, ownerOf, placeOwner, span, summary } from "./trail.js";
 
 const by = { pc: 0x0800_1234, code: "doom: R_DrawColumn" };
 const held = (addr, stamp, writer = by) => ({ what: "held", addr, ram: true, written: stamp ? { stamp, by: writer } : null });
@@ -123,4 +123,10 @@ test("a value looked up in a table says what chose it", () => {
   assert.equal(leafText(texel), "0x6a from ZONE_AXI[36864]");
   const trail = { hops: [{ steps: [copied, drawn, lookup, entry] }], end: { kind: "rom", step: entry } };
   assert.match(summary(trail), /was stored by V_DrawPatch \(v_video.c:189\) in doom, looked up by 0x6a from ZONE_AXI\[36864\], and was copied once/);
+});
+
+test("a place is said short, keeping what its lump's format says", () => {
+  assert.equal(shortPlace("doom .uninit: task_doom::ZONE_AXI[55416] (AXI SRAM + 0x5941c)"), "ZONE_AXI[55416]");
+  assert.equal(shortPlace("the NOR: WAD lump SW11_2 + 0xa7a: picture 32×128, pixel (12, 70)"), "the NOR: WAD lump SW11_2 + 0xa7a: picture 32×128, pixel (12, 70)");
+  assert.equal(shortPlace("i2c_driver stack (AXI SRAM + 0xd3ea)"), "i2c_driver stack");
 });

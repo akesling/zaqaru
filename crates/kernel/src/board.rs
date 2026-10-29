@@ -1587,12 +1587,53 @@ impl Board {
                 format!(r#"{{"addr":{start},"length":{length},"where":{},{by}}}"#, quoted(&self.describe_typed(start, map, read)))
             })
             .collect();
+        // And every place it went on the way, still there or not: each
+        // store of something made of it, runs of them by the code that
+        // stored, first when.
+        let mut stores: Vec<(u32, u32, u32, u64)> = p
+            .nodes
+            .iter()
+            .filter_map(|node| match node.what {
+                armv6m::provenance::What::Store { addr, size, .. } => Some((node.pc, addr, size, node.time)),
+                _ => None,
+            })
+            .collect();
+        stores.sort_unstable_by_key(|&(pc, addr, ..)| (pc, addr));
+        let mut went: Vec<(u32, u32, u32, u64, u64)> = Vec::new(); // (pc, start, end, first, writes)
+        for (pc, addr, size, time) in stores {
+            match went.last_mut() {
+                Some((last, _, end, first, writes)) if *last == pc && addr <= *end => {
+                    *end = (*end).max(addr + size);
+                    *first = (*first).min(time);
+                    *writes += 1;
+                }
+                _ => went.push((pc, addr, addr + size, time, 1)),
+            }
+        }
+        went.sort_unstable_by_key(|&(_, _, _, first, _)| first);
+        let total = went.len();
+        let went: Vec<String> = went
+            .into_iter()
+            .take(limit)
+            .map(|(pc, start, end, first, writes)| {
+                let still = (start..end).any(|a| p.memory.contains_key(&a));
+                format!(
+                    r#"{{"addr":{start},"length":{},"t":{},"writes":{writes},"still":{still},"where":{},"code":{},"lines":[{}]}}"#,
+                    end - start,
+                    first / 1000,
+                    quoted(&self.describe_typed(start, map, read)),
+                    quoted(&self.code_at(pc, map)),
+                    self.lines_at(pc, map, read).iter().map(dwarf::line_json).collect::<Vec<_>>().join(",")
+                )
+            })
+            .collect();
         format!(
-            r#"{{"following":true,"since_ns":{},"bytes":{},"runs":{},"shown":[{}]}}"#,
+            r#"{{"following":true,"since_ns":{},"bytes":{},"runs":{},"shown":[{}],"places":{total},"went":[{}]}}"#,
             p.since / 1000,
             bytes.len(),
             runs.len(),
-            shown.join(",")
+            shown.join(","),
+            went.join(",")
         )
     }
 
