@@ -180,6 +180,9 @@ pub struct Debug {
     pub statics: Vec<Static>,
 }
 
+/// Types that only hold another, whose own fields a name leaves out.
+const WRAPPERS: [&str; 8] = ["MaybeUninit<", "ManuallyDrop<", "UnsafeCell<", "SyncUnsafeCell<", "Cell<", "RefCell<", "StaticCell<", "UninitCell<"];
+
 fn fail(why: gimli::Error) -> String {
     format!("DWARF: {why}")
 }
@@ -330,6 +333,49 @@ impl Debug {
             Type::Struct { fields, .. } => fields.iter().find(|f| f.name == name).map(|f| (f.offset, f.ty)),
             _ => None,
         }
+    }
+
+    /// An address in one of the statics, named down its type: the static's
+    /// own name without its modules, then each element and field the
+    /// address is in — `HUBRIS_TASK_TABLE_SPACE[3].save.r4`,
+    /// `FRAME_SHOWN[40]` — with whatever is left over as an offset into the
+    /// last. A wrapper's own field (`MaybeUninit`'s `value`, a newtype's
+    /// `__0`) says nothing and is left out. `None` outside every static.
+    pub fn place_of(&self, address: u32) -> Option<String> {
+        let at = self.statics.partition_point(|s| s.address <= address).checked_sub(1)?;
+        let st = self.statics[..=at].iter().rev().find(|s| address >= s.address && address - s.address < s.size.max(1))?;
+        let mut name = st.name.rsplit("::").next().unwrap_or(&st.name).to_string();
+        let (mut offset, mut id) = (address - st.address, st.ty);
+        for _ in 0..16 {
+            id = self.resolve(id);
+            match self.ty(id) {
+                Some(Type::Array { element, stride, count, .. }) if stride > 0 && offset < stride.saturating_mul(count) => {
+                    name += &format!("[{}]", offset / stride);
+                    offset %= stride;
+                    id = element;
+                }
+                Some(Type::Struct { name: ty, fields, variants: None, .. }) => {
+                    let Some(field) = fields
+                        .iter()
+                        .filter(|f| f.offset <= offset && offset - f.offset < self.size(f.ty).max(1) && self.size(f.ty) > 0)
+                        .last()
+                    else {
+                        break;
+                    };
+                    let wrapper = WRAPPERS.iter().any(|w| ty.starts_with(w)) || (fields.len() == 1 && field.name.starts_with("__"));
+                    if !wrapper {
+                        name += &format!(".{}", field.name.trim_start_matches("__"));
+                    }
+                    offset -= field.offset;
+                    id = field.ty;
+                }
+                _ => break,
+            }
+        }
+        if offset > 0 {
+            name += &format!(" + {offset:#x}");
+        }
+        Some(name)
     }
 
     /// The static whose name is `name` or ends `::name`.

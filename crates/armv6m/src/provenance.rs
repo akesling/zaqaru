@@ -69,6 +69,10 @@ pub enum What {
     Held { addr: u32, size: u32, value: u32, written: Option<Mark> },
     /// Following everything: what register `n` held as following began.
     Register { n: u8, value: u32 },
+    /// A value loaded from `addr`, an address worked out from other
+    /// values: the loaded value's history the first parent, the address's
+    /// the second — what chose which entry of a table was read.
+    Load { addr: u32 },
 }
 
 /// A node's number, from 1; 0 is untagged.
@@ -81,6 +85,9 @@ pub struct Provenance {
     pub since: u64,
     /// Whether everything is followed, not only what came in off a bus.
     pub everything: bool,
+    /// Whether only some bytes are followed, forward: what comes in off a
+    /// bus is then no origin.
+    pub seeded: bool,
     pub regs: [Tag; 16],
     /// By byte address; an address not here is untagged.
     pub memory: HashMap<u32, Tag>,
@@ -103,6 +110,18 @@ impl Provenance {
         let mut p = Provenance { since, everything: true, ..Provenance::default() };
         for (n, &value) in regs.iter().enumerate() {
             p.regs[n] = p.add(Node { what: What::Register { n: n as u8, value }, pc: regs[15], time: since, parents: [0, 0] });
+        }
+        p
+    }
+
+    /// Following the bytes at `address`, holding `values`, forward from
+    /// `since`: one origin for them all, and nothing else.
+    pub fn seeded(since: u64, address: u32, values: &[u8], pc: u32) -> Provenance {
+        let mut p = Provenance { since, seeded: true, ..Provenance::default() };
+        let value = values.iter().take(4).enumerate().fold(0u32, |v, (i, &b)| v | u32::from(b) << (8 * i));
+        let tag = p.add(Node { what: What::Held { addr: address, size: values.len() as u32, value, written: None }, pc, time: since, parents: [0, 0] });
+        for i in 0..values.len() as u32 {
+            p.memory.insert(address.wrapping_add(i), tag);
         }
         p
     }
@@ -164,14 +183,23 @@ impl Provenance {
 
     /// A load the instruction made: `data_register` when it read a
     /// peripheral's data register, which is an origin; `written`, the last
-    /// write to what it read, if RAM.
-    pub(crate) fn loaded(&mut self, addr: u32, size: u32, value: u32, data_register: bool, written: Option<Mark>, pc: u32, time: u64) {
-        let tag = if data_register {
+    /// write to what it read, if RAM; `address`, the registers its address
+    /// was made of, a bit each.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loaded(&mut self, addr: u32, size: u32, value: u32, data_register: bool, written: Option<Mark>, address: u16, pc: u32, time: u64) {
+        let mut tag = if data_register && !self.seeded {
             self.add(Node { what: What::Read { addr, value }, pc, time, parents: [0, 0] })
         } else {
             self.hold(addr, size, value, written, pc, time);
             self.of_memory(addr, size, pc, time)
         };
+        // Where it was read from, if that was worked out from values
+        // followed: the stack pointer's and the pc's say nothing of which.
+        let from: Vec<Tag> = (0..13).filter(|n| address & 1 << n != 0).map(|n| self.regs[n]).collect();
+        let from = self.union(from, pc, time);
+        if from != 0 && from != tag && tag != 0 {
+            tag = self.add(Node { what: What::Load { addr }, pc, time, parents: [tag, from] });
+        }
         self.loads.push((value & mask(size), size, tag));
     }
 
@@ -251,12 +279,42 @@ impl Provenance {
                     lane = 0;
                     out.push((tag, node, byte));
                 }
+                What::Load { addr } => out.push((tag, node, addr.wrapping_add(lane))),
                 _ => out.push((tag, node, byte)),
             }
             if out.len() >= depth {
                 break;
             }
             tag = next;
+        }
+        out
+    }
+
+    /// Where the values a node was made of came in, past copies and
+    /// merges and the lanes of bytes loaded together: the origins — what was
+    /// held since before the window, read off a bus, in a register, or made
+    /// by the code — at most `most`, each once. Not through the addresses
+    /// loads were made from: those are their own question.
+    pub fn origins(&self, tag: Tag, most: usize) -> Vec<(Tag, &Node)> {
+        let mut out: Vec<(Tag, &Node)> = Vec::new();
+        let mut queue = std::collections::VecDeque::from([tag]);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(at) = queue.pop_front() {
+            if out.len() >= most || seen.len() > 4096 {
+                break;
+            }
+            if at == 0 || !seen.insert(at) {
+                continue;
+            }
+            let Some(node) = self.node(at) else { continue };
+            match node.what {
+                What::Bytes { lanes, .. } => queue.extend(lanes),
+                What::Merge => queue.extend(node.parents),
+                What::Load { .. } => queue.push_back(node.parents[0]),
+                What::Store { .. } if node.parents[0] != 0 => queue.push_back(node.parents[0]),
+                What::Register { n: 13 | 15, .. } => {}
+                _ => out.push((at, node)),
+            }
         }
         out
     }

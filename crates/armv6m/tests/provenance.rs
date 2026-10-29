@@ -175,9 +175,10 @@ fn following_everything_ends_every_history_where_it_came_in() {
     run(&mut m);
     let p = m.provenance.as_ref().expect("following began");
     assert!(p.everything && p.since >= from);
+    // The value's own way, past the loads' addresses.
     let what = |addr: u32| -> Vec<What> {
         let tag = *p.memory.get(&addr).unwrap_or_else(|| panic!("{addr:#x} is tagged"));
-        p.history(tag, 8).iter().map(|(_, node)| node.what).collect()
+        p.history(tag, 8).iter().map(|(_, node)| node.what).filter(|w| !matches!(w, What::Load { .. })).collect()
     };
     // The copy: from the byte held since before, with the write that put it there.
     let copy = what(0x2400_0200);
@@ -235,7 +236,9 @@ table:
     m.follow_everything_from(m.time + 1);
     run(&mut m);
     let p = m.provenance.as_ref().unwrap();
-    let story = |address: u32| -> Vec<(What, u32)> { p.story(address, 8).iter().map(|&(_, node, byte)| (node.what, byte)).collect() };
+    let story = |address: u32| -> Vec<(What, u32)> {
+        p.story(address, 8).iter().map(|&(_, node, byte)| (node.what, byte)).filter(|(w, _)| !matches!(w, What::Load { .. })).collect()
+    };
     let flash = story(0x2400_0202);
     assert!(matches!(flash[0], (What::Store { addr: 0x2400_0200, size: 4, .. }, 0x2400_0202)), "{flash:?}");
     assert!(matches!(flash[1], (What::Store { addr: 0x2400_0102, size: 1, value: 0xC4 }, 0x2400_0102)), "{flash:?}");
@@ -245,4 +248,67 @@ table:
     assert!(matches!(register[2], (What::Register { n: 2, value: 0x33 }, _)), "{register:?}");
     let constant = story(0x2400_0203);
     assert!(matches!(constant[..], [_, (What::Store { addr: 0x2400_0103, value: 7, .. }, _)]), "{constant:?}");
+}
+
+#[test]
+fn a_value_looked_up_in_a_table_leads_to_the_index_that_chose_it() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100      @ a table
+    movs r1, #0x5A
+    strb r1, [r3, #2]        @ its third entry
+    ldr r4, =0x24000180      @ where the index is kept
+    movs r1, #2
+    strb r1, [r4]
+begin:
+    ldrb r5, [r4]            @ the index, held since before
+    ldrb r6, [r3, r5]        @ the entry it chooses
+    ldr r7, =0x24000200
+    strb r6, [r7]
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 6), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let story = p.story(0x2400_0200, 8);
+    let load = story.iter().find_map(|&(_, node, _)| match node.what {
+        What::Load { addr } => Some((addr, node.parents[1])),
+        _ => None,
+    });
+    let (addr, address) = load.expect("the lookup is a step of the story");
+    assert_eq!(addr, 0x2400_0102);
+    assert!(matches!(story.last().unwrap().1.what, What::Held { addr: 0x2400_0102, value: 0x5A, .. }), "the entry, held since before");
+    let origins: Vec<What> = p.origins(address, 8).iter().map(|(_, node)| node.what).collect();
+    assert!(origins.iter().any(|w| matches!(w, What::Held { addr: 0x2400_0180, value: 2, .. })), "the index: {origins:?}");
+}
+
+#[test]
+fn bytes_followed_forward_tag_whatever_is_made_of_them() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100
+    movs r1, #0x21
+    strb r1, [r3]            @ the byte to follow
+    nop
+begin:
+    ldrb r4, [r3]
+    adds r4, #1              @ made into something else
+    ldr r6, =0x24000200
+    strb r4, [r6]            @ where it went
+    movs r5, #9
+    strb r5, [r6, #1]        @ beside it, from nowhere it was
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 4), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_forward_from(probe.time, 0x2400_0100, 1);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    assert!(p.seeded);
+    assert!(p.memory.contains_key(&0x2400_0200), "what was made of it is tagged");
+    assert!(!p.memory.contains_key(&0x2400_0201), "what was not is not");
 }

@@ -104,3 +104,16 @@ fn an_instruction_s_line_names_its_file_and_function() {
     assert_eq!(outer.file.as_deref(), Some("/hubris/drv/stm32xx-i2c-server/src/main.rs"));
     assert!(d.files().iter().any(|f| f == "/hubris/drv/stm32xx-i2c-server/src/main.rs"));
 }
+
+#[test]
+fn an_address_is_named_down_its_static_s_type() {
+    let Some(archive) = archive() else { return };
+    let kernel = debug(&archive, "kernel");
+    let table = TaskTable::of(&kernel).expect("the task table");
+    let name = kernel.place_of(table.base + 3 * table.stride + 8).expect("inside the table");
+    assert!(name.starts_with("HUBRIS_TASK_TABLE_SPACE[3]."), "a field of the fourth task, not MaybeUninit's: {name}");
+    assert!(!name.contains("value"), "{name}");
+    let space = kernel.static_named("HUBRIS_TASK_TABLE_SPACE").unwrap();
+    assert_eq!(kernel.place_of(space.address + 1).as_deref().map(|n| n.starts_with("HUBRIS_TASK_TABLE_SPACE[0]")), Some(true));
+    assert!(kernel.place_of(0x1000).is_none(), "nothing there");
+}

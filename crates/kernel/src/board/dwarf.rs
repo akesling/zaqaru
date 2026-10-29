@@ -52,6 +52,21 @@ impl Board {
         Some(debug)
     }
 
+    /// What an address is, as [`Board::describe`] says it, with the
+    /// static it is in named down its type from the DWARF of whoever's
+    /// memory it is: `display .frame: FRAME_SHOWN[40] (SRAM4 + 0x28)`.
+    pub fn describe_typed(&self, address: u32, map: Option<&Result<Image, String>>, read: ReadFile) -> String {
+        let plain = self.describe(address, map);
+        let Some(place) = map.and_then(|m| m.as_ref().ok()).and_then(|image| image.whatis(address)) else { return plain };
+        let Some(debug) = self.debug_of(&place.owner.name, read) else { return plain };
+        let Ok(debug) = &*debug else { return plain };
+        let Some(name) = debug.place_of(address) else { return plain };
+        // The owner and part as they were, the symbol and offset made the
+        // name; what the chip calls it after, as before.
+        let block = plain.find(" (").map_or("", |at| &plain[at..]);
+        format!("{} {}: {name}{block}", place.owner.name, place.part)
+    }
+
     /// Where the instruction at `pc` came from, innermost first, from the
     /// DWARF of whoever's code it is.
     pub fn lines_at(&self, pc: u32, map: Option<&Result<Image, String>>, read: ReadFile) -> Vec<Line> {

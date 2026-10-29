@@ -24,7 +24,7 @@
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
 import { progressHtml } from "./progress.js";
 import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
-import { HOPS, byteOf, folded, follow, functionOf, next, ownerOf, placeOwner, span, stepsOf, summary } from "./trail.js";
+import { HOPS, byteOf, folded, follow, functionOf, leafText, next, ownerOf, placeOwner, span, stepsOf, summary } from "./trail.js";
 
 const MODES = [
   ["variables", "variables"],
@@ -70,6 +70,7 @@ export class Inspector {
     this.stories = []; // every story asked for, oldest first, to go back and forth among
     this.lit = null; // the step the pointer is on: its bytes outlined in the pictures
     this.viewing = null; // { key, address, size, name, mode, width, offset }: bytes seen in their own form
+    this.reach = null; // { address, label, from, window, running, progress, answer | error }: where a value went
     this.scanned = null; // what the display controller scans out: `board/scanned`'s layers
     this.audit = null; // { back, answer | error | running }
     this.snapshot = null; // { stamp, owners: Map(owner → { statics, bytes }) }
@@ -249,6 +250,65 @@ export class Inspector {
     if (this.trail === trail) this.draw(true);
   }
 
+  /// Where the byte at `address` went after `from` (picoseconds of the
+  /// board's), over `window`: a re-execution following it alone forward,
+  /// and every place in memory that holds something made of it at the end.
+  async readReach(address, label, from, window = this.reach?.window ?? 1e11) {
+    const reach = { address, label, from, window, running: true };
+    this.reach = reach;
+    this.draw(true);
+    try {
+      reach.answer = await this.view.query({ time: from + window, follow: { forward: { from, address, length: 1 } } }, "board/reached", (p) => this.progressed("reach", reach, p));
+    } catch (why) {
+      reach.error = String(why);
+    }
+    reach.running = false;
+    if (this.reach === reach) {
+      this.view.setHighlight(this.reachRuns());
+      this.draw(true);
+    }
+  }
+
+  /// The places a value reached, as runs to outline: `[address, length]`.
+  reachRuns() {
+    return (this.reach?.answer?.shown ?? []).map((r) => [r.addr, r.length]);
+  }
+
+  reachHtml() {
+    const e = this.e;
+    const r = this.reach;
+    const hex = (n) => `0x${(n >>> 0).toString(16)}`;
+    const windows = [
+      [1e9, "1 ms"],
+      [1e10, "10 ms"],
+      [1e11, "100 ms"],
+      [1e12, "1 s"],
+    ]
+      .map(([w, label]) => `<button type="button" data-reach-window="${w}"${w === r.window ? ' class="on"' : ""}>${label}</button>`)
+      .join("");
+    const head = `<div class="story-head"><b>where ${e(r.label ?? hex(r.address))} went</b> <span class="dim">over the</span> <span class="controls">${windows}</span> <span class="dim">after t=${(r.from / 1e9).toFixed(3)} ms</span> <span class="controls"><button type="button" data-close="reach">close</button></span></div>`;
+    let body;
+    if (r.running) body = `<div class="dim">following it forward, and everything made of it</div><div data-progress="reach">${progressHtml(r.progress)}</div>`;
+    else if (r.error) body = `<div class="dim">${e(r.error)}</div>`;
+    else if (!r.answer?.following) body = `<div class="dim">nothing followed: no board at the checkpoint it began from</div>`;
+    else {
+      const a = r.answer;
+      const short = (where) => (where ?? "").replace(/ \((.*)\)$/, "").replace(/\b(\w+::)+/g, "");
+      const rows = a.shown
+        .map((run) => {
+          const owner = /^([\w-]+) (\.[\w.]+|stack)/.exec(run.where ?? "")?.[1];
+          const line = run.lines?.[0];
+          const by = line?.file ? `${e((line.function ?? "").replace(/^.*::/, ""))} ${this.lineLink(line)}` : e(run.code ?? "");
+          return `<li data-lit="${run.addr}"><a data-goto="${run.addr}">${e(short(run.where).replace(/^[\w-]+ [.\w]+: /, ""))}</a>${owner ? ` ${this.ownerChip(owner)}` : ""}${run.length > 1 ? ` <span class="dim">${run.length} bytes</span>` : ""} <span class="dim">by</span> ${by}</li>`;
+        })
+        .join("");
+      const owners = [...new Set(a.shown.map((run) => /^([\w-]+) (\.[\w.]+|stack)/.exec(run.where ?? "")?.[1]).filter(Boolean))];
+      const said = a.bytes ? `It reached ${a.bytes} byte${a.bytes === 1 ? "" : "s"} in ${a.runs} place${a.runs === 1 ? "" : "s"}${owners.length ? `, in ${owners.join(", ")}` : ""}, still there at the end of the window.` : "Nothing holds anything made of it at the end of the window: what it went into was overwritten, or it went nowhere.";
+      body = `<div class="story-summary">${e(said)}</div>${rows ? `<ol class="story-steps">${rows}</ol>` : ""}${a.runs > a.shown.length ? `<div class="dim">and ${a.runs - a.shown.length} more places</div>` : ""}`;
+    }
+    return `<div class="mem-story mem-reach">${head}${body}</div>`;
+  }
+
   async runAudit() {
     this.audit = { back: this.back, running: true };
     this.draw(true);
@@ -369,7 +429,7 @@ export class Inspector {
     else if (this.mode === "stack") body = this.stackHtml(owner);
     else if (this.mode === "writers") body = this.writersHtml(owner);
     else body = this.variablesHtml(owner);
-    const story = this.trail ? this.trailHtml() : "";
+    const story = (this.trail ? this.trailHtml() : "") + (this.reach ? this.reachHtml() : "");
     box.innerHTML = `${head}${story}<div class="mem-views"><div class="mem-view">${body}</div>${this.sourceHtml()}</div>`;
     box.onmouseover = (event) => this.hovered(event);
     box.onchange = (event) => {
@@ -635,12 +695,23 @@ export class Inspector {
           return `<li${lit}><span class="verb">stored</span> ${v === null ? "" : `<b>${byte(v)}</b> `}to ${place(step)} by ${by(step)} ${when(step)}</li>`;
         case "held": {
           const other = step.ram && step.written?.by?.pc !== undefined ? ` <a data-retrail="${address},${step.written.stamp * 1e6}" title="follow this value back instead">follow this one</a>` : "";
-          return `<li${lit}><span class="verb">loaded</span> ${v === null ? "" : `<b>${byte(v)}</b> `}from ${place(step)} by ${by(step)} ${when(step)}${other}</li>`;
+          const went = ` <a data-reach="${address},${step.t * 1000 - 1000}" title="everywhere this value went from here, and anything made of it">where else it went</a>`;
+          return `<li${lit}><span class="verb">loaded</span> ${v === null ? "" : `<b>${byte(v)}</b> `}from ${place(step)} by ${by(step)} ${when(step)}${other}${went}</li>`;
         }
         case "read":
           return `<li${lit}><span class="verb">read</span> <b>${hex(step.value)}</b> off <b>${e(step.register)}</b>${step.record ? ` <a data-record="${step.record.n}" data-stand="${Math.floor(step.record.t / 1000) + 1}" title="stand the board at the trace record">trace record ${step.record.n}</a>` : ""} by ${by(step)} ${when(step)}</li>`;
         case "register":
           return `<li><span class="verb">held</span> in ${e(step.register)} as the window began</li>`;
+        case "load": {
+          // What chose the entry read: each value its address was worked
+          // out from, a story of its own to follow.
+          const leaves = step.address.map((leaf) => {
+            const at = leaf.byte ?? leaf.addr;
+            const follow = leaf.what === "held" && leaf.ram && leaf.written?.by?.pc !== undefined ? ` <a data-retrail="${at},${leaf.written.stamp * 1e6}" title="where this value came from">why</a>` : "";
+            return `<span class="leaf"${at !== undefined ? ` data-lit="${at}"` : ""}>${e(leafText(leaf))}${follow}</span>`;
+          });
+          return `<li class="story-address"${lit}><span class="verb">chosen</span> by ${leaves.join(" and ")} <span class="dim">— what the address it was read at was worked out from</span></li>`;
+        }
         case "merge":
           return `<li${lit}><span class="verb">made</span> of two values by ${by(step)} ${when(step)}<details><summary class="dim">the other</summary><ol>${step.other.map((o) => stepHtml({ step: o })).join("")}</ol></details></li>`;
         default:
@@ -677,7 +748,7 @@ export class Inspector {
     const index = this.stories.indexOf(t);
     const nav = `<button type="button" data-story="${index - 1}" ${index > 0 ? "" : "disabled"} title="the story before">‹</button><button type="button" data-story="${index + 1}" ${index < this.stories.length - 1 ? "" : "disabled"} title="the story after">›</button>`;
     const value = stepsOf(t)[0]?.step;
-    const head = `<div class="story-head"><span class="controls">${nav}</span> <b>where ${e(t.label ?? hex(t.address))}${value && byteOf(value) !== null ? ` = ${byte(byteOf(value))}` : ""} came from</b> <span class="dim">${hex(t.address)}</span> <span class="controls">${t.running ? `<button type="button" data-story-stop>stop</button>` : ""}<button type="button" data-close="trail" title="close the story; ‹ brings it back">close</button></span></div>`;
+    const head = `<div class="story-head"><span class="controls">${nav}</span> <b>where ${e(t.label ?? hex(t.address))}${value && byteOf(value) !== null ? ` = ${byte(byteOf(value))}` : ""} came from</b> <span class="dim">${hex(t.address)}</span> <span class="controls">${t.running ? `<button type="button" data-story-stop>stop</button>` : ""}${t.hops[0] ? `<button type="button" data-reach="${t.address},${t.hops[0].time}" title="follow this value forward from here: everywhere it, and anything made of it, went">where it went</button>` : ""}<button type="button" data-close="trail" title="close the story; ‹ brings it back">close</button></span></div>`;
     let html = `<div class="mem-story">${head}`;
     if (said) html += `<div class="story-summary">${e(said)}</div>`;
     if (rows) html += `<ol class="story-steps">${rows}</ol>`;
@@ -784,6 +855,14 @@ export class Inspector {
       }
     }
     g.putImageData(image, 0, 0);
+    // Where a value followed forward went, on the picture.
+    g.fillStyle = "rgb(255 61 245 / 0.55)";
+    for (const [start, length] of this.reachRuns()) {
+      for (let a = start; a < start + length; a++) {
+        const at = pixelOf(shape, a);
+        if (at) g.fillRect(at.x, at.y, 1, 1);
+      }
+    }
     const marked = this.trail ? pixelOf(shape, this.trail.address) : null;
     if (marked) {
       g.strokeStyle = "#ff3df5";
@@ -891,7 +970,7 @@ export class Inspector {
     const address = lit ? Number(lit.dataset.lit) : null;
     if (address !== this.lit) {
       this.lit = address;
-      this.view.setHighlight(address === null ? null : [[address, 1]]);
+      this.view.setHighlight(address === null ? (this.reach?.answer ? this.reachRuns() : null) : [[address, 1]]);
     }
     const hover = this.box.querySelector(".mem-hover");
     const byte = event.target.closest("[data-heat]");
@@ -943,6 +1022,15 @@ export class Inspector {
     if (t("[data-retrail]")) {
       const [at, time] = t("[data-retrail]").dataset.retrail.split(",").map(Number);
       this.readTrail(at, null, { at, time });
+      return true;
+    }
+    if (t("[data-reach]")) {
+      const [address, from] = t("[data-reach]").dataset.reach.split(",").map(Number);
+      this.readReach(address, null, Math.max(0, from));
+      return true;
+    }
+    if (t("[data-reach-window]") && this.reach) {
+      this.readReach(this.reach.address, this.reach.label, this.reach.from, Number(t("[data-reach-window]").dataset.reachWindow));
       return true;
     }
     if (t("[data-view]")) {

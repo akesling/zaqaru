@@ -228,9 +228,10 @@ pub struct Machine {
     /// Where each value came from, while someone is following: see
     /// [`provenance`]. `None` otherwise, which costs a test an instruction.
     pub provenance: Option<Box<provenance::Provenance>>,
-    /// When to begin following everything, if not yet: see
-    /// [`Machine::follow_everything_from`].
-    pub follow_from: Option<u64>,
+    /// When to begin following, if not yet, and what: everything (see
+    /// [`Machine::follow_everything_from`]), or some bytes forward (see
+    /// [`Machine::follow_forward_from`]).
+    pub follow_from: Option<(u64, Option<(u32, u32)>)>,
     pub events: Vec<Event>,
     /// How many times each exception has been entered.
     pub taken: Box<[u64; scs::exception::COUNT]>,
@@ -468,7 +469,7 @@ impl Machine {
 
     fn execute_for(&mut self, until: u64, instructions: u64) -> Outcome {
         // Following everything from an instant: run to it, begin, run on.
-        if let Some(from) = self.follow_from {
+        if let Some((from, _)) = self.follow_from {
             if self.time < from && until > from {
                 let retired = self.retired;
                 let outcome = self.execute_until(from, instructions);
@@ -487,13 +488,21 @@ impl Machine {
     }
 
     fn begin_following_everything(&mut self) {
-        self.follow_from = None;
-        let mut regs = [0; 16];
-        regs[..13].copy_from_slice(&self.cpu.r[..13]);
-        regs[13] = self.cpu.sp();
-        regs[14] = self.cpu.r[14];
-        regs[15] = self.cpu.pc;
-        self.provenance = Some(Box::new(provenance::Provenance::everything(self.time, &regs)));
+        let seed = self.follow_from.take().and_then(|(_, seed)| seed);
+        self.provenance = Some(Box::new(match seed {
+            Some((address, length)) => {
+                let values: Vec<u8> = (0..length).map(|i| self.bus.peek(address.wrapping_add(i), 1).unwrap_or(0) as u8).collect();
+                provenance::Provenance::seeded(self.time, address, &values, self.cpu.pc)
+            }
+            None => {
+                let mut regs = [0; 16];
+                regs[..13].copy_from_slice(&self.cpu.r[..13]);
+                regs[13] = self.cpu.sp();
+                regs[14] = self.cpu.r[14];
+                regs[15] = self.cpu.pc;
+                provenance::Provenance::everything(self.time, &regs)
+            }
+        }));
         self.cpu.watch.on = true;
     }
 
@@ -580,7 +589,20 @@ impl Machine {
     pub fn follow_everything_from(&mut self, from: u64) {
         self.provenance = None;
         self.cpu.watch.on = false;
-        self.follow_from = Some(from);
+        self.follow_from = Some((from, None));
+        if self.time >= from {
+            self.begin_following_everything();
+        }
+    }
+
+    /// Follows the `length` bytes at `address` forward from the board's
+    /// time `from`: they alone are an origin, and whatever is made of them
+    /// is tagged — where a value went, and what it went into. Begun as
+    /// [`Machine::follow_everything_from`] begins.
+    pub fn follow_forward_from(&mut self, from: u64, address: u32, length: u32) {
+        self.provenance = None;
+        self.cpu.watch.on = false;
+        self.follow_from = Some((from, Some((address, length))));
         if self.time >= from {
             self.begin_following_everything();
         }

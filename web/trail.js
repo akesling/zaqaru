@@ -114,7 +114,7 @@ export function placeOwner(step) {
 /// Whether a step is a byte moved by plumbing: a store or a load by code
 /// that only copies.
 export function isPlumbing(step) {
-  if (step.what !== "store" && step.what !== "held") return false;
+  if (step.what !== "store" && step.what !== "held" && step.what !== "load") return false;
   const line = step.lines?.[0];
   return PLUMBING.test(functionOf(step)) || PLUMBING_FILES.test(line?.file ?? "");
 }
@@ -180,6 +180,22 @@ export function originText(trail) {
   }
 }
 
+/// One of the values an address was worked out from, in a few words: its
+/// value and where it was.
+export function leafText(leaf) {
+  const where = (leaf.where ?? "").replace(/^[\w-]+ [.\w]+: /, "").replace(/ \((.*)\)$/, "").replace(/\b(\w+::)+/g, "");
+  switch (leaf.what) {
+    case "held":
+      return `${byteOf(leaf) === null ? "" : `0x${byteOf(leaf).toString(16)} `}from ${where}`;
+    case "read":
+      return `0x${leaf.value.toString(16)} off ${leaf.register}`;
+    case "register":
+      return `what ${leaf.register} held`;
+    default:
+      return "a constant";
+  }
+}
+
 /// A story in one sentence: where the value came from, what made it, and
 /// how it got here.
 export function summary(trail) {
@@ -197,6 +213,10 @@ export function summary(trail) {
     const owner = ownerOf(made);
     parts.push(`was stored by ${functionOf(made)}${where}${owner ? ` in ${owner}` : ""}`);
   }
+  // What chose the value: the values the address it was looked up at was
+  // worked out from, at the lookup nearest what made it.
+  const lookup = steps.find((s) => s.what === "load" && !isPlumbing(s) && (!made || s.t <= made.t));
+  if (lookup?.address?.length) parts.push(`looked up by ${lookup.address.map(leafText).join(" and ")}`);
   const copies = steps.filter((s) => s.what === "store" && isPlumbing(s) && (!made || s.t > made.t));
   if (copies.length) {
     const into = placeOwner(steps[0]);

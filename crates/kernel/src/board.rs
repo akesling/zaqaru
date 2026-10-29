@@ -493,6 +493,88 @@ fn parse_address(text: &str) -> Option<(u32, u16)> {
     Some((packed, port.parse().ok()?))
 }
 
+/// What byte `offset` of a Doom WAD's lump `name` is, where its format
+/// says: a colour map's light level and index, a palette's entry, a flat's
+/// or a picture's pixel. `between(marker)` says whether the lump is between
+/// the markers `marker_START` and `marker_END` (`F` for flats).
+fn wad_byte(name: &str, lump: &[u8], offset: usize, between: impl Fn(&str) -> bool) -> Option<String> {
+    match name {
+        "COLORMAP" => return Some(format!("light map {}, colour {:#04x}", offset / 256, offset % 256)),
+        "PLAYPAL" => return Some(format!("palette {}, colour {:#04x}, {}", offset / 768, offset % 768 / 3, ["red", "green", "blue"][offset % 3])),
+        _ => {}
+    }
+    if lump.len() == 4096 && between("F") {
+        return Some(format!("flat pixel ({}, {})", offset % 64, offset / 64));
+    }
+    // A picture: width, height and offsets, then where each column's posts
+    // are; each post its first row, its length, a pad byte, its pixels and
+    // another pad.
+    let half = |at: usize| Some(u16::from_le_bytes(lump.get(at..at + 2)?.try_into().ok()?) as usize);
+    let word = |at: usize| Some(u32::from_le_bytes(lump.get(at..at + 4)?.try_into().ok()?) as usize);
+    let (width, height) = (half(0)?, half(2)?);
+    if width == 0 || width > 1024 || height == 0 || height > 1024 || 8 + 4 * width > lump.len() {
+        return None;
+    }
+    for x in 0..width {
+        let mut at = word(8 + 4 * x)?;
+        if at >= lump.len() {
+            return None;
+        }
+        while let Some(&top) = lump.get(at) {
+            if top == 0xFF {
+                break;
+            }
+            let length = *lump.get(at + 1)? as usize;
+            let pixels = at + 3;
+            if offset >= pixels && offset < pixels + length {
+                return Some(format!("picture {width}×{height}, pixel ({x}, {})", top as usize + offset - pixels));
+            }
+            at = pixels + length + 1;
+        }
+    }
+    None
+}
+
+/// Whether lump `n` of a WAD is between `marker_START` (or `markerS_START`)
+/// and `marker_END`.
+fn lump_between(wad: &[u8], lumps: usize, directory: usize, n: usize, marker: &str) -> bool {
+    let name = |i: usize| -> String {
+        let at = directory + 16 * i + 8;
+        wad.get(at..at + 8).map_or(String::new(), |b| b.iter().take_while(|&&c| c != 0).map(|&c| c as char).collect())
+    };
+    let (start, end) = (format!("{marker}_START"), format!("{marker}_END"));
+    let (start2, end2) = (format!("{marker}{marker}_START"), format!("{marker}{marker}_END"));
+    (0..n).rev().map(name).find_map(|lump| {
+        if lump == start || lump == start2 {
+            Some(true)
+        } else if lump == end || lump == end2 {
+            Some(false)
+        } else {
+            None
+        }
+    }) == Some(true)
+        && (n + 1..lumps).map(name).any(|lump| lump == end || lump == end2)
+}
+
+#[cfg(test)]
+mod wad {
+    use super::wad_byte;
+
+    #[test]
+    fn a_wad_s_bytes_are_named_by_their_lump_s_format() {
+        assert_eq!(wad_byte("COLORMAP", &[], 0xc4e, |_| false).as_deref(), Some("light map 12, colour 0x4e"));
+        assert_eq!(wad_byte("PLAYPAL", &[], 768 + 5, |_| false).as_deref(), Some("palette 1, colour 0x01, blue"));
+        assert_eq!(wad_byte("FLOOR4_8", &[0; 4096], 64 * 3 + 5, |m| m == "F").as_deref(), Some("flat pixel (5, 3)"));
+        // A 2×4 picture: column 0 a post of rows 1 and 2, column 1 none.
+        let mut picture = vec![2, 0, 4, 0, 0, 0, 0, 0];
+        picture.extend_from_slice(&16u32.to_le_bytes());
+        picture.extend_from_slice(&23u32.to_le_bytes());
+        picture.extend_from_slice(&[1, 2, 0, 0xAA, 0xBB, 0, 0xFF, 0xFF]);
+        assert_eq!(wad_byte("STCFN068", &picture, 20, |_| false).as_deref(), Some("picture 2×4, pixel (0, 2)"));
+        assert_eq!(wad_byte("STCFN068", &picture, 2, |_| false), None, "the header");
+    }
+}
+
 impl Board {
     /// A command written to `/dev/board`, a line at a time:
     ///
@@ -1397,7 +1479,13 @@ impl Board {
             }
             let name = wad.get(entry + 8..entry + 16)?;
             let name: String = name.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
-            Some(if offset > at { format!("WAD lump {name} + {:#x}", offset - at) } else { format!("WAD lump {name}") })
+            let lump = &wad[at..(at + size).min(wad.len())];
+            let what = wad_byte(&name, lump, offset - at, |marker| lump_between(wad, lumps, directory, n, marker));
+            let place = if offset > at { format!("WAD lump {name} + {:#x}", offset - at) } else { format!("WAD lump {name}") };
+            Some(match what {
+                Some(what) => format!("{place}: {what}"),
+                None => place,
+            })
         })
     }
 
@@ -1451,6 +1539,60 @@ impl Board {
             p.since / 1000,
             quoted(&self.describe(address, map)),
             steps.join(",")
+        )
+    }
+
+    /// Follows the `length` bytes at `address` forward from the board's
+    /// time `from`, in picoseconds: see
+    /// `armv6m::Machine::follow_forward_from`.
+    pub fn follow_forward_from(&mut self, from: u64, address: u32, length: u32) -> String {
+        self.machine.follow_forward_from(from, address, length);
+        format!(r#"{{"following":"forward","from_ns":{},"address":{address},"length":{length}}}"#, from / 1000)
+    }
+
+    /// Where the values followed have reached, as JSON: the runs of the
+    /// board's memory holding something made of them, by address — each
+    /// with what it is, the code that last stored there and when — at most
+    /// `limit` runs, and how many bytes in all.
+    pub fn reached_json(&self, limit: usize, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
+        use crate::system::server::quoted;
+        let Some(p) = &self.machine.provenance else {
+            return r#"{"following":false,"runs":[]}"#.to_string();
+        };
+        let mut bytes: Vec<(u32, u32)> = p.memory.iter().map(|(&a, &t)| (a, t)).collect();
+        bytes.sort_unstable();
+        // Runs of bytes next to each other, stored by the same code.
+        let pc = |tag: u32| p.node(tag).map_or(0, |n| n.pc);
+        let mut runs: Vec<(u32, u32, u32)> = Vec::new(); // (start, length, tag)
+        for (addr, tag) in bytes.iter().copied() {
+            match runs.last_mut() {
+                Some((start, length, last)) if *start + *length == addr && pc(*last) == pc(tag) => *length += 1,
+                _ => runs.push((addr, 1, tag)),
+            }
+        }
+        let shown: Vec<String> = runs
+            .iter()
+            .take(limit)
+            .map(|&(start, length, tag)| {
+                let node = p.node(tag);
+                let by = match node {
+                    Some(node) if matches!(node.what, armv6m::provenance::What::Store { .. }) => format!(
+                        r#""t":{},"code":{},"lines":[{}]"#,
+                        node.time / 1000,
+                        quoted(&self.code_at(node.pc, map)),
+                        self.lines_at(node.pc, map, read).iter().map(dwarf::line_json).collect::<Vec<_>>().join(",")
+                    ),
+                    _ => r#""t":null,"code":"where it began""#.to_string(),
+                };
+                format!(r#"{{"addr":{start},"length":{length},"where":{},{by}}}"#, quoted(&self.describe_typed(start, map, read)))
+            })
+            .collect();
+        format!(
+            r#"{{"following":true,"since_ns":{},"bytes":{},"runs":{},"shown":[{}]}}"#,
+            p.since / 1000,
+            bytes.len(),
+            runs.len(),
+            shown.join(",")
         )
     }
 
@@ -1529,7 +1671,7 @@ impl Board {
             out.push(match node.what {
                 What::Store { addr, size, value } => format!(
                     r#"{{"what":"store","addr":{addr},"size":{size},"value":{value},"where":{},{common}}}"#,
-                    quoted(&self.describe(within(addr, size), map))
+                    quoted(&self.describe_typed(within(addr, size), map, read))
                 ),
                 What::Read { addr, value } => {
                     let register = armv6m::names::data_register(&self.machine.bus.soc, addr).unwrap_or_default();
@@ -1547,7 +1689,7 @@ impl Board {
                 }
                 What::Held { addr, size, value, written } => format!(
                     r#"{{"what":"held","addr":{addr},"size":{size},"value":{value},"where":{},"ram":{},"written":{},{common}}}"#,
-                    quoted(&self.describe(within(addr, size), map)),
+                    quoted(&self.describe_typed(within(addr, size), map, read)),
                     self.machine.bus.ram_at(addr).is_some(),
                     written.map_or("null".into(), |mark| format!(
                         r#"{{"stamp":{},"by":{}}}"#,
@@ -1557,6 +1699,27 @@ impl Board {
                 ),
                 // Followed through, lane by lane: never a step of its own.
                 What::Bytes { .. } => continue,
+                // What the address it was read from was worked out from:
+                // the values that chose which entry of a table it was, each
+                // where it came into the window. A constant the code loaded
+                // from beside itself — a table's address — says nothing.
+                What::Load { addr } => {
+                    let leaves: Vec<(&armv6m::provenance::Node, u32)> = p
+                        .origins(node.parents[1], 8)
+                        .into_iter()
+                        .filter(|(_, leaf)| !matches!(leaf.what, What::Held { addr, .. } if addr.wrapping_sub(leaf.pc) < 4096))
+                        .map(|(_, leaf)| (leaf, if let What::Held { addr, .. } = leaf.what { addr } else { 0 }))
+                        .collect();
+                    if leaves.is_empty() {
+                        continue;
+                    }
+                    let leaves = self.why_steps(p, leaves, map, read, depth / 2);
+                    format!(
+                        r#"{{"what":"load","addr":{addr},"where":{},"address":[{}],{common}}}"#,
+                        quoted(&self.describe_typed(byte, map, read)),
+                        leaves.join(",")
+                    )
+                }
                 What::Register { n, value } => format!(
                     r#"{{"what":"register","register":"{}","value":{value},{common}}}"#,
                     match n {

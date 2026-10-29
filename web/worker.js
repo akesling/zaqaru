@@ -583,16 +583,19 @@ async function standBoard(board) {
 /// `standBoard`. Its own, so that a seek made while it runs on cannot
 /// change which one it is.
 async function boardAt({ time, follow = false, watch = null, back = FOLLOW_BACK }, report = null) {
-  // `follow: { from }`: everything followed, from that instant.
-  const everything = typeof follow === "object" && follow !== null ? Math.max(0, Math.round(follow.from)) : null;
-  const from = everything ?? (follow || watch ? time - (watch ? back : FOLLOW_BACK) : time);
+  // `follow: { from }`: everything followed, from that instant; `follow:
+  // { forward: { from, address, length } }`: those bytes, forward from it.
+  const forward = typeof follow === "object" && follow?.forward ? follow.forward : null;
+  const everything = typeof follow === "object" && follow !== null && !forward ? Math.max(0, Math.round(follow.from)) : null;
+  const from = forward ? Math.max(0, Math.round(forward.from)) : everything ?? (follow || watch ? time - (watch ? back : FOLLOW_BACK) : time);
   const boarded = (entry) => entry.board !== null && entry.board !== undefined;
   // The last checkpoint before `from`; following or watching, failing
   // that, the first with a board at all.
   let index = checkpoints.entries.findLastIndex((entry) => boarded(entry) && entry.board < from);
   if (index < 0) index = follow || watch ? Math.max(0, checkpoints.entries.findIndex((entry) => boarded(entry) && entry.board < time)) : 0;
   const container = await Container.fromSnapshot(module, checkpoints.snapshot(index));
-  for (const [path, on] of [["board/provenance", everything !== null ? `everything ${everything}` : follow && "on"], ["board/watch", watch]]) {
+  const following = forward ? `forward ${from} ${forward.address} ${forward.length}` : everything !== null ? `everything ${everything}` : follow && "on";
+  for (const [path, on] of [["board/provenance", following], ["board/watch", watch]]) {
     if (!on) continue;
     try {
       container.put(path, on);
@@ -601,7 +604,7 @@ async function boardAt({ time, follow = false, watch = null, back = FOLLOW_BACK 
     }
   }
   const start = checkpoints.entries[index]?.board ?? 0;
-  const watching = everything !== null || follow || watch ? from : null;
+  const watching = forward || everything !== null || follow || watch ? from : null;
   container.stopAtBoard({ time }, live ? frontier : -1, report && ((at) => report({ start, from: watching, to: time, board: at.board })));
   return container;
 }

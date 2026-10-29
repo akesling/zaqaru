@@ -1511,10 +1511,14 @@ const renderers = {
         followValues = !followValues;
         return seekBoard(boardTime ?? value.time_ps);
       }
+      // A value's story is the memory panel's, told there.
       const why = event.target.closest("[data-why]");
-      if (why) {
-        valuesWhy = valuesWhy === why.dataset.why ? null : why.dataset.why;
-        return showValues(panel, value);
+      if (why && memoryView) {
+        const address = Number(why.dataset.why);
+        memoryView.goTo(address);
+        memoryView.inspector.readTrail(address, null);
+        memoryView.element.scrollIntoView({ behavior: "smooth", block: "start" });
+        return;
       }
       const layer = event.target.closest("[data-layer]");
       if (layer) {
@@ -1972,28 +1976,17 @@ function equipTimeline(panel) {
 // the one asked about, why: each copy back to the byte on the wire, every
 // step's time a handle on that instant.
 
-let valuesKept = { at: null, tagged: null, why: new Map() };
-let valuesWhy = null;
+let valuesKept = { at: null, tagged: null };
 
 function showValues(panel, value) {
   const box = panel.body.querySelector(".values");
   if (!box) return;
   if (boardTime === null || !followValues) return update(box, "");
   if (valuesKept.at !== boardTime) {
-    valuesKept = { at: boardTime, tagged: null, why: new Map() };
+    valuesKept = { at: boardTime, tagged: null };
     read("board/tagged")
       .then((tagged) => {
         if (valuesKept.at === boardTime) valuesKept.tagged = tagged;
-        showValues(panel, boardValue ?? value);
-      })
-      .catch(() => {});
-  }
-  if (valuesWhy && !valuesKept.why.has(valuesWhy)) {
-    const asked = valuesWhy;
-    valuesKept.why.set(asked, null);
-    read(`board/why/${asked}`)
-      .then((why) => {
-        valuesKept.why.set(asked, why);
         showValues(panel, boardValue ?? value);
       })
       .catch(() => {});
@@ -2004,34 +1997,13 @@ function showValues(panel, value) {
   const rows = tagged.shown
     .map((run) => {
       const origin = run.origin ? `← ${escape(run.origin.register)} 0x${run.origin.value.toString(16)} at ${bench.stamp(run.origin.t)}` : "";
-      const open = valuesWhy === String(run.addr);
-      const chain = open ? whyHtml(valuesKept.why.get(String(run.addr))) : "";
-      return `<div class="run${open ? " open" : ""}"><button type="button" data-why="${run.addr}">${open ? "hide" : "why"}</button> <code>${run.hex}</code>${run.length > 16 ? "…" : ""} ${escape(run.where)} <span class="dim">${origin}</span>${chain}</div>`;
+      return `<div class="run"><button type="button" data-why="${run.addr}" title="its story, write by write, in the memory panel">why</button> <code>${run.hex}</code>${run.length > 16 ? "…" : ""} ${escape(run.where)} <span class="dim">${origin}</span></div>`;
     })
     .join("");
   update(
     box,
     `<div class="values-head"><b>values from outside</b> <span class="dim">— ${tagged.runs} run${tagged.runs === 1 ? "" : "s"} of memory hold what came in through a peripheral since ${bench.fmtTime(tagged.since_ns)}</span></div>${rows || `<div class="dim">nothing from outside is in memory now</div>`}`,
   );
-}
-
-/// A `why` as a chain: newest first, each step a handle on its instant.
-function whyHtml(why) {
-  if (!why) return `<div class="why dim">asking…</div>`;
-  const steps = (list) =>
-    list
-      .map((step) => {
-        const what =
-          step.what === "store"
-            ? `stored <code>0x${step.value.toString(16)}</code> at ${escape(step.where)}`
-            : step.what === "read"
-              ? `read <code>0x${step.value.toString(16)}</code> from <b>${escape(step.register)}</b>${step.record ? ` — the byte on the wire at ${bench.stamp(step.record.t)}` : ""}`
-              : "merged with";
-        const other = step.other?.length ? `<div class="why-other">${steps(step.other)}</div>` : "";
-        return `<div class="why-step">${bench.stamp(step.t)} ${what} <span class="dim">by ${escape(step.code)}</span>${other}</div>`;
-      })
-      .join("");
-  return `<div class="why">${steps(why.steps) || `<div class="dim">came from nowhere followed</div>`}</div>`;
 }
 
 /// The probes' cards, one for each probe, kept from read to read: a card's

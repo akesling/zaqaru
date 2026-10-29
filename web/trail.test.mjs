@@ -1,7 +1,7 @@
 // Checks `trail.js` under Node: node --test web/trail.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW, byteOf, folded, follow, functionOf, isPlumbing, next, ownerOf, placeOwner, span, summary } from "./trail.js";
+import { WINDOW, byteOf, folded, follow, functionOf, isPlumbing, leafText, next, ownerOf, placeOwner, span, summary } from "./trail.js";
 
 const by = { pc: 0x0800_1234, code: "doom: R_DrawColumn" };
 const held = (addr, stamp, writer = by) => ({ what: "held", addr, ram: true, written: stamp ? { stamp, by: writer } : null });
@@ -114,4 +114,13 @@ test("a story says in a sentence where its value came from, what made it and how
   );
   assert.equal(span(19e6), "19 µs");
   assert.equal(span(2.5e9), "2.5 ms");
+});
+
+test("a value looked up in a table says what chose it", () => {
+  const texel = { what: "held", ram: true, addr: 0x2400_9000, size: 1, value: 0x6a, byte: 0x2400_9000, where: "doom .uninit: ZONE_AXI[36864] (AXI SRAM + 0x5a3a4)" };
+  const lookup = { what: "load", addr: 0x9000_1503, byte: 0x9000_1503, where: "the NOR: WAD lump COLORMAP + 0x503", address: [texel], code: drawn.code, lines: drawn.lines, t: drawn.t };
+  const entry = { ...fromWad, where: "the NOR: WAD lump COLORMAP + 0x503: light map 5, colour 0x03" };
+  assert.equal(leafText(texel), "0x6a from ZONE_AXI[36864]");
+  const trail = { hops: [{ steps: [copied, drawn, lookup, entry] }], end: { kind: "rom", step: entry } };
+  assert.match(summary(trail), /was stored by V_DrawPatch \(v_video.c:189\) in doom, looked up by 0x6a from ZONE_AXI\[36864\], and was copied once/);
 });
