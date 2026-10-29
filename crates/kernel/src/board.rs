@@ -1337,10 +1337,39 @@ impl Board {
             let at = if address > base { format!("{name} + {:#x}", address - base) } else { name.to_string() };
             text = if text.is_empty() { at } else { format!("{text} ({at})") };
         }
+        if let Some(lump) = self.wad_lump(address) {
+            text = format!("{text}: {lump}");
+        }
         if text.is_empty() {
             text = format!("{address:#010x}: nothing the chip or the archive names");
         }
         text
+    }
+
+    /// What a NOR holding a WAD — Doom's — has at `address`, if it is in
+    /// one: the lump, by its name in the WAD's directory, and how far in.
+    fn wad_lump(&self, address: u32) -> Option<String> {
+        let armv6m::bus::Soc::H7(soc) = &self.machine.bus.soc else { return None };
+        let wad = soc.quadspi.nor.as_ref()?.contents();
+        let offset = address.checked_sub(armv6m::quadspi::WINDOW)? as usize;
+        if offset >= wad.len() || wad.len() < 12 || !matches!(&wad[..4], b"IWAD" | b"PWAD") {
+            return None;
+        }
+        let word = |at: usize| Some(u32::from_le_bytes(wad.get(at..at + 4)?.try_into().ok()?) as usize);
+        let (lumps, directory) = (word(4)?, word(8)?);
+        if offset >= directory && offset < directory + 16 * lumps {
+            return Some(format!("the WAD's directory, entry {}", (offset - directory) / 16));
+        }
+        (0..lumps).find_map(|n| {
+            let entry = directory + 16 * n;
+            let (at, size) = (word(entry)?, word(entry + 4)?);
+            if offset < at || offset >= at + size {
+                return None;
+            }
+            let name = wad.get(entry + 8..entry + 16)?;
+            let name: String = name.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            Some(if offset > at { format!("WAD lump {name} + {:#x}", offset - at) } else { format!("WAD lump {name}") })
+        })
     }
 
     /// Where the code at `pc` is: its owner, and the function and how far
@@ -1367,6 +1396,13 @@ impl Board {
         }
     }
 
+    /// Follows everything from the board's time `from`, in picoseconds:
+    /// see `armv6m::Machine::follow_everything_from`.
+    pub fn follow_everything_from(&mut self, from: u64) -> String {
+        self.machine.follow_everything_from(from);
+        format!(r#"{{"following":"everything","from_ns":{}}}"#, from / 1000)
+    }
+
     /// Where the value at `address` came from, as JSON: newest first, each
     /// step what it was — a store, where to and by which code; a merge of
     /// two values, the other's history beside it; a read of a peripheral's
@@ -1379,9 +1415,10 @@ impl Board {
             return r#"{"following":false,"steps":[]}"#.to_string();
         };
         let tag = p.memory.get(&address).copied().unwrap_or(0);
-        let steps = self.why_steps(p, tag, map, read, 24);
+        let steps = self.why_steps(p, tag, map, read, 32);
         format!(
-            r#"{{"following":true,"since_ns":{},"address":{address},"what":{},"steps":[{}]}}"#,
+            r#"{{"following":true,"everything":{},"since_ns":{},"address":{address},"what":{},"steps":[{}]}}"#,
+            p.everything,
             p.since / 1000,
             quoted(&self.describe(address, map)),
             steps.join(",")
@@ -1475,6 +1512,25 @@ impl Board {
                     let other = self.why_steps(p, node.parents[1], map, read, depth / 2);
                     format!(r#"{{"what":"merge","other":[{}],{common}}}"#, other.join(","))
                 }
+                What::Held { addr, size, value, written } => format!(
+                    r#"{{"what":"held","addr":{addr},"size":{size},"value":{value},"where":{},"ram":{},"written":{},{common}}}"#,
+                    quoted(&self.describe(addr, map)),
+                    self.machine.bus.ram_at(addr).is_some(),
+                    written.map_or("null".into(), |mark| format!(
+                        r#"{{"stamp":{},"by":{}}}"#,
+                        mark.stamp,
+                        self.writer_json(mark.writer, map, read)
+                    ))
+                ),
+                What::Register { n, value } => format!(
+                    r#"{{"what":"register","register":"{}","value":{value},{common}}}"#,
+                    match n {
+                        13 => "sp".to_string(),
+                        14 => "lr".to_string(),
+                        15 => "pc".to_string(),
+                        n => format!("r{n}"),
+                    }
+                ),
             });
         }
         out

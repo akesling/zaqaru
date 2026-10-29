@@ -315,9 +315,12 @@ impl Machine {
         // And the registers it restores, the tags it carried.
         if self.provenance.is_some() {
             let (pc, time) = (self.cpu.pc, self.time);
+            let written: Vec<_> = (0..6).map(|slot| self.bus.last_write(sp.wrapping_add(4 * slot))).collect();
             if let Some(provenance) = &mut self.provenance {
                 for (slot, reg) in [0, 1, 2, 3, 12, 14].into_iter().enumerate() {
-                    provenance.regs[reg] = provenance.of_memory(sp.wrapping_add(4 * slot as u32), 4, pc, time);
+                    let at = sp.wrapping_add(4 * slot as u32);
+                    provenance.hold(at, 4, frame[slot], written[slot], pc, time);
+                    provenance.regs[reg] = provenance.of_memory(at, 4, pc, time);
                 }
             }
         }

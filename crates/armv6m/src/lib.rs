@@ -228,6 +228,9 @@ pub struct Machine {
     /// Where each value came from, while someone is following: see
     /// [`provenance`]. `None` otherwise, which costs a test an instruction.
     pub provenance: Option<Box<provenance::Provenance>>,
+    /// When to begin following everything, if not yet: see
+    /// [`Machine::follow_everything_from`].
+    pub follow_from: Option<u64>,
     pub events: Vec<Event>,
     /// How many times each exception has been entered.
     pub taken: Box<[u64; scs::exception::COUNT]>,
@@ -331,6 +334,7 @@ impl Machine {
             retired: 0,
             horizon: Horizon::NONE,
             provenance: None,
+            follow_from: None,
             events: Vec::new(),
             taken: Box::new([0; scs::exception::COUNT]),
             priority: scs::BASE_PRIORITY,
@@ -463,6 +467,37 @@ impl Machine {
     }
 
     fn execute_for(&mut self, until: u64, instructions: u64) -> Outcome {
+        // Following everything from an instant: run to it, begin, run on.
+        if let Some(from) = self.follow_from {
+            if self.time < from && until > from {
+                let retired = self.retired;
+                let outcome = self.execute_until(from, instructions);
+                if self.time < from {
+                    return outcome;
+                }
+                let instructions = instructions.saturating_sub(self.retired - retired);
+                self.begin_following_everything();
+                return self.execute_until(until, instructions);
+            }
+            if self.time >= from {
+                self.begin_following_everything();
+            }
+        }
+        self.execute_until(until, instructions)
+    }
+
+    fn begin_following_everything(&mut self) {
+        self.follow_from = None;
+        let mut regs = [0; 16];
+        regs[..13].copy_from_slice(&self.cpu.r[..13]);
+        regs[13] = self.cpu.sp();
+        regs[14] = self.cpu.r[14];
+        regs[15] = self.cpu.pc;
+        self.provenance = Some(Box::new(provenance::Provenance::everything(self.time, &regs)));
+        self.cpu.watch.on = true;
+    }
+
+    fn execute_until(&mut self, until: u64, instructions: u64) -> Outcome {
         let last = self.retired.saturating_add(instructions).min(self.horizon.instructions);
         let until = until.min(self.horizon.time);
         while self.time < until && self.retired < last {
@@ -533,6 +568,22 @@ impl Machine {
     pub fn follow_values(&mut self, on: bool) {
         self.provenance = on.then(|| Box::new(provenance::Provenance::new(self.time)));
         self.cpu.watch.on = on;
+        self.follow_from = None;
+    }
+
+    /// Follows everything from the board's time `from` on (now, if it has
+    /// passed): every value a history, ending where it came into the
+    /// window — see [`provenance`]. Begun between instructions, at the
+    /// first that starts at or after `from`, by however the machine is
+    /// run there, so that a re-execution asked to begin at an instant runs
+    /// exactly as one that was not.
+    pub fn follow_everything_from(&mut self, from: u64) {
+        self.provenance = None;
+        self.cpu.watch.on = false;
+        self.follow_from = Some(from);
+        if self.time >= from {
+            self.begin_following_everything();
+        }
     }
 
     /// Whether the machine stands at its [`Horizon`], and will run no further.

@@ -1130,10 +1130,22 @@ export class MemoryView {
     for (let a = st.base; a < st.base + shown; a++) {
       if (a > st.base && (a - st.base) % 16 === 0) bytes += `<br><span class="addr">${(a - st.base).toString(16).padStart(4, "0")}</span> `;
       const b = this.byteAt(a);
-      bytes += `<span class="b" data-heat="${a},${a + 1}">${b === null ? "  " : b.toString(16).padStart(2, "0")}</span>`;
+      bytes += `<span class="b" data-heat="${a},${a + 1}" data-trail="${a}">${b === null ? "  " : b.toString(16).padStart(2, "0")}</span>`;
     }
     const more = st.size > shown ? `<span class="dim"> …${st.size - shown} more</span>` : "";
     return `<div class="mem-static"><div class="mem-static-head"><span class="name" title="${e(st.name)}">${e(shortName(st.name))}</span> <span class="dim">0x${st.base.toString(16)} · ${st.size} B · untyped</span></div><div class="mem-bytes">${bytes}${more}</div></div>`;
+  }
+
+  /// Shows `address`: its owner chosen, the inspector on it, and it
+  /// outlined in the pictures.
+  goTo(address) {
+    const owner = this.owners.find((o) => o.ranges.some((r) => address >= r.base && address < r.end));
+    this.selected = owner?.name ?? null;
+    this.focus = address;
+    this.inspected = null;
+    this.highlight = [[address, 1]];
+    this.draw();
+    this.inspect();
   }
 
   /// Memory to outline in the pictures: runs of `[address, length]`.

@@ -137,3 +137,75 @@ fn a_busy_wait_for_the_next_byte_waits_for_it() {
     run(&mut m);
     assert!(m.time < 10_000_000_000, "done in a few bus bit-times, not {} ps", m.time);
 }
+
+/// A byte written before following begins, then copied, beside a
+/// constant, a register's value from before, and a byte of flash.
+const BEFORE_AND_AFTER: &str = "
+    ldr r3, =0x24000100
+    movs r1, #0x5A
+    strb r1, [r3]            @ before: what the copy is of
+    movs r2, #0x33           @ before: held in a register
+    nop
+begin:
+    ldrb r4, [r3]            @ held since before, written by the strb
+    ldr r6, =0x24000200
+    strb r4, [r6]
+    movs r5, #7
+    strb r5, [r6, #1]        @ a constant
+    strb r2, [r6, #2]        @ a register's, from before
+    adr r7, table
+    ldrb r7, [r7]
+    strb r7, [r6, #3]        @ flash's
+    bkpt #1
+    .align 2
+table:
+    .byte 0xC4, 0, 0, 0
+    .ltorg
+";
+
+#[test]
+fn following_everything_ends_every_history_where_it_came_in() {
+    let source = format!(".thumb_func\nreset:\n{BEFORE_AND_AFTER}");
+    // Where `begin` is in time: five instructions in.
+    let mut probe = h753(&source);
+    assert!(matches!(probe.run_until(u64::MAX, 5), Outcome::Budget));
+    let from = probe.time;
+    let mut m = h753(&source);
+    m.follow_everything_from(from);
+    run(&mut m);
+    let p = m.provenance.as_ref().expect("following began");
+    assert!(p.everything && p.since >= from);
+    let what = |addr: u32| -> Vec<What> {
+        let tag = *p.memory.get(&addr).unwrap_or_else(|| panic!("{addr:#x} is tagged"));
+        p.history(tag, 8).iter().map(|(_, node)| node.what).collect()
+    };
+    // The copy: from the byte held since before, with the write that put it there.
+    let copy = what(0x2400_0200);
+    assert!(matches!(copy[0], What::Store { addr: 0x2400_0200, size: 1, value: 0x5A }), "{copy:?}");
+    match copy[1] {
+        What::Held { addr: 0x2400_0100, size: 1, value: 0x5A, written: Some(mark) } => {
+            assert!(mark.stamp != 0 && mark.writer >= armv6m::bus::FLASH_BASE, "{mark:?}")
+        }
+        other => panic!("held since before: {other:?}"),
+    }
+    assert_eq!(copy.len(), 2);
+    // The constant: a store of nothing.
+    assert_eq!(what(0x2400_0201), [What::Store { addr: 0x2400_0201, size: 1, value: 7 }]);
+    // The register's, from before.
+    let register = what(0x2400_0202);
+    assert!(matches!(register[1], What::Register { n: 2, value: 0x33 }), "{register:?}");
+    // Flash's: held, and never written.
+    let flash = what(0x2400_0203);
+    assert!(matches!(flash[1], What::Held { value: 0xC4, written: None, .. }), "{flash:?}");
+}
+
+#[test]
+fn following_everything_from_an_instant_changes_nothing() {
+    let source = format!(".thumb_func\nreset:\n{BEFORE_AND_AFTER}");
+    let mut followed = h753(&source);
+    followed.follow_everything_from(1);
+    run(&mut followed);
+    let mut plain = h753(&source);
+    run(&mut plain);
+    assert_eq!((followed.retired, followed.time, &followed.cpu), (plain.retired, plain.time, &plain.cpu));
+}

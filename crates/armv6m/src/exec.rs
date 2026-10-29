@@ -159,9 +159,10 @@ impl Machine {
         }
         if self.provenance.is_some() {
             let data_register = addr >= 0x4000_0000 && crate::names::data_register(&self.bus.soc, addr).is_some();
+            let written = self.provenance.as_ref().is_some_and(|p| p.everything).then(|| self.bus.last_write(addr)).flatten();
             let (pc, time) = (self.cpu.pc, self.time);
             if let Some(provenance) = &mut self.provenance {
-                provenance.loaded(addr, size, value, data_register, pc, time);
+                provenance.loaded(addr, size, value, data_register, written, pc, time);
             }
         }
         Ok(value)

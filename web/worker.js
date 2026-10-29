@@ -513,6 +513,7 @@ async function stand(at, board = null) {
 /// board runs on — so it is a seek of its own.
 ///
 /// With `follow`, where values go is followed on the way (`board/provenance`),
+/// or with `follow: { from }`, every value, from that instant of the board's;
 /// from a checkpoint far enough back — `FOLLOW_BACK` of the board's time —
 /// that what arrived shortly before the instant is caught too, and never
 /// one from before there was a board to follow. With `watch`, writes are
@@ -529,14 +530,16 @@ async function standBoard(board) {
 /// `standBoard`. Its own, so that a seek made while it runs on cannot
 /// change which one it is.
 async function boardAt({ time, follow = false, watch = null, back = FOLLOW_BACK }) {
-  const from = follow || watch ? time - (watch ? back : FOLLOW_BACK) : time;
+  // `follow: { from }`: everything followed, from that instant.
+  const everything = typeof follow === "object" && follow !== null ? Math.max(0, Math.round(follow.from)) : null;
+  const from = everything ?? (follow || watch ? time - (watch ? back : FOLLOW_BACK) : time);
   const boarded = (entry) => entry.board !== null && entry.board !== undefined;
   // The last checkpoint before `from`; following or watching, failing
   // that, the first with a board at all.
   let index = checkpoints.entries.findLastIndex((entry) => boarded(entry) && entry.board < from);
   if (index < 0) index = follow || watch ? Math.max(0, checkpoints.entries.findIndex((entry) => boarded(entry) && entry.board < time)) : 0;
   const container = await Container.fromSnapshot(module, checkpoints.snapshot(index));
-  for (const [path, on] of [["board/provenance", follow && "on"], ["board/watch", watch]]) {
+  for (const [path, on] of [["board/provenance", everything !== null ? `everything ${everything}` : follow && "on"], ["board/watch", watch]]) {
     if (!on) continue;
     try {
       container.put(path, on);

@@ -22,6 +22,7 @@
 // memory in the pictures.
 
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
+import { follow } from "./trail.js";
 
 const MODES = [
   ["variables", "variables"],
@@ -60,7 +61,7 @@ export class Inspector {
     this.files = new Map(); // path → text, or a promise of it
     this.source = null; // { file, line, whole }
     this.history = null; // { key, address, size, type, owner, answer | error }
-    this.why = null; // { key, address, answer | error }
+    this.trail = null; // { address, label, hops, end, running, error }: see trail.js
     this.audit = null; // { back, answer | error | running }
     this.snapshot = null; // { stamp, owners: Map(owner → { statics, bytes }) }
     this.compared = null;
@@ -199,18 +200,23 @@ export class Inspector {
     if (this.history === history) this.draw(true);
   }
 
-  /// Where a field's value came from, from a re-execution following values.
-  async readWhy(target) {
-    this.why = { ...target, running: true };
-    this.draw(true);
-    const why = this.why;
+  /// Where the value at `address` came from, back through every write:
+  /// see `trail.js`. With `from`, going on from where a story stopped.
+  async readTrail(address, label, from = null) {
+    const trail = from && this.trail?.address === address ? this.trail : { address, label, hops: [] };
+    trail.from = from;
+    trail.end = null;
+    trail.error = null;
+    this.trail = trail;
+    const wanted = () => this.trail === trail;
+    const update = () => wanted() && this.draw(true);
     try {
-      why.answer = await this.view.query({ follow: true }, `board/why/${target.address}`);
-    } catch (e) {
-      why.error = String(e);
+      await follow(trail, { read: (path) => this.view.read(path), query: (options, path) => this.view.query(options, path), update, wanted });
+    } catch (why) {
+      trail.error = String(why);
     }
-    why.running = false;
-    if (this.why === why) this.draw(true);
+    trail.running = null;
+    update();
   }
 
   async runAudit() {
@@ -324,6 +330,7 @@ export class Inspector {
     else if (this.mode === "stack") body = this.stackHtml(owner);
     else if (this.mode === "writers") body = this.writersHtml(owner);
     else body = this.variablesHtml(owner);
+    if (this.trail) body = this.trailHtml() + body;
     box.innerHTML = `${head}<div class="mem-views"><div class="mem-view">${body}</div>${this.sourceHtml()}</div>`;
     box.onmouseover = (event) => this.hovered(event);
     this.warm();
@@ -380,12 +387,11 @@ export class Inspector {
     const heat = node.address !== null && node.size && actions ? `<span class="heat" data-heat="${node.address},${node.address + node.size}"></span>` : "";
     const by = latest ? latest(node) : "";
     const act = actions
-      ? `<span class="acts"><a data-history="${e(key)}" title="every write to it over the window, from a re-execution watching it">history</a> <a data-why="${e(key)}" title="where its value came from: each copy back to the bytes off a bus, from a re-execution following values">why</a></span>`
+      ? `<span class="acts"><a data-history="${e(key)}" title="every write to it over the window, from a re-execution watching it">history</a> <a data-why="${e(key)}" title="where its value came from: each copy and each write back to where it came in, from re-executions following every value">why</a></span>`
       : "";
     const near = this.view.focus !== null && depth === 0 && this.view.focus >= node.address && this.view.focus < node.address + node.size;
     let html = `<div class="mem-node${near ? " near" : ""}${node.unknown ? " unknown" : ""}" style="padding-left:${depth * 1.2}em" data-key="${e(key)}">${toggle}${heat}<span class="name">${e(depth ? node.name : node.name.split("::").slice(-2).join("::"))}</span><span class="ty">: ${e(node.typeName)}</span> = <span class="val">${e(node.value)}</span>${by}${act}</div>`;
     if (this.history?.key === key) html += this.historyHtml(node);
-    if (this.why?.key === key) html += this.whyHtml();
     if (open && parts) {
       for (const child of node.children) html += this.nodeHtml(child, `${key}/${child.name}`, depth + 1, actions, latest);
       if (node.more) html += `<div class="dim" style="padding-left:${(depth + 1) * 1.2}em">…${node.more} more of ${node.more + node.children.length}</div>`;
@@ -431,6 +437,8 @@ export class Inspector {
       html += `</div>`;
     }
     for (const st of s.around ?? []) html += this.aroundHtml(st, where);
+    const focus = this.view.focus;
+    if (focus !== null) html = `<div class="mem-focus">0x${focus.toString(16)} <span class="dim">${e(describe(focus) ?? "")}</span> <a data-trail="${focus}" title="where the value there came from, write by write">why</a></div>${html}`;
     // The guesser, scored against what the DWARF says these hold.
     if (trees.length && typed?.types) {
       const { total, right, misses } = score(typed.types, trees, byte, where);
@@ -455,7 +463,7 @@ export class Inspector {
       const [stamp, writer] = this.view.latestIn(a, a + 4);
       const near = this.view.focus !== null && this.view.focus >= a && this.view.focus < a + 4;
       rows.push(
-        `<tr class="${near ? "near" : ""}"><td class="dim">0x${a.toString(16)}</td><td><span class="heat" data-heat="${a},${a + 4}"></span>${word.toString(16).padStart(8, "0")}</td><td class="g-${g.kind}">${e(g.kind)}</td><td>${e(g.label)}</td><td class="dim">${stamp ? `<span data-ago="${stamp}"></span> by ${this.writerHtml(this.view.inspected.writers[writer])}` : ""}</td></tr>`,
+        `<tr class="${near ? "near" : ""}"><td class="dim">0x${a.toString(16)}</td><td><span class="heat" data-heat="${a},${a + 4}"></span>${word.toString(16).padStart(8, "0")}</td><td class="g-${g.kind}">${e(g.kind)}</td><td>${e(g.label)}</td><td class="dim">${stamp ? `<span data-ago="${stamp}"></span> by ${this.writerHtml(this.view.inspected.writers[writer])} <a data-trail="${a}">why</a>` : ""}</td></tr>`,
       );
     }
     return `<div class="mem-static"><div class="mem-static-head"><b>${e(st.name)}</b> <span class="dim">nothing's DWARF says what this is: each word guessed at alone</span></div><table class="mem-words">${rows.join("")}</table></div>`;
@@ -545,25 +553,57 @@ export class Inspector {
     return `${head}<div class="mem-ticks" title="each write, across the window">${ticks}</div><table class="mem-table">${rows}</table>${dropped}</div>`;
   }
 
-  whyHtml() {
+  /// A value's story, latest first: each window's history, the write that
+  /// leads to the next, and where it came in.
+  trailHtml() {
     const e = this.e;
-    const w = this.why;
-    const head = `<div class="mem-history"><div class="dim">where its value came from <a data-close="why">close</a></div>`;
-    if (w.running) return `${head}<div class="dim">re-running the board to here, following its values…</div></div>`;
-    if (w.error) return `${head}<div class="dim">${e(w.error)}</div></div>`;
-    const steps = (list) =>
-      list
-        .map((s) => {
-          const when = `<a class="dim" data-stand="${Math.floor(s.t / 1000) + 1}">t=${(s.t / 1e6).toFixed(3)} ms</a>`;
-          const by = s.lines?.length ? this.writerHtml(s) : e(s.code);
-          if (s.what === "store") return `<li>stored to ${e(s.where)} by ${by} ${when}</li>`;
-          if (s.what === "read") return `<li><b>read off ${e(s.register)}</b>: 0x${s.value.toString(16)}${s.record ? `, trace record ${s.record.n}` : ""}, by ${by} ${when}</li>`;
-          return `<li>made of two values, by ${by} ${when}; the other:<ol>${steps(s.other)}</ol></li>`;
-        })
-        .join("");
-    const a = w.answer;
-    const body = a?.steps?.length ? `<ol class="mem-why">${steps(a.steps)}</ol>` : `<div class="dim">it came from nowhere followed: a constant, or from before the re-execution began</div>`;
-    return `${head}${body}</div>`;
+    const t = this.trail;
+    const hex = (n) => `0x${(n >>> 0).toString(16)}`;
+    const at = (address, where) => `<a data-goto="${address}" title="show ${hex(address)} in the pictures">${e(where ?? hex(address))}</a>`;
+    const when = (ns) => `<a class="dim" data-stand="${Math.floor(ns / 1000) + 1}" title="stand the board here">t=${(ns / 1e6).toFixed(3)} ms</a>`;
+    const by = (s) => (s.lines?.length ? this.writerHtml(s) : e(s.code ?? "?"));
+    const step = (s, last, nested) => {
+      switch (s.what) {
+        case "store":
+          return `<li>${hex(s.value)} stored to ${at(s.addr, s.where)} by ${by(s)} ${when(s.t)}${last ? ` — <b>made by that code: a constant</b>` : ""}</li>`;
+        case "read":
+          return `<li><b>came in off ${e(s.register)}</b>: ${hex(s.value)}${s.record ? `, trace record ${s.record.n}` : ""}, read by ${by(s)} ${when(s.t)}</li>`;
+        case "held": {
+          const again = nested && s.ram && s.written?.by?.pc !== undefined ? ` <a data-retrail="${s.addr},${s.written.stamp * 1e6}" title="follow this value back instead">follow this one</a>` : "";
+          return `<li>${hex(s.value)} loaded from ${at(s.addr, s.where)} by ${by(s)} ${when(s.t)}${again}</li>`;
+        }
+        case "register":
+          return `<li>held in ${e(s.register)} as the window began</li>`;
+        case "merge":
+          return `<li>made of two values by ${by(s)} ${when(s.t)}<details><summary class="dim">the other</summary><ol>${steps(s.other, true)}</ol></details></li>`;
+        default:
+          return "";
+      }
+    };
+    const steps = (list, nested = false) => list.map((s, i) => step(s, i === list.length - 1, nested)).join("");
+    const window = (ps) => (ps >= 1e12 ? `${ps / 1e12} s` : `${ps / 1e9} ms`);
+    let html = `<div class="mem-trail"><div class="dim">where the value at ${at(t.address, t.label)} came from, write by write <a data-close="trail">close</a></div>`;
+    t.hops.forEach((hop, i) => {
+      const lead = i === 0 ? "as it stands" : `which was written there`;
+      html += `<div class="trail-hop dim">${lead}: ${at(hop.at, hop.what)} — the board run again over the ${window(hop.window)} to ${when(hop.time / 1000)}</div>`;
+      html += hop.steps.length ? `<ol class="mem-why">${steps(hop.steps)}</ol>` : "";
+    });
+    if (t.running) html += `<div class="dim">running the board again over the ${window(t.running.window)} before ${(t.running.time / 1e9).toFixed(3)} ms, following everything…</div>`;
+    if (t.error) html += `<div class="dim">${e(t.error)}</div>`;
+    const end = t.end;
+    const last = end?.step;
+    const ends = {
+      bus: () => `it came in from outside, off ${e(last.register)}`,
+      rom: () => `it came from ${e(last.where)}`,
+      constant: () => `the code that stored it made it`,
+      unwritten: () => `never written since the board started: what the RAM held at reset`,
+      writer: () => `written by ${e(end.by?.code ?? last?.written?.by?.code ?? "something not an instruction")}`,
+      register: () => `it sat in ${e(last?.register ?? "a register")} longer than the widest window: followed no further`,
+      unfollowed: () => `nothing followed in the window wrote it: the probe, or DMA`,
+      more: () => `followed ${t.hops.length} writes back <a data-trail-more title="go on, from the last write">keep going</a>`,
+    };
+    if (end) html += `<div class="trail-end">${(ends[end.kind] ?? (() => e(end.kind)))()}</div>`;
+    return `${html}</div>`;
   }
 
   auditHtml() {
@@ -677,7 +717,26 @@ export class Inspector {
     }
     if (t("[data-why]")) {
       const target = nodeOf(t("[data-why]").dataset.why);
-      if (target) this.readWhy(target);
+      if (target) this.readTrail(target.address, target.name.split("::").slice(-2).join("::"));
+      return true;
+    }
+    if (t("[data-trail]")) {
+      const address = Number(t("[data-trail]").dataset.trail);
+      this.readTrail(address, null);
+      return true;
+    }
+    if (t("[data-retrail]")) {
+      const [at, time] = t("[data-retrail]").dataset.retrail.split(",").map(Number);
+      this.readTrail(at, null, { at, time });
+      return true;
+    }
+    if (t("[data-trail-more]") && this.trail?.end?.kind === "more") {
+      const { at, time } = this.trail.end;
+      this.readTrail(this.trail.address, this.trail.label, { at, time });
+      return true;
+    }
+    if (t("[data-goto]")) {
+      this.view.goTo(Number(t("[data-goto]").dataset.goto));
       return true;
     }
     if (t("[data-close]")) {

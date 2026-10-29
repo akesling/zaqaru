@@ -20,11 +20,22 @@
 //! found the same way. The hardware's own pushes and pops — an exception's
 //! frame — carry the tags of the registers they save.
 //!
+//! Following everything ([`Provenance::everything`]), nothing is untagged:
+//! what was in memory before following began — RAM, flash, a NOR, a
+//! peripheral's register — is an origin the first time an instruction
+//! loads it ([`What::Held`]), with the last write to it if it is RAM, which
+//! is where to follow it on from in an earlier window; what each register
+//! held is an origin of its own ([`What::Register`]); and a store of a
+//! value made of nothing — an immediate — is a node with no parent. So a
+//! value's history always ends somewhere that says what to do next.
+//!
 //! What this does not follow: control flow (a branch on a tagged value
 //! leaves what it decides untagged), the FPU's registers, and DMA, whose
 //! writes land untagged. Kept off, it costs a flag test per instruction.
 
 use std::collections::HashMap;
+
+use crate::bus::Mark;
 
 /// A node of a value's history.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +59,12 @@ pub enum What {
     Store { addr: u32, size: u32, value: u32 },
     /// A value made of two tagged ones.
     Merge,
+    /// Following everything: `size` bytes at `addr` that held `value`
+    /// before following began, the first time one was loaded; and the last
+    /// write to them then, if they are RAM.
+    Held { addr: u32, size: u32, value: u32, written: Option<Mark> },
+    /// Following everything: what register `n` held as following began.
+    Register { n: u8, value: u32 },
 }
 
 /// A node's number, from 1; 0 is untagged.
@@ -55,8 +72,11 @@ pub type Tag = u32;
 
 #[derive(Clone, Debug, Default)]
 pub struct Provenance {
-    /// The time it began: what came in before is untagged.
+    /// The time it began: what came in before is untagged, unless
+    /// following `everything`.
     pub since: u64,
+    /// Whether everything is followed, not only what came in off a bus.
+    pub everything: bool,
     pub regs: [Tag; 16],
     /// By byte address; an address not here is untagged.
     pub memory: HashMap<u32, Tag>,
@@ -72,6 +92,15 @@ fn mask(size: u32) -> u32 {
 impl Provenance {
     pub fn new(since: u64) -> Provenance {
         Provenance { since, ..Provenance::default() }
+    }
+
+    /// Following everything from `since`, the registers holding `regs`.
+    pub fn everything(since: u64, regs: &[u32; 16]) -> Provenance {
+        let mut p = Provenance { since, everything: true, ..Provenance::default() };
+        for (n, &value) in regs.iter().enumerate() {
+            p.regs[n] = p.add(Node { what: What::Register { n: n as u8, value }, pc: regs[15], time: since, parents: [0, 0] });
+        }
+        p
     }
 
     pub fn node(&self, tag: Tag) -> Option<&Node> {
@@ -102,17 +131,31 @@ impl Provenance {
         self.union(tags, pc, time)
     }
 
+    /// Following everything, bytes loaded untagged are what they held
+    /// before following began: an origin, kept on them.
+    pub(crate) fn hold(&mut self, addr: u32, size: u32, value: u32, written: Option<Mark>, pc: u32, time: u64) {
+        if !self.everything || (0..size).all(|i| self.memory.contains_key(&addr.wrapping_add(i))) {
+            return;
+        }
+        let tag = self.add(Node { what: What::Held { addr, size, value: value & mask(size), written }, pc, time, parents: [0, 0] });
+        for i in 0..size {
+            self.memory.entry(addr.wrapping_add(i)).or_insert(tag);
+        }
+    }
+
     /// A new instruction.
     pub(crate) fn begin(&mut self) {
         self.loads.clear();
     }
 
     /// A load the instruction made: `data_register` when it read a
-    /// peripheral's data register, which is an origin.
-    pub(crate) fn loaded(&mut self, addr: u32, size: u32, value: u32, data_register: bool, pc: u32, time: u64) {
+    /// peripheral's data register, which is an origin; `written`, the last
+    /// write to what it read, if RAM.
+    pub(crate) fn loaded(&mut self, addr: u32, size: u32, value: u32, data_register: bool, written: Option<Mark>, pc: u32, time: u64) {
         let tag = if data_register {
             self.add(Node { what: What::Read { addr, value }, pc, time, parents: [0, 0] })
         } else {
+            self.hold(addr, size, value, written, pc, time);
             self.of_memory(addr, size, pc, time)
         };
         self.loads.push((value & mask(size), size, tag));
@@ -129,7 +172,9 @@ impl Provenance {
                 self.union(tags, pc, time)
             }
         };
-        let tag = if tag == 0 {
+        // Following everything, a value made of nothing is still a store:
+        // the code's own, a constant.
+        let tag = if tag == 0 && !self.everything {
             0
         } else {
             self.add(Node { what: What::Store { addr, size, value: value & mask(size) }, pc, time, parents: [tag, 0] })
