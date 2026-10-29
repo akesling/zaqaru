@@ -1468,6 +1468,9 @@ impl Board {
         }
         let word = |at: usize| Some(u32::from_le_bytes(wad.get(at..at + 4)?.try_into().ok()?) as usize);
         let (lumps, directory) = (word(4)?, word(8)?);
+        if offset < 12 {
+            return Some("the WAD's header".to_string());
+        }
         if offset >= directory && offset < directory + 16 * lumps {
             return Some(format!("the WAD's directory, entry {}", (offset - directory) / 16));
         }
@@ -1555,7 +1558,13 @@ impl Board {
             return r#"{"following":false,"steps":[],"influences":[]}"#.to_string();
         };
         let pointer = |value: u32| self.machine.bus.ram_at(value).is_some() || value >= 0x0800_0000;
-        let all = p.influences(address, 128);
+        // The kernel's copies between tasks, and memcpy and its kin, move
+        // bytes: where they read is where the bytes were, said already.
+        let moves = |pc: u32| {
+            let code = self.code_at(pc, map);
+            code.starts_with("kernel") || ["memcpy", "memmove", "copy_forward", "copy_backward", "compiler_builtins::mem"].iter().any(|n| code.contains(n))
+        };
+        let all = p.influences(address, 128, &moves);
         let total = all.len();
         let leaves: Vec<String> = all
             .into_iter()

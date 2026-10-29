@@ -324,19 +324,22 @@ impl Provenance {
     /// the origins of whatever it was made of besides — the other values
     /// arithmetic merged into it, and the values the addresses it was
     /// looked up at were worked out from, and theirs in turn. Each with the
-    /// byte it is about and whether it was reached through an address (it
-    /// chose which value, rather than being one). At most `most`, each once.
+    /// byte it is about and whether its last step was through an address
+    /// (it chose which value, rather than being one). At most `most`, each
+    /// once. `moves(pc)` says the code at `pc` only moves bytes — a copy, a
+    /// kernel's between tasks — whose addresses say where it moved them,
+    /// not what they are, and are not followed.
     ///
     /// [`story`]: Provenance::story
-    pub fn influences(&self, address: u32, most: usize) -> Vec<(Tag, &Node, u32, bool)> {
+    pub fn influences(&self, address: u32, most: usize, moves: &dyn Fn(u32) -> bool) -> Vec<(Tag, &Node, u32, bool)> {
         let story = self.story(address, 64);
         let mut out: Vec<(Tag, &Node, u32, bool)> = Vec::new();
         let mut queue = std::collections::VecDeque::new();
         for &(tag, node, byte) in &story {
             match node.what {
                 What::Merge => queue.push_back((node.parents[1], false)),
-                What::Load { .. } => queue.push_back((node.parents[1], true)),
-                What::Store { .. } | What::Bytes { .. } => {}
+                What::Load { .. } if !moves(node.pc) => queue.push_back((node.parents[1], true)),
+                What::Load { .. } | What::Store { .. } | What::Bytes { .. } => {}
                 What::Register { n: 13 | 15, .. } => {}
                 _ => out.push((tag, node, byte, false)),
             }
@@ -353,6 +356,7 @@ impl Provenance {
             match node.what {
                 What::Bytes { lanes, .. } => queue.extend(lanes.map(|l| (l, via))),
                 What::Merge => queue.extend(node.parents.map(|p| (p, via))),
+                What::Load { .. } if moves(node.pc) => queue.push_back((node.parents[0], via)),
                 What::Load { .. } => queue.extend([(node.parents[0], via), (node.parents[1], true)]),
                 What::Store { .. } if node.parents[0] != 0 => queue.push_back((node.parents[0], via)),
                 What::Register { n: 13 | 15, .. } => {}

@@ -10,7 +10,7 @@
 // goes breadth first, nearest first, until it has run `budget` windows,
 // and says what it left unexplored.
 
-import { WIDEST, WINDOW, next, shortPlace } from "./trail.js";
+import { WIDEST, WINDOW, functionOf, next, shortPlace } from "./trail.js";
 
 /// Walks back from `graph.address`, filling `graph.nodes` — `{ id, at,
 /// time, window, depth, via, parent, what, steps }`, the value at `at` as
@@ -19,7 +19,7 @@ import { WIDEST, WINDOW, next, shortPlace } from "./trail.js";
 /// to. Begins at the write `graph.from` (`{ at, time }`), or the last to
 /// the address as things stand (`read`). `query`, `update`, `wanted` and
 /// `cache` as `follow`'s in trail.js.
-export async function depend(graph, { read, query, update = () => {}, wanted = () => true, budget = 40, cache = null }) {
+export async function depend(graph, { read, query, update = () => {}, wanted = () => true, budget = 60, cache = null }) {
   // Going on from where it stopped: what it had yet to follow.
   if (graph.queue) return walk(graph, { query, update, wanted, budget, cache });
   let start = graph.from;
@@ -60,7 +60,8 @@ async function walk(graph, { query, update, wanted, budget, cache }) {
     const node = { id: graph.nodes.length, ...item, window, what: answer?.what ?? null, steps: answer?.steps ?? [] };
     graph.nodes.push(node);
     for (const leaf of answer?.influences ?? []) {
-      const via = item.via === "address" || leaf.via === "address" ? "address" : "value";
+      // Whether it chose the value it was found in, rather than being it.
+      const via = leaf.via;
       const step = next(leaf);
       if (step.at !== undefined) {
         const key = `${step.at} ${step.time}`;
@@ -81,9 +82,9 @@ async function walk(graph, { query, update, wanted, budget, cache }) {
 export function family(origin) {
   const leaf = origin.leaf;
   if (origin.kind === "bus") return leaf.register ?? "a peripheral";
-  if (origin.kind === "constant") return "constants in the code";
+  if (origin.kind === "constant") return `made in ${functionOf(leaf) || "the code"}`;
   const place = shortPlace(leaf.where ?? "");
-  return place.replace(/(\[\d+\]|\s\+\s0x[0-9a-f]+).*$/, "") || "somewhere";
+  return place.replace(/(\[\d+\]|\s\+\s0x[0-9a-f]+|, entry \d+).*$/, "") || "somewhere";
 }
 
 const KINDS = [
@@ -111,13 +112,16 @@ export function grouped(graph) {
 }
 
 /// What a value depended on, in a sentence.
-export function dependsSummary(graph) {
+export function dependsSummary(graph, most = 5) {
   const groups = grouped(graph);
   if (!groups.length) return null;
-  const parts = groups.map((g) => `${g.label}: ${g.families.map((f) => (f.origins.length > 1 ? `${f.name} ×${f.origins.length}` : f.name)).join(", ")}`);
+  const parts = groups.map((g) => {
+    const named = g.families.slice(0, most).map((f) => (f.origins.length > 1 ? `${f.name} ×${f.origins.length}` : f.name));
+    const rest = g.families.length - named.length;
+    return `${g.label}: ${named.join(", ")}${rest > 0 ? ` and ${rest} more` : ""}`;
+  });
   const writes = graph.nodes.length;
-  const choosers = graph.origins.filter((o) => o.via === "address").length;
-  const head = `It depended on ${graph.origins.length} value${graph.origins.length === 1 ? "" : "s"}${choosers ? ` (${choosers} of them chose which value rather than being one)` : ""}, followed back through ${writes} write${writes === 1 ? "" : "s"}`;
+  const head = `It depended on ${graph.origins.length} value${graph.origins.length === 1 ? "" : "s"}, followed back through ${writes} write${writes === 1 ? "" : "s"}`;
   return `${head} — ${parts.join("; ")}${graph.left ? `; ${graph.left} more not yet followed` : ""}.`;
 }
 

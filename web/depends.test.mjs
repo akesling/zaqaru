@@ -27,12 +27,13 @@ test("every value a value depended on is followed back, breadth first, to where 
   assert.deepEqual(asked, ["2400", "24009000", "2400a000"]);
   assert.deepEqual(graph.origins.map((o) => [o.kind, family(o), o.via]), [
     ["rom", "the NOR: WAD lump COLORMAP", "value"],
-    ["rom", "the NOR: WAD lump SW11_1", "address"],
-    ["bus", "USART3 RDR", "address"],
+    ["rom", "the NOR: WAD lump SW11_1", "value"],
+    ["bus", "USART3 RDR", "value"],
   ]);
   assert.deepEqual(pathTo(graph, 2).map((n) => n.at), [0x2400_a000, 0x2400_9000, 0x2400]);
   assert.deepEqual(grouped(graph).map((g) => g.kind), ["bus", "rom"]);
-  assert.match(dependsSummary(graph), /^It depended on 3 values \(2 of them chose which value rather than being one\), followed back through 3 writes — from outside: USART3 RDR; from data: the NOR: WAD lump COLORMAP, the NOR: WAD lump SW11_1\.$/);
+  assert.match(dependsSummary(graph), /^It depended on 3 values, followed back through 3 writes — from outside: USART3 RDR; from data: the NOR: WAD lump COLORMAP, the NOR: WAD lump SW11_1\.$/);
+  assert.match(dependsSummary(graph, 1), /from data: the NOR: WAD lump COLORMAP and 1 more\./);
 });
 
 test("the walk stops at its budget and says what it left", async () => {
@@ -61,4 +62,9 @@ test("a strip of time spreads what was a microsecond before and what was a secon
   assert.equal(xs.length, 3);
   assert.ok(xs[0] > xs[1] && xs[1] > xs[2] && xs[0] - xs[1] > 100, `${xs}`);
   assert.equal(timeStrip([{ t: 1, kind: "step", label: "one" }]), "");
+});
+
+test("places are grouped without which element, entry or offset; constants by the code that made them", () => {
+  assert.equal(family({ kind: "rom", leaf: { where: "the NOR: the WAD's directory, entry 552" } }), "the NOR: the WAD's directory");
+  assert.equal(family({ kind: "constant", leaf: { code: "doom: G_BuildTiccmd + 0x10", lines: [{ function: "G_BuildTiccmd", file: "g_game.c", line: 332 }] } }), "made in G_BuildTiccmd");
 });

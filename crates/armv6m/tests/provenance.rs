@@ -342,7 +342,7 @@ begin:
     run(&mut m);
     let p = m.provenance.as_ref().unwrap();
     let held: Vec<(u32, bool)> = p
-        .influences(0x2400_0200, 16)
+        .influences(0x2400_0200, 16, &|_| false)
         .iter()
         .filter_map(|&(_, node, _, via)| match node.what {
             What::Held { addr, .. } => Some((addr, via)),
