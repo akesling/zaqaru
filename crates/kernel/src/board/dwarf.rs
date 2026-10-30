@@ -227,6 +227,13 @@ impl Board {
         }
         [dir, above].into_iter().find_map(|root| read(format!("{root}/src/{path}").as_bytes()).ok())
     }
+
+    /// Every source file the build kept beside the archive, as the DWARF
+    /// would name each: its `src/.files` (see demo/hubris/sources.sh).
+    pub fn kept_files(&self, read: ReadFile) -> Vec<String> {
+        let Some(list) = self.source_file(".files", read) else { return Vec::new() };
+        String::from_utf8_lossy(&list).lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
+    }
 }
 
 /// Bytes as hex, `--` for each not known.
