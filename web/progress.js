@@ -24,9 +24,18 @@ export function wait(ms) {
 /// `{ fraction, phase, left }`: how much of the run is done, from 0 to 1;
 /// what it is doing, in words; and roughly how long it has left, in words,
 /// once there is enough of it done to say.
-export function progress({ start, from, to, board, elapsed }) {
+export function progress({ start, from, to, board, elapsed, followed = null }) {
   const span = Math.max(1, to - start);
   const fraction = Math.min(1, Math.max(0, (board - start) / span));
+  // Following, what is left goes at following's pace, far slower than
+  // running's: from how far it has gone since it began.
+  if (followed) {
+    const gone = board - followed.board;
+    const took = elapsed - followed.elapsed;
+    const phase = `following from ${boardTime(from)}: at ${boardTime(board)} of ${boardTime(to)}`;
+    const left = gone > 0 && took >= 500 ? `about ${wait(((to - board) / gone) * took)} left` : null;
+    return { fraction, phase, left };
+  }
   const phase =
     from !== null && from !== undefined && board >= from
       ? `following from ${boardTime(from)}: at ${boardTime(board)} of ${boardTime(to)}`

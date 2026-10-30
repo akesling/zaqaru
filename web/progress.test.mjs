@@ -27,3 +27,10 @@ test("nothing said about what is left until there is enough done to say it", () 
   assert.match(progressHtml(null), /restoring a checkpoint/);
   assert.match(progressHtml({ start: 0, from: null, to: 100, board: 25, elapsed: 3000 }), /width:25\.0%.*about 9 s left/);
 });
+
+test("following, what is left is said at following's pace", () => {
+  // Ran to 31.959 s fast, then followed 0.6 s of the board in 60 s.
+  const report = { start: 0, from: 31.959e12, to: 32.959e12, board: 32.559e12, elapsed: 62_000, followed: { board: 31.959e12, elapsed: 2_000 } };
+  assert.equal(progress(report).left, "about 40 s left");
+  assert.equal(progress({ ...report, board: 31.96e12, elapsed: 2_200 }).left, null, "not until it has gone a while");
+});

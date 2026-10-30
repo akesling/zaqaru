@@ -611,18 +611,22 @@ async function boardAt({ time, follow = false, watch = null, back = FOLLOW_BACK 
 
 /// What tells the page how far a run toward an instant has got, at most
 /// every `PROGRESS_MS`: `{ type: "rerun", id, start, from, to, board,
-/// elapsed }` — the board's time at the checkpoint it began from, where
-/// following or watching begins (null for neither), the instant, where it
-/// has got to, and the milliseconds it has taken.
+/// elapsed, followed }` — the board's time at the checkpoint it began
+/// from, where following or watching begins (null for neither), the
+/// instant, where it has got to, the milliseconds it has taken, and where
+/// and when following began (`{ board, elapsed }`, once it has).
 const PROGRESS_MS = 150;
 function reporter(id) {
   const began = performance.now();
   let last = 0;
+  // Where following began, and when: it goes far slower than running.
+  let followed = null;
   return (at) => {
     const now = performance.now();
+    if (!followed && at.from !== null && at.from !== undefined && at.board >= at.from) followed = { board: at.board, elapsed: now - began };
     if (now - last < PROGRESS_MS) return;
     last = now;
-    postMessage({ type: "rerun", id, ...at, elapsed: now - began });
+    postMessage({ type: "rerun", id, ...at, elapsed: now - began, followed });
   };
 }
 
