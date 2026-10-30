@@ -180,6 +180,41 @@ pub struct Definition {
     pub declaration: bool,
 }
 
+/// What the DWARF says the compiler made of the source: each function's
+/// code, each copy of one inlined into another, each static — with the
+/// place it was declared, where the DWARF gives one. For what refers to
+/// what: see xref.rs.
+#[derive(Default)]
+pub(crate) struct Instances {
+    pub functions: Vec<Compiled>,
+    pub inlined: Vec<Inlined>,
+    pub statics: Vec<Placed>,
+}
+
+/// A function's code: its first instruction.
+pub(crate) struct Compiled {
+    pub name: String,
+    pub decl: Option<(String, u32)>,
+    pub low: u32,
+}
+
+/// A copy of a function inlined: where it was called from, and the
+/// function, or inlined copy, it was called in.
+pub(crate) struct Inlined {
+    pub name: String,
+    pub decl: Option<(String, u32)>,
+    pub call: (Option<String>, u32),
+    pub within: Option<String>,
+}
+
+/// A static's bytes.
+pub(crate) struct Placed {
+    pub name: String,
+    pub decl: Option<(String, u32)>,
+    pub address: u32,
+    pub size: u32,
+}
+
 /// The most of a variable's bytes read.
 pub const VARIABLE_BYTES: u32 = 1024;
 
@@ -201,7 +236,12 @@ pub struct Debug {
     frames: gimli::DebugFrame<R>,
     /// Every function the symbol table names, by address, with its size:
     /// for where one without call frame information begins.
-    functions: Vec<(u32, u32)>,
+    pub(crate) functions: Vec<(u32, u32)>,
+    /// And by name, for one the DWARF says nothing of.
+    pub(crate) named_functions: Vec<(String, u32, u32)>,
+    /// The code, by section: for what refers to what (see xref.rs).
+    pub(crate) code: Vec<(u32, Vec<u8>)>,
+    instances: RefCell<Option<std::rc::Rc<Instances>>>,
     types: RefCell<Types>,
     /// By address.
     pub statics: Vec<Static>,
@@ -250,7 +290,8 @@ impl Debug {
         }
         ranges.sort_unstable();
         let functions = crate::hubris::functions(elf);
-        let mut debug = Debug { dwarf, units, ranges, lines, frames, functions, types: RefCell::default(), statics: Vec::new() };
+        let (named_functions, code) = (crate::hubris::named_functions(elf), crate::hubris::code(elf));
+        let mut debug = Debug { dwarf, units, ranges, lines, frames, functions, named_functions, code, instances: RefCell::default(), types: RefCell::default(), statics: Vec::new() };
         debug.statics = debug.read_statics();
         Ok(debug)
     }
@@ -347,6 +388,83 @@ impl Debug {
         }
         out.sort_unstable();
         out.dedup();
+        out
+    }
+
+    /// The file numbered `index` in unit `u`'s line table, as the line
+    /// tables name it.
+    fn file_of(&self, u: usize, index: u64) -> Option<String> {
+        let unit = &self.units[u];
+        let header = unit.line_program.as_ref()?.header();
+        let file = header.file(index)?;
+        let name = self.string(u, file.path_name())?;
+        let dir = file.directory(header).and_then(|d| self.string(u, d)).unwrap_or_default();
+        let comp_dir = unit.comp_dir.as_ref().and_then(|d| Some(d.to_string_lossy().ok()?.into_owned())).unwrap_or_default();
+        Some(join(&join(&comp_dir, &dir), &name))
+    }
+
+    /// Where an entry was declared, or its abstract origin or its
+    /// specification was.
+    fn decl_of(&self, u: usize, entry: &gimli::DebuggingInformationEntry<R>, depth: u32) -> Option<(String, u32)> {
+        if let (Some(AttributeValue::FileIndex(index)), Some(line)) = (entry.attr_value(DW_AT_decl_file), entry.attr_value(DW_AT_decl_line).and_then(|v| v.udata_value())) {
+            return Some((self.file_of(u, index)?, line as u32));
+        }
+        if depth > 4 {
+            return None;
+        }
+        let origin = entry.attr_value(DW_AT_abstract_origin).or_else(|| entry.attr_value(DW_AT_specification))?;
+        let (u, offset) = self.reference(u, origin)?;
+        let entry = self.units[u].entry(offset).ok()?;
+        self.decl_of(u, &entry, depth + 1)
+    }
+
+    /// Every function's code, inlined copy and static: read once.
+    pub(crate) fn instances(&self) -> std::rc::Rc<Instances> {
+        if let Some(done) = self.instances.borrow().as_ref() {
+            return std::rc::Rc::clone(done);
+        }
+        let mut out = Instances::default();
+        for (u, unit) in self.units.iter().enumerate() {
+            // The functions, and inlined copies, each entry is in.
+            let mut within: Vec<(isize, String)> = Vec::new();
+            let mut cursor = unit.entries();
+            while let Ok(Some(entry)) = cursor.next_dfs() {
+                let depth = entry.depth();
+                while within.last().is_some_and(|(d, _)| *d >= depth) {
+                    within.pop();
+                }
+                match entry.tag() {
+                    DW_TAG_subprogram | DW_TAG_inlined_subroutine => {
+                        let Some(name) = self.name_of(u, entry) else { continue };
+                        let decl = self.decl_of(u, entry, 0);
+                        if entry.tag() == DW_TAG_subprogram {
+                            if let Some(AttributeValue::Addr(low)) = entry.attr_value(DW_AT_low_pc) {
+                                out.functions.push(Compiled { name: name.clone(), decl, low: low as u32 & !1 });
+                            }
+                        } else {
+                            let file = match entry.attr_value(DW_AT_call_file) {
+                                Some(AttributeValue::FileIndex(index)) => self.file_of(u, index),
+                                _ => None,
+                            };
+                            let line = entry.attr_value(DW_AT_call_line).and_then(|v| v.udata_value()).unwrap_or(0) as u32;
+                            out.inlined.push(Inlined { name: name.clone(), decl, call: (file, line), within: within.last().map(|(_, n)| n.clone()) });
+                        }
+                        within.push((depth, name));
+                    }
+                    DW_TAG_variable => {
+                        let Some(AttributeValue::Exprloc(expr)) = entry.attr_value(DW_AT_location) else { continue };
+                        let Ok(code) = expr.0.to_slice() else { continue };
+                        let Some(address) = static_address(&code).filter(|&a| a != 0) else { continue };
+                        let Some(name) = self.name_of(u, entry) else { continue };
+                        let size = self.type_of(u, entry).map_or(1, |ty| self.size(ty));
+                        out.statics.push(Placed { name, decl: self.decl_of(u, entry, 0), address, size });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let out = std::rc::Rc::new(out);
+        *self.instances.borrow_mut() = Some(std::rc::Rc::clone(&out));
         out
     }
 

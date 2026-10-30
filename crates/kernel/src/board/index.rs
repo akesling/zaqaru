@@ -121,6 +121,60 @@ impl Board {
     }
 }
 
+impl Board {
+    /// `board/uses/{name}/{line}/{file}`: where the function or static
+    /// `name`, declared at `file` and `line`, is called, inlined or has its
+    /// address taken, as the code made of it says, kernel and tasks:
+    /// `{"name", "found", "sites":[{"how", "file", "line", "function",
+    /// "owner", "pc", "text"}…]}` — `found` false when nothing compiled is
+    /// it (a type, a macro, a local, or code the linker left out).
+    pub fn uses_json(&self, name: &str, line: u32, file: &str, map: Option<&Result<Image, String>>, read: ReadFile) -> Option<String> {
+        use armv6m::xref::How;
+        let image = map?.as_ref().ok()?;
+        let mut found = false;
+        let mut sites = Vec::new();
+        let mut texts: BTreeMap<String, Option<Vec<String>>> = BTreeMap::new();
+        for owner in std::iter::once(&image.kernel).chain(&image.tasks) {
+            let Some(debug) = self.debug_of(&owner.name, read) else { continue };
+            let Ok(debug) = &*debug else { continue };
+            let Some(found_here) = debug.sites(name, file, line) else { continue };
+            found = true;
+            for site in found_here {
+                let how = match site.how {
+                    How::Call => "call",
+                    How::TailCall => "tail call",
+                    How::Inlined => "inlined",
+                    How::Address => "address",
+                };
+                let lines = site.file.as_ref().and_then(|f| {
+                    texts
+                        .entry(f.clone())
+                        .or_insert_with(|| self.source_file(f, read).map(|t| String::from_utf8_lossy(&t).lines().map(|l| l.trim().chars().take(200).collect()).collect()))
+                        .as_ref()
+                });
+                // The compiler moves what it can — an address loaded early
+                // — so a line that does not name it is the nearest that
+                // does, close by.
+                let names = |n: usize| lines.and_then(|l| l.get(n.checked_sub(1)?)).is_some_and(|t: &String| !uses_of(t, name, true).is_empty());
+                let at = site.line as usize;
+                let line = if at == 0 || names(at) { at } else { (1..=40).flat_map(|d| [at + d, at.saturating_sub(d)]).find(|&n| n > 0 && names(n)).unwrap_or(at) };
+                let text = lines.and_then(|l| l.get(line.checked_sub(1)?).cloned());
+                let site = armv6m::xref::Site { line: line as u32, ..site };
+                sites.push(format!(
+                    r#"{{"how":"{how}","file":{},"line":{},"function":{},"owner":{},"pc":{},"text":{}}}"#,
+                    site.file.as_deref().map_or("null".into(), quoted),
+                    site.line,
+                    site.function.as_deref().map_or("null".into(), quoted),
+                    quoted(&owner.name),
+                    site.pc.map_or("null".into(), |pc| pc.to_string()),
+                    text.as_deref().map_or("null".into(), quoted)
+                ));
+            }
+        }
+        Some(format!(r#"{{"name":{},"found":{found},"sites":[{}]}}"#, quoted(name), sites.join(",")))
+    }
+}
+
 /// Where `name` is in `text` as a name in the code: `(line, column)`,
 /// both from 1, each line once; passing over comments, strings and
 /// characters — and in Rust, lifetimes, which look like characters begun.

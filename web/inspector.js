@@ -27,7 +27,7 @@ import { highlight } from "./highlight.js";
 import { definitionsOf, markUse, readIndex, shortFile } from "./symbols.js";
 import { progressHtml } from "./progress.js";
 import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
-import { HOPS, byteOf, folded, follow, functionOf, leafText, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, storyField, summary } from "./trail.js";
+import { HOPS, byteOf, folded, follow, functionOf, leafText, shortFunction, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, storyField, summary } from "./trail.js";
 
 const MODES = [
   ["variables", "variables"],
@@ -177,12 +177,12 @@ export class Inspector {
   /// Shows `line` of `file` — a source line clicked, a name gone to — the
   /// whole file, the line in the middle; where it was before, kept to go
   /// back to.
-  openSource(file, line, whole = true, name = null) {
+  openSource(file, line, whole = true, name = null, def = null) {
     if (this.source && (this.source.file !== file || this.source.line !== line)) {
       this.sourceBack.push(this.source);
       this.sourceForward = [];
     }
-    this.source = { file, line, whole, choices: null, note: null, name };
+    this.source = { file, line, whole, choices: null, note: null, name, def };
     const owner = this.view.selected;
     if (owner) this.readWriters(owner);
     this.draw(true);
@@ -197,26 +197,45 @@ export class Inspector {
     await this.loadIndex();
     if (this.source !== source) return;
     const all = definitionsOf(this.index, name, source.file);
-    // Where it already is is nowhere to go.
-    const elsewhere = all.filter((d) => !(d.file === source.file && d.line === source.line));
+    // At a definition of it: where it is used, as an editor does.
+    const at = all.find((d) => d.file === source.file && d.line === source.line);
+    if (at) return this.showUses(name, at);
+    const elsewhere = all;
     const defined = elsewhere.filter((d) => !d.declared);
     const best = defined.length === 1 ? defined[0] : elsewhere.length === 1 ? elsewhere[0] : null;
-    if (best) return this.openSource(best.file, best.line, true, name);
+    if (best) return this.openSource(best.file, best.line, true, name, best);
     source.choices = null;
-    // Defined here, or nowhere known — a local, a field: where it is used.
-    if (!elsewhere.length) return this.showUses(name);
+    // Defined nowhere known — a local, a field: where it is used.
+    if (!elsewhere.length) return this.showUses(name, null);
     source.choices = { name, all: elsewhere };
     this.draw(true);
   }
 
-  /// Where `name` is used in the board's code (`board/references`): a
-  /// list above the source, kept while its places are gone to.
-  async showUses(name) {
+  /// The definition `name`, as written in the source shown, most likely
+  /// is: the one defined, if one is; or null.
+  async definitionOf(name) {
+    await this.loadIndex();
+    const all = definitionsOf(this.index, name, this.source?.file ?? "");
+    const defined = all.filter((d) => !d.declared);
+    return defined.length === 1 ? defined[0] : all.length === 1 ? all[0] : null;
+  }
+
+  /// Where `name` is used, in a list above the source kept while its
+  /// places are gone to: as the code made of it says (`board/uses`), for
+  /// a function or a static whose definition `def` is known; and in any
+  /// case every line of the source with it (`board/references`).
+  async showUses(name, def = undefined) {
     const uses = { name, running: true };
     this.uses = uses;
     this.draw(true);
+    if (def === undefined) def = await this.definitionOf(name);
+    uses.def = def;
+    const compiled = def && (def.kind === "function" || def.kind === "static");
     try {
-      uses.answer = await this.view.read(`board/references/${name}`);
+      [uses.meaning, uses.answer] = await Promise.all([
+        compiled ? this.view.read(`board/uses/${name}/${def.line}/${def.file}`).catch(() => null) : null,
+        this.view.read(`board/references/${name}`),
+      ]);
     } catch (why) {
       uses.error = String(why);
     }
@@ -231,20 +250,45 @@ export class Inspector {
     const close = `<a data-close="uses">close</a>`;
     if (u.running) return `<div class="mem-uses"><div class="mem-uses-head">finding where <b>${e(u.name)}</b> is used… ${close}</div></div>`;
     if (u.error || !u.answer?.files) return `<div class="mem-uses"><div class="mem-uses-head">where <b>${e(u.name)}</b> is used: ${e(u.error ?? "no index")} ${close}</div></div>`;
+    const here = (file, line) => this.source?.file === file && this.source?.line === line;
+    const row = (file, line, text, before = "", after = "") =>
+      `<a class="mem-use${here(file, line) ? " here" : ""}" data-src="${e(file)}" data-line="${line}" data-hop><span class="ln">${line}</span>${before}<span class="code">${markUse(text ?? "", u.name)}</span>${after}</a>`;
+    // As the code says: each place, grouped by its file.
+    let meaning = "";
+    const sites = u.meaning?.found ? u.meaning.sites.filter((s) => s.file) : null;
+    if (sites) {
+      const byFile = new Map();
+      for (const site of sites) {
+        if (!byFile.has(site.file)) byFile.set(site.file, []);
+        byFile.get(site.file).push(site);
+      }
+      const said = { call: ["call", "calls"], "tail call": ["tail call", "tail calls"], inlined: ["inlined", "inlined"], address: ["takes its address", "take its address"] };
+      const counts = Object.keys(said)
+        .map((how) => [how, sites.filter((s) => s.how === how).length])
+        .filter(([, n]) => n)
+        .map(([how, n]) => `${n} ${said[how][n === 1 ? 0 : 1]}`)
+        .join(", ");
+      const titles = { call: "calls it", "tail call": "jumps to it last, as a call", inlined: "a copy of it compiled into this code", address: "takes its address: to call it later, or to read or write it" };
+      const how = (site) => `<span class="chip use-how" data-how="${site.how}" title="${titles[site.how]}">${site.how === "address" ? "&amp;" : site.how}</span>`;
+      const where = (site) => `<span class="dim use-in">${e(shortFunction(site.function ?? ""))}${site.owner ? ` · ${e(site.owner)}` : ""}</span>`;
+      const rows = [...byFile]
+        .map(([file, list]) => `<div class="mem-uses-file" title="${e(file)}">${e(shortFile(file))} <span class="dim">${list.length}</span></div>${list.map((site) => row(file, site.line, site.text, how(site), where(site))).join("")}`)
+        .join("");
+      meaning = `<div class="mem-uses-label">by what the code does <span class="dim">${counts || "nowhere: nothing compiled calls it or takes its address"}</span></div>${rows}`;
+    }
+    // By name: every line with it.
     const files = u.answer.files;
     const shown = files.reduce((n, f) => n + f.uses.length, 0);
-    const here = (file, line) => this.source?.file === file && this.source?.line === line;
-    const rows = files
-      .map(
-        (f) =>
-          `<div class="mem-uses-file" title="${e(f.file)}">${e(shortFile(f.file))} <span class="dim">${f.uses.length}</span></div>${f.uses
-            .map(([line, , text]) => `<a class="mem-use${here(f.file, line) ? " here" : ""}" data-src="${e(f.file)}" data-line="${line}" data-hop><span class="ln">${line}</span><span class="code">${markUse(text, u.name)}</span></a>`)
-            .join("")}`,
-      )
-      .join("");
-    const count = `${u.answer.total} use${u.answer.total === 1 ? "" : "s"} in ${files.length} file${files.length === 1 ? "" : "s"}${u.answer.total > shown ? `, the first ${shown} shown` : ""}`;
-    return `<div class="mem-uses"><div class="mem-uses-head">where <b>${e(u.name)}</b> is used <span class="dim">${count}</span> ${close}</div><div class="mem-uses-list" data-scroll-key="uses ${e(u.name)}">${rows || `<div class="dim">nowhere in the source the build kept</div>`}</div></div>`;
+    const textRows = files.map((f) => `<div class="mem-uses-file" title="${e(f.file)}">${e(shortFile(f.file))} <span class="dim">${f.uses.length}</span></div>${f.uses.map(([line, , text]) => row(f.file, line, text)).join("")}`).join("");
+    const count = `${u.answer.total} line${u.answer.total === 1 ? "" : "s"} in ${files.length} file${files.length === 1 ? "" : "s"}${u.answer.total > shown ? `, the first ${shown} shown` : ""}`;
+    const compiled = u.def && (u.def.kind === "function" || u.def.kind === "static");
+    const why = !u.def ? "no one definition of it known" : !compiled ? `a ${u.def.kind}, which is no code of its own` : !sites ? "nothing compiled is it" : "";
+    const byName = sites
+      ? `<details class="mem-uses-name"><summary class="mem-uses-label">every line with the name <span class="dim">${count}</span></summary>${textRows}</details>`
+      : `<div class="mem-uses-label">every line with the name <span class="dim">${count}${why ? ` — by name alone: ${why}` : ""}</span></div>${textRows || `<div class="dim">nowhere in the source the build kept</div>`}`;
+    return `<div class="mem-uses"><div class="mem-uses-head">where <b>${e(u.name)}</b> is used ${close}</div><div class="mem-uses-list" data-scroll-key="uses ${e(u.name)}">${meaning}${byName}</div></div>`;
   }
+
 
   /// Brought up to date as the panel polls: the stack when it was written
   /// since it was read, the writers now and then, and what each task is
@@ -1465,7 +1509,7 @@ export class Inspector {
       return true;
     }
     if (t("[data-uses]")) {
-      this.showUses(t("[data-uses]").dataset.uses);
+      this.showUses(t("[data-uses]").dataset.uses, this.source?.def ?? undefined);
       return true;
     }
     if (t("[data-whole]")) {

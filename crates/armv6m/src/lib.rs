@@ -68,6 +68,7 @@ pub mod timer;
 pub mod timing;
 pub mod trace;
 pub mod usart;
+pub mod xref;
 pub mod zip;
 
 use std::collections::BTreeSet;

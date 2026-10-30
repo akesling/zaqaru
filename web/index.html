@@ -170,6 +170,14 @@
   .mem-use.here { background: color-mix(in srgb, var(--accent) 18%, transparent); }
   .mem-use .ln { opacity: .45; min-width: 3.5em; text-align: right; flex: none; }
   .mem-use b { color: var(--accent); }
+  .mem-uses-label { margin: 4px 0 2px; }
+  .mem-uses-name > summary { cursor: pointer; }
+  .mem-use .use-how { flex: none; min-width: 3.6em; text-align: center; --chip: #57606a; }
+  .mem-use .use-how[data-how="call"], .mem-use .use-how[data-how="tail call"] { --chip: #0969da; }
+  .mem-use .use-how[data-how="inlined"] { --chip: #8250df; }
+  .mem-use .use-how[data-how="address"] { --chip: #bf8700; }
+  .mem-use .use-in { flex: none; margin-left: auto; padding-left: 8px; }
+  .mem-use .code { overflow: hidden; text-overflow: ellipsis; }
   .mem-source-head .controls button { padding: 0 5px; }
   .mem-field { margin-top: 4px; }
   .field-scale { display: inline-block; width: 90px; height: 9px; border-radius: 2px; vertical-align: -1px; background: linear-gradient(to right, rgb(120 20 30), rgb(220 70 20) 40%, rgb(255 190 40) 75%, rgb(255 255 230)); }

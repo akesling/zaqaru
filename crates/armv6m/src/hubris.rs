@@ -329,6 +329,25 @@ pub(crate) fn functions(elf: &[u8]) -> Vec<(u32, u32)> {
     out
 }
 
+/// The code of a 32-bit little-endian ELF: each executable section's
+/// address and bytes.
+pub(crate) fn code(elf: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    let Some(parsed) = Elf::parse(elf) else { return Vec::new() };
+    parsed
+        .sections
+        .iter()
+        .filter(|s| s.alloc && s.exec && s.kind != 8)
+        .filter_map(|s| Some((s.addr, elf.get(s.offset as usize..(s.offset as usize).checked_add(s.size as usize)?)?.to_vec())))
+        .collect()
+}
+
+/// The functions of a 32-bit little-endian ELF by name, from its symbol
+/// table: each one's name, address without the Thumb bit, and size.
+pub(crate) fn named_functions(elf: &[u8]) -> Vec<(String, u32, u32)> {
+    let Some(parsed) = Elf::parse(elf) else { return Vec::new() };
+    parsed.symbols.into_iter().filter(|s| s.kind == STT_FUNC && s.size != 0).map(|s| (s.name, s.value & !1, s.size)).collect()
+}
+
 const STT_OBJECT: u8 = 1;
 const STT_FUNC: u8 = 2;
 

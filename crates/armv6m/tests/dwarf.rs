@@ -141,3 +141,39 @@ fn every_function_static_and_type_is_found_where_it_was_declared() {
     // Each once, however many instances of it there are.
     assert_eq!(all.iter().filter(|d| d.name == "safe_copy" && d.kind == Kind::Function).count(), 1);
 }
+
+#[test]
+fn a_function_is_found_where_its_code_is_called_and_inlined() {
+    use armv6m::xref::How;
+    let Some(archive) = archive() else { return };
+    let kernel = debug(&archive, "kernel");
+    let all = kernel.definitions();
+    let def = all.iter().find(|d| d.name == "safe_copy" && !d.declaration).expect("safe_copy");
+    let sites = kernel.sites(&def.name, &def.file, def.line).expect("of the kernel's");
+    if std::env::var("SHOW").is_ok() {
+        for s in &sites {
+            eprintln!("{s:?}");
+        }
+    }
+    assert!(!sites.is_empty());
+    assert!(sites.iter().all(|s| s.file.as_deref().is_some_and(|f| f.ends_with(".rs")) && s.line > 0), "{sites:?}");
+    assert!(sites.iter().any(|s| matches!(s.how, How::Call | How::TailCall | How::Inlined)));
+    // A static, by the instructions that take its address.
+    let failed = all.iter().find(|d| d.name == "KERNEL_HAS_FAILED").expect("KERNEL_HAS_FAILED");
+    let used = kernel.sites(&failed.name, &failed.file, failed.line).expect("of the kernel's");
+    assert!(used.iter().any(|s| s.how == How::Address && s.file.as_deref().is_some_and(|f| f.starts_with("/hubris/sys/kern/src/"))), "{used:?}");
+}
+
+#[test]
+fn doom_s_c_is_known_by_name_where_it_has_no_declaration() {
+    let Ok(archive) = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/demo/doom-build/bench/archives/doom.zip")) else { return };
+    let doom = debug(&archive, "doom");
+    let sites = doom.sites("R_DrawColumn", "task/doom/task/doom/doomgeneric/r_draw.c", 102).expect("Doom's");
+    if std::env::var("SHOW").is_ok() {
+        for s in &sites {
+            eprintln!("{s:?}");
+        }
+    }
+    // Called through `colfunc`: its address taken where that is set.
+    assert!(sites.iter().any(|s| s.file.as_deref().is_some_and(|f| f.ends_with("r_main.c"))), "{sites:?}");
+}
