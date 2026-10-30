@@ -220,7 +220,9 @@
   .mem-source { flex: 1 1 32em; min-width: 0; position: sticky; top: 3em; max-height: 70vh; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; }
   .mem-source-head { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-bottom: 3px; }
   .mem-source-head a, .mem-history a[data-close], .mem-node .acts a { color: var(--accent); cursor: pointer; }
-  .mem-source-body { overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.45; }
+  .mem-source-body { flex: 1 1 auto; min-height: 0; overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.45; }
+  /* Their own height, whatever the code below them: only the code scrolls. */
+  .mem-source > :not(.mem-source-body) { flex: none; }
   .mem-source .sl { display: flex; gap: 6px; white-space: pre; }
   .mem-source .sl[data-runs] { cursor: pointer; }
   .mem-source .sl[data-runs]:hover { background: var(--line); }
