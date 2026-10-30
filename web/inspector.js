@@ -23,6 +23,7 @@
 
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
 import { alike, depend, dependsField, dependsSummary, grouped, pathTo, reachField, timeStrip } from "./depends.js";
+import { highlight } from "./highlight.js";
 import { progressHtml } from "./progress.js";
 import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
 import { HOPS, byteOf, folded, follow, functionOf, leafText, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, storyField, summary } from "./trail.js";
@@ -1155,7 +1156,9 @@ export class Inspector {
     const head = `<div class="mem-source-head"><b>${e(file.split("/").slice(-3).join("/"))}</b>:${line} <span class="dim" title="${e(file)}">${e(file)}</span> <a data-whole>${whole ? "around the line" : "the whole file"}</a> ${close}</div>`;
     if (text === undefined) return `<div class="mem-source">${head}<div class="dim">reading…</div></div>`;
     if (text === null) return `<div class="mem-source">${head}<div class="dim">the build did not keep this file</div></div>`;
-    const lines = text.split("\n");
+    // Coloured once a file: the file's whole text, for what spans lines.
+    if (this.highlighted?.file !== file) this.highlighted = { file, lines: highlight(text, file) };
+    const lines = this.highlighted.lines;
     const from = whole ? 0 : Math.max(0, line - 1 - CONTEXT);
     const to = whole ? lines.length : Math.min(lines.length, line + CONTEXT);
     const owner = this.view.selected;
@@ -1164,7 +1167,7 @@ export class Inspector {
     for (let n = from; n < to; n++) {
       const w = held?.lines.get(`${file}:${n + 1}`);
       const heat = w ? `<span class="heat" data-heat-stamp="${w.latest}" title="${w.words * 4} bytes of ${e(owner)}'s memory last written here"></span>` : `<span class="heat none"></span>`;
-      rows.push(`<div class="sl${n + 1 === line ? " here" : ""}"${w ? ` data-runs="${e(JSON.stringify(w.runs))}"` : ""}><span class="ln">${n + 1}</span>${heat}<span class="code">${e(lines[n]) || " "}</span>${w ? ` <span class="dim wrote">${w.words * 4} B</span>` : ""}</div>`);
+      rows.push(`<div class="sl${n + 1 === line ? " here" : ""}"${w ? ` data-runs="${e(JSON.stringify(w.runs))}"` : ""}><span class="ln">${n + 1}</span>${heat}<span class="code">${lines[n] || " "}</span>${w ? ` <span class="dim wrote">${w.words * 4} B</span>` : ""}</div>`);
     }
     return `<div class="mem-source">${head}<div class="mem-source-body">${rows.join("")}</div><div class="dim">a line's colour: how lately it wrote what of ${owner ? e(owner) : "the task"}'s memory it holds; click one to outline that memory</div></div>`;
   }
