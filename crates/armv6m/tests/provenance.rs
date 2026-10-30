@@ -457,3 +457,33 @@ begin:
     assert!(text.contains("before: store 1 to 0x24000180"), "{text}");
     assert!(text.contains("held 0 at 0x24000180"), "{text}");
 }
+
+#[test]
+fn an_address_made_of_immediates_is_made_of_nothing() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100
+    movs r1, #5
+    str r1, [r3]
+    nop
+begin:
+    ldr r0, [r3]             @ r0 holds something followed
+    ldr r1, [r3]
+    cmp r0, #0
+    movw r0, #0x0200         @ and then an address, of nothing
+    movt r0, #0x2400
+    str r1, [r0]
+    str r0, [r0, #4]
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 4), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let tag = p.memory[&0x2400_0204];
+    let node = p.node(tag).unwrap();
+    assert!(matches!(node.what, What::Store { value: 0x2400_0200, .. }), "{node:?}");
+    assert_eq!(node.parents[0], 0, "the address is a constant: {:?}", p.node(node.parents[0]));
+}

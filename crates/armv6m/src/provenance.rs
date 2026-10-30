@@ -290,7 +290,9 @@ impl Provenance {
         if written == 0 {
             return;
         }
-        let from_registers: Vec<Tag> = (0..16).filter(|n| read & 1 << n != 0).map(|n| self.regs[n]).collect();
+        // Not the pc: what is made of it — a literal's address, a table's
+        // beside the code — is a constant of the code's.
+        let from_registers: Vec<Tag> = (0..15).filter(|n| read & 1 << n != 0).map(|n| self.regs[n]).collect();
         let mut computed = None;
         for n in 0..16 {
             if written & 1 << n == 0 {
@@ -515,9 +517,9 @@ impl Provenance {
                 let made = self.node(at).map_or(0, |n| n.parents[0]);
                 // The same code storing to the same place what it made of
                 // what it stored there before: a count, a sum, folded.
-                if let Some(previous) = self.repeated(at, walk) {
+                if let Some(previous) = self.repeated(at) {
                     let (mut earliest, mut times) = (previous, 1);
-                    while let Some(before) = self.repeated(earliest, walk) {
+                    while let Some(before) = self.repeated(earliest) {
                         if times >= 1 << 20 {
                             break;
                         }
@@ -595,7 +597,7 @@ impl Provenance {
 
     /// The store before `tag` by the same code to the same place, if what
     /// `tag` stored was made of it — within a few steps back.
-    fn repeated(&self, tag: Tag, walk: &mut Walk) -> Option<Tag> {
+    fn repeated(&self, tag: Tag) -> Option<Tag> {
         let Some(&Node { what: What::Store { addr, .. }, pc, .. }) = self.node(tag) else { return None };
         let mut queue = std::collections::VecDeque::from([self.node(tag)?.parents[0]]);
         let mut seen = 0;

@@ -215,7 +215,9 @@ impl Machine {
         carry: bool,
     ) -> Result<Step, Fault> {
         let undefined = Self::undefined32(hw1, hw2);
-        let x = self.r(n);
+        // MOV and MVN have no Rn: read none, lest following values take
+        // the pc for what the result was made of.
+        let x = if n == 15 && matches!(op, 0b0010 | 0b0011) { 0 } else { self.r(n) };
         let c = self.cpu.c;
         // TST, TEQ, CMN and CMP: the operation, flags only.
         let test = d == 15 && setflags && matches!(op, 0b0000 | 0b0100 | 0b1000 | 0b1101);
@@ -303,7 +305,9 @@ impl Machine {
         let d = bits(hw2, 11, 8);
         let imm12 = (hw1 >> 10 & 1) << 11 | bits(hw2, 14, 12) << 8 | hw2 & 0xFF;
         let imm5 = bits(hw2, 14, 12) << 2 | bits(hw2, 7, 6);
-        let x = self.r(n);
+        // MOVW's and MOVT's Rn bits are their immediate's top four: no
+        // register is read.
+        let x = if matches!(op, 0b00100 | 0b01100) { 0 } else { self.r(n) };
         match op {
             // ADDW and SUBW; from the pc, ADR.
             0b00000 | 0b01010 => {
