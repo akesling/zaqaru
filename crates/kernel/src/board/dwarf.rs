@@ -29,6 +29,8 @@ pub struct Cache {
     owners: HashMap<String, Rc<Result<Debug, String>>>,
     /// `board/index`, once made: see index.rs.
     pub index: Option<Rc<String>>,
+    /// Every source file it read, for `board/references`.
+    pub sources: Rc<Vec<String>>,
 }
 
 impl Board {
@@ -38,7 +40,7 @@ impl Board {
         let archive = self.archive.as_ref()?;
         let mut cache = self.debug.borrow_mut();
         if cache.archive != *archive {
-            *cache = Cache { archive: archive.clone(), owners: HashMap::new(), index: None };
+            *cache = Cache { archive: archive.clone(), ..Cache::default() };
         }
         if let Some(debug) = cache.owners.get(owner) {
             return Some(Rc::clone(debug));

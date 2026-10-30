@@ -74,3 +74,19 @@ export function search(index, query, most = 30) {
 export function shortFile(file) {
   return file.split("/").slice(-2).join("/");
 }
+
+/// A line a name is used on, as HTML: the name, each time it is a whole
+/// word, in `<b>`.
+export function markUse(text, name) {
+  const escape = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const clean = name.replace(/[^\w]/g, "");
+  if (!clean) return escape(text);
+  const word = new RegExp(`(?<![\\w])${clean}(?![\\w])`, "g");
+  let out = "";
+  let at = 0;
+  for (const m of text.matchAll(word)) {
+    out += `${escape(text.slice(at, m.index))}<b>${escape(m[0])}</b>`;
+    at = m.index + m[0].length;
+  }
+  return out + escape(text.slice(at));
+}

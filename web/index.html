@@ -160,6 +160,16 @@
   .mem-source .code [class^="hl-"]:not(.hl-c):not(.hl-s):not(.hl-n):not(.hl-k):not(.hl-a):not(.hl-l):hover { text-decoration: underline; cursor: pointer; }
   .mem-source-choices { display: flex; flex-direction: column; gap: 1px; padding: 3px 0 5px; border-bottom: 1px solid var(--line); margin-bottom: 3px; }
   .mem-source-choices a { cursor: pointer; }
+  .mem-uses { border-bottom: 1px solid var(--line); margin-bottom: 4px; padding-bottom: 4px; }
+  .mem-uses-head { padding-bottom: 3px; }
+  .mem-uses-head a, .mem-source-head a[data-uses] { color: var(--accent); cursor: pointer; }
+  .mem-uses-list { max-height: 28vh; overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.45; }
+  .mem-uses-file { margin-top: 4px; font-weight: 600; opacity: .8; }
+  .mem-use { display: flex; gap: 6px; white-space: pre; overflow: hidden; text-overflow: ellipsis; cursor: pointer; color: inherit; text-decoration: none; }
+  .mem-use:hover { background: var(--line); }
+  .mem-use.here { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+  .mem-use .ln { opacity: .45; min-width: 3.5em; text-align: right; flex: none; }
+  .mem-use b { color: var(--accent); }
   .mem-source-head .controls button { padding: 0 5px; }
   .mem-field { margin-top: 4px; }
   .field-scale { display: inline-block; width: 90px; height: 9px; border-radius: 2px; vertical-align: -1px; background: linear-gradient(to right, rgb(120 20 30), rgb(220 70 20) 40%, rgb(255 190 40) 75%, rgb(255 255 230)); }

@@ -24,7 +24,7 @@
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
 import { alike, depend, dependsField, dependsSummary, grouped, pathTo, reachField, timeStrip } from "./depends.js";
 import { highlight } from "./highlight.js";
-import { definitionsOf, readIndex, shortFile } from "./symbols.js";
+import { definitionsOf, markUse, readIndex, shortFile } from "./symbols.js";
 import { progressHtml } from "./progress.js";
 import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
 import { HOPS, byteOf, folded, follow, functionOf, leafText, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, storyField, summary } from "./trail.js";
@@ -88,6 +88,7 @@ export class Inspector {
     this.sourceBack = []; // where the source was, to go back to
     this.sourceForward = [];
     this.index = null; // the board's code, indexed: see `loadIndex`
+    this.uses = null; // { name, running, answer | error }: where a name is used, see `showUses`
     this.history = null; // { key, address, size, type, owner, answer | error }
     this.trail = null; // { address, label, hops, end, running, error }: see trail.js
     this.windows = new Map(); // the stories' windows run so far: see trail.js
@@ -176,12 +177,12 @@ export class Inspector {
   /// Shows `line` of `file` — a source line clicked, a name gone to — the
   /// whole file, the line in the middle; where it was before, kept to go
   /// back to.
-  openSource(file, line, whole = true) {
+  openSource(file, line, whole = true, name = null) {
     if (this.source && (this.source.file !== file || this.source.line !== line)) {
       this.sourceBack.push(this.source);
       this.sourceForward = [];
     }
-    this.source = { file, line, whole, choices: null, note: null };
+    this.source = { file, line, whole, choices: null, note: null, name };
     const owner = this.view.selected;
     if (owner) this.readWriters(owner);
     this.draw(true);
@@ -200,12 +201,49 @@ export class Inspector {
     const elsewhere = all.filter((d) => !(d.file === source.file && d.line === source.line));
     const defined = elsewhere.filter((d) => !d.declared);
     const best = defined.length === 1 ? defined[0] : elsewhere.length === 1 ? elsewhere[0] : null;
-    if (best) return this.openSource(best.file, best.line);
+    if (best) return this.openSource(best.file, best.line, true, name);
     source.choices = null;
-    if (!all.length) source.note = `nothing known defines ${name}`;
-    else if (!elsewhere.length) source.note = `${name} is defined here`;
-    else source.choices = { name, all: elsewhere };
+    // Defined here, or nowhere known — a local, a field: where it is used.
+    if (!elsewhere.length) return this.showUses(name);
+    source.choices = { name, all: elsewhere };
     this.draw(true);
+  }
+
+  /// Where `name` is used in the board's code (`board/references`): a
+  /// list above the source, kept while its places are gone to.
+  async showUses(name) {
+    const uses = { name, running: true };
+    this.uses = uses;
+    this.draw(true);
+    try {
+      uses.answer = await this.view.read(`board/references/${name}`);
+    } catch (why) {
+      uses.error = String(why);
+    }
+    uses.running = false;
+    if (this.uses === uses) this.draw(true);
+  }
+
+  usesHtml() {
+    const u = this.uses;
+    if (!u) return "";
+    const e = this.e;
+    const close = `<a data-close="uses">close</a>`;
+    if (u.running) return `<div class="mem-uses"><div class="mem-uses-head">finding where <b>${e(u.name)}</b> is used… ${close}</div></div>`;
+    if (u.error || !u.answer?.files) return `<div class="mem-uses"><div class="mem-uses-head">where <b>${e(u.name)}</b> is used: ${e(u.error ?? "no index")} ${close}</div></div>`;
+    const files = u.answer.files;
+    const shown = files.reduce((n, f) => n + f.uses.length, 0);
+    const here = (file, line) => this.source?.file === file && this.source?.line === line;
+    const rows = files
+      .map(
+        (f) =>
+          `<div class="mem-uses-file" title="${e(f.file)}">${e(shortFile(f.file))} <span class="dim">${f.uses.length}</span></div>${f.uses
+            .map(([line, , text]) => `<a class="mem-use${here(f.file, line) ? " here" : ""}" data-src="${e(f.file)}" data-line="${line}" data-hop><span class="ln">${line}</span><span class="code">${markUse(text, u.name)}</span></a>`)
+            .join("")}`,
+      )
+      .join("");
+    const count = `${u.answer.total} use${u.answer.total === 1 ? "" : "s"} in ${files.length} file${files.length === 1 ? "" : "s"}${u.answer.total > shown ? `, the first ${shown} shown` : ""}`;
+    return `<div class="mem-uses"><div class="mem-uses-head">where <b>${e(u.name)}</b> is used <span class="dim">${count}</span> ${close}</div><div class="mem-uses-list" data-scroll-key="uses ${e(u.name)}">${rows || `<div class="dim">nowhere in the source the build kept</div>`}</div></div>`;
   }
 
   /// Brought up to date as the panel polls: the stack when it was written
@@ -1228,9 +1266,10 @@ export class Inspector {
           .join("")}</div>`
       : "";
     const note = this.source.note ? `<div class="dim">${e(this.source.note)}</div>` : "";
-    const head = `<div class="mem-source-head">${nav} <b>${e(file.split("/").slice(-3).join("/"))}</b>:${line} <span class="dim" title="${e(file)}">${e(file)}</span> <a data-whole>${whole ? "around the line" : "the whole file"}</a> ${close}</div>${choices}${note}`;
-    if (text === undefined) return `<div class="mem-source">${head}<div class="dim">reading…</div></div>`;
-    if (text === null) return `<div class="mem-source">${head}<div class="dim">the build did not keep this file</div></div>`;
+    const usesOf = this.source.name && this.uses?.name !== this.source.name ? ` <a data-uses="${e(this.source.name)}" title="every place it is used">uses of ${e(this.source.name)}</a>` : "";
+    const head = `<div class="mem-source-head">${nav} <b>${e(file.split("/").slice(-3).join("/"))}</b>:${line} <span class="dim" title="${e(file)}">${e(file)}</span> <a data-whole>${whole ? "around the line" : "the whole file"}</a>${usesOf} ${close}</div>${choices}${note}`;
+    if (text === undefined) return `<div class="mem-source">${this.usesHtml()}${head}<div class="dim">reading…</div></div>`;
+    if (text === null) return `<div class="mem-source">${this.usesHtml()}${head}<div class="dim">the build did not keep this file</div></div>`;
     // Coloured once a file: the file's whole text, for what spans lines.
     if (this.highlighted?.file !== file) this.highlighted = { file, lines: highlight(text, file) };
     const lines = this.highlighted.lines;
@@ -1244,7 +1283,7 @@ export class Inspector {
       const heat = w ? `<span class="heat" data-heat-stamp="${w.latest}" title="${w.words * 4} bytes of ${e(owner)}'s memory last written here"></span>` : `<span class="heat none"></span>`;
       rows.push(`<div class="sl${n + 1 === line ? " here" : ""}"${w ? ` data-runs="${e(JSON.stringify(w.runs))}"` : ""}><span class="ln">${n + 1}</span>${heat}<span class="code">${lines[n] || " "}</span>${w ? ` <span class="dim wrote">${w.words * 4} B</span>` : ""}</div>`);
     }
-    return `<div class="mem-source">${head}<div class="mem-source-body" data-scroll-key="${e(`${file}:${line}:${whole}`)}">${rows.join("")}</div><div class="dim">a line's colour: how lately it wrote what of ${owner ? e(owner) : "the task"}'s memory it holds; click one to outline that memory</div></div>`;
+    return `<div class="mem-source">${this.usesHtml()}${head}<div class="mem-source-body" data-scroll-key="${e(`${file}:${line}:${whole}`)}">${rows.join("")}</div><div class="dim">a line's colour: how lately it wrote what of ${owner ? e(owner) : "the task"}'s memory it holds; click one to outline that memory</div></div>`;
   }
 
   hovered(event) {
@@ -1420,7 +1459,13 @@ export class Inspector {
     // A name in the source: where it is defined.
     const name = t(".mem-source .code .hl-i, .mem-source .code .hl-f, .mem-source .code .hl-t, .mem-source .code .hl-x, .mem-source .code .hl-m");
     if (name) {
-      this.goToName(name.textContent.replace(/!$/, ""));
+      // Shift or Alt: where it is used, rather than where it is defined.
+      if (event.shiftKey || event.altKey) this.showUses(name.textContent.replace(/!$/, ""));
+      else this.goToName(name.textContent.replace(/!$/, ""));
+      return true;
+    }
+    if (t("[data-uses]")) {
+      this.showUses(t("[data-uses]").dataset.uses);
       return true;
     }
     if (t("[data-whole]")) {

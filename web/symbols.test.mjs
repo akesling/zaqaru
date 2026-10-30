@@ -1,7 +1,7 @@
 // Checks `symbols.js` under Node: node --test web/symbols.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { definitionsOf, readIndex, search } from "./symbols.js";
+import { definitionsOf, markUse, readIndex, search } from "./symbols.js";
 
 const index = readIndex({
   files: ["/hubris/sys/kern/src/task.rs", "/hubris/sys/kern/src/umem.rs", "/hubris/drv/i2c/src/lib.rs", "task/doom/doomgeneric/r_draw.c", "task/doom/doomgeneric/r_draw.h"],
@@ -29,4 +29,8 @@ test("symbols found by name — exactly, its start, within it — or by path; on
   assert.deepEqual(search(index, "copy").map((s) => s.name), ["safe_copy"]);
   assert.deepEqual(search(index, "R_Draw").map((s) => `${s.file}:${s.line}`), ["task/doom/doomgeneric/r_draw.c:120"]);
   assert.deepEqual(search(index, " "), []);
+});
+
+test("a line a name is used on, the name marked where it is a whole word", () => {
+  assert.equal(markUse("x = FRACBITS + MAXFRACBITS < FRACBITS;", "FRACBITS"), "x = <b>FRACBITS</b> + MAXFRACBITS &lt; <b>FRACBITS</b>;");
 });

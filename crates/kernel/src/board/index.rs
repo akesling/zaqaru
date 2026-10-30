@@ -78,9 +78,121 @@ impl Board {
             named.iter().map(|f| quoted(f)).collect::<Vec<_>>().join(","),
             rows.join(",")
         ));
-        self.debug.borrow_mut().index = Some(Rc::clone(&json));
+        let mut cache = self.debug.borrow_mut();
+        cache.index = Some(Rc::clone(&json));
+        cache.sources = Rc::new(files);
         Some(json)
     }
+
+    /// `board/references/{name}`: where `name` is used in the source the
+    /// build kept — as a name in the code, not in a comment or a string —
+    /// `{"name", "files":[{"file", "uses":[[line, column, text]…]}…],
+    /// "total"}`, the line's text trimmed; at most `most` uses said.
+    pub fn references_json(&self, name: &str, most: usize, map: Option<&Result<Image, String>>, read: ReadFile) -> Option<String> {
+        self.index_json(map, read)?;
+        let sources = Rc::clone(&self.debug.borrow().sources);
+        let mut total = 0;
+        let mut out = Vec::new();
+        for file in sources.iter() {
+            if !(file.ends_with(".rs") || file.ends_with(".c") || file.ends_with(".h")) {
+                continue;
+            }
+            let Some(text) = self.source_file(file, read) else { continue };
+            let text = String::from_utf8_lossy(&text);
+            // Cheaply passed over: a file that has it nowhere.
+            if !text.contains(name) {
+                continue;
+            }
+            let lines: Vec<&str> = text.lines().collect();
+            let mut uses = Vec::new();
+            for (line, column) in uses_of(&text, name, file.ends_with(".rs")) {
+                total += 1;
+                if total > most {
+                    continue;
+                }
+                let said: String = lines.get(line as usize - 1).map_or("", |l| l.trim()).chars().take(200).collect();
+                uses.push(format!("[{line},{column},{}]", quoted(&said)));
+            }
+            if !uses.is_empty() {
+                out.push(format!(r#"{{"file":{},"uses":[{}]}}"#, quoted(file), uses.join(",")));
+            }
+        }
+        Some(format!(r#"{{"name":{},"files":[{}],"total":{total}}}"#, quoted(name), out.join(",")))
+    }
+}
+
+/// Where `name` is in `text` as a name in the code: `(line, column)`,
+/// both from 1, each line once; passing over comments, strings and
+/// characters — and in Rust, lifetimes, which look like characters begun.
+pub fn uses_of(text: &str, name: &str, rust: bool) -> Vec<(u32, u32)> {
+    let bytes = text.as_bytes();
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let (mut i, mut line, mut start) = (0, 1u32, 0);
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\n' => {
+                line += 1;
+                start = i + 1;
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    if bytes[i] == b'\n' {
+                        line += 1;
+                        start = i + 1;
+                    }
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    } else if bytes[i] == b'\n' {
+                        line += 1;
+                        start = i + 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'\'' => {
+                // A character, `'x'`, `'\n'`; in Rust, `'a` begins a lifetime.
+                let close = if bytes.get(i + 1) == Some(&b'\\') { bytes[i + 2..].iter().position(|&c| c == b'\'').map(|p| i + 2 + p) } else { (bytes.get(i + 2) == Some(&b'\'')).then_some(i + 2) };
+                match close {
+                    Some(end) if end - i <= 12 => i = end + 1,
+                    _ if rust => {
+                        i += 1;
+                        while i < bytes.len() && word(bytes[i]) {
+                            i += 1;
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            _ if word(b) => {
+                let from = i;
+                while i < bytes.len() && word(bytes[i]) {
+                    i += 1;
+                }
+                if &text[from..i] == name && !b.is_ascii_digit() && out.last().is_none_or(|(l, _)| *l != line) {
+                    out.push((line, (from - start) as u32 + 1));
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
 }
 
 /// What a source file defines that a line says plainly: `(name, kind,
@@ -314,6 +426,16 @@ mod tests {
         let text = "pub(crate) const unsafe fn copy() {}\n#[derive(Debug)]\npub struct Task {\n    pub const MAX: usize = 3;\nmacro_rules! ringbuf {\nstatic mut TICKS: u64 = 0;\n    let x = 1;\nimpl Task {\n    type Output = u8;\npub fn _x() {}\nconst _: () = ();";
         let found: Vec<_> = scan("kern/src/task.rs", text).into_iter().map(|(n, k, l, _)| format!("{n} {k} {l}")).collect();
         assert_eq!(found, ["copy function 1", "Task type 3", "MAX const 4", "ringbuf macro 5", "TICKS static 6", "Output type 9", "_x function 10"]);
+    }
+
+    #[test]
+    fn a_name_is_used_where_it_is_code_not_where_it_is_said() {
+        use super::uses_of;
+        let c = "int x = FRACBITS; // FRACBITS\n/* FRACBITS\n */ char *s = \"FRACBITS\"; char c = 'F';\n  y = FRACBITS + MAXFRACBITS + FRACBITS;";
+        assert_eq!(uses_of(c, "FRACBITS", false), [(1, 9), (4, 7)]);
+        let rust = "fn f<'a>(t: &'a Task) -> Task { let c = 'T'; Task::new() }\n// Task";
+        assert_eq!(uses_of(rust, "Task", true), [(1, 17)]);
+        assert_eq!(uses_of(rust, "a", true), []);
     }
 
     #[test]
