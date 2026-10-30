@@ -438,7 +438,8 @@ impl Machine {
             // Data processing, register.
             0b010000 => {
                 let dn = low(i, 0);
-                let x = self.r(dn);
+                // NEG and MVN read Rm alone.
+                let x = if matches!(i >> 6 & 0xF, 0x9 | 0xF) { 0 } else { self.r(dn) };
                 let y = self.r(low(i, 3));
                 let c = self.cpu.c;
                 let shifted = |machine: &mut Machine, kind| {
@@ -653,7 +654,9 @@ impl Machine {
     fn miscellaneous(&mut self, i: u32) -> Result<Flow, Fault> {
         let pc = self.cpu.pc;
         let undefined = Err(Fault::Undefined { instr: i });
-        let m = self.r(low(i, 3));
+        // Rm, for the extends and the byte reversals alone: push, pop and
+        // the rest read none, and following values must not think they do.
+        let m = if matches!(i >> 8 & 0xF, 0b0010 | 0b1010) { self.r(low(i, 3)) } else { 0 };
         let d = low(i, 0);
 
         match i >> 8 & 0xF {

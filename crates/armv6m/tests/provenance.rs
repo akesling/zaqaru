@@ -487,3 +487,40 @@ begin:
     assert!(matches!(node.what, What::Store { value: 0x2400_0200, .. }), "{node:?}");
     assert_eq!(node.parents[0], 0, "the address is a constant: {:?}", p.node(node.parents[0]));
 }
+
+#[test]
+fn a_pop_is_chosen_by_nothing() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100
+    movs r1, #5
+    str r1, [r3]
+    ldr r0, =0x24000200
+    movs r2, #1
+    movs r7, #9
+    adr r4, after
+    adds r4, #1
+    push {r4}
+    push {r7}
+    nop
+begin:
+    ldr r1, [r3]             @ followed values in registers
+    ldr r2, [r3]
+    str.w r1, [r0, r2, lsl #2]
+    pop {r7, pc}
+    .align 2
+after:
+    ldr r6, =0x24000300
+    str r7, [r6]
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 11), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let store = p.node(p.memory[&0x2400_0300]).unwrap();
+    let popped = p.node(store.parents[0]).unwrap();
+    assert!(matches!(popped.what, What::Held { value: 9, .. }), "{popped:?}");
+}
