@@ -1805,6 +1805,121 @@ impl Board {
         format!(r#"{{"following":true,"since_ns":{},"runs":{total},"shown":[{}]}}"#, p.since / 1000, out.join(","))
     }
 
+    /// One node of a value's history as JSON: what it was — a store, a
+    /// read off a bus, what was held since before, a register's, a merge
+    /// and its operation, a load — with its value, where, its code and
+    /// line, and when. `byte`, the one of a store's or a hold's that is
+    /// asked about.
+    fn node_json(&self, node: &armv6m::provenance::Node, byte: u32, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
+        use crate::system::server::quoted;
+        use armv6m::provenance::What;
+        let lines: Vec<String> = self.lines_at(node.pc, map, read).iter().map(dwarf::line_json).collect();
+        // The byte followed, where it is one of those the node is about.
+        let within = |addr: u32, size: u32| if byte.wrapping_sub(addr) < size { byte } else { addr };
+        let common = format!(r#""byte":{byte},"t":{},"pc":{},"code":{},"lines":[{}]"#, node.time / 1000, node.pc, quoted(&self.code_at(node.pc, map)), lines.join(","));
+        match node.what {
+            What::Store { addr, size, value } => format!(r#"{{"what":"store","addr":{addr},"size":{size},"value":{value},"where":{},{common}}}"#, quoted(&self.describe_typed(within(addr, size), map, read))),
+            What::Read { addr, value } => {
+                let register = armv6m::names::data_register(&self.machine.bus.soc, addr).unwrap_or_default();
+                let record = self.record_of(&register, value, node.time);
+                format!(
+                    r#"{{"what":"read","addr":{addr},"value":{value},"register":{},"record":{},{common}}}"#,
+                    quoted(&register),
+                    record.map_or("null".into(), |(n, t)| format!(r#"{{"n":{n},"t":{}}}"#, t / 1000))
+                )
+            }
+            What::Held { addr, size, value, written } => format!(
+                r#"{{"what":"held","addr":{addr},"size":{size},"value":{value},"where":{},"ram":{},"written":{},{common}}}"#,
+                quoted(&self.describe_typed(within(addr, size), map, read)),
+                self.machine.bus.ram_at(addr).is_some(),
+                written.map_or("null".into(), |mark| format!(r#"{{"stamp":{},"by":{}}}"#, mark.stamp, self.writer_json(mark.writer, map, read)))
+            ),
+            What::Register { n, value } => format!(
+                r#"{{"what":"register","register":"{}","value":{value},{common}}}"#,
+                match n {
+                    13 => "sp".to_string(),
+                    14 => "lr".to_string(),
+                    15 => "pc".to_string(),
+                    n => format!("r{n}"),
+                }
+            ),
+            What::Merge { value } => format!(r#"{{"what":"merge","op":"{}","value":{},{common}}}"#, self.operation_at(node.pc), value.map_or("null".into(), |v| v.to_string())),
+            What::Load { addr, value } => format!(r#"{{"what":"load","addr":{addr},"value":{value},"where":{},{common}}}"#, quoted(&self.describe_typed(addr, map, read))),
+            What::Bytes { addr, value, .. } => format!(r#"{{"what":"bytes","addr":{addr},"value":{value},"where":{},{common}}}"#, quoted(&self.describe_typed(addr, map, read))),
+        }
+    }
+
+    /// The operation of the instruction at `pc`, in a word: `add`, `mul`.
+    fn operation_at(&self, pc: u32) -> &'static str {
+        let half = |at: u32| self.machine.bus.peek(at, 2).unwrap_or(0);
+        let first = half(pc);
+        armv6m::ops::operation(first, if armv6m::ops::wide(first) { half(pc.wrapping_add(2)) } else { 0 })
+    }
+
+    /// How the value at an address, in a register, or of a node of the
+    /// window's history (`node`, its tag) was made, as a tree of JSON
+    /// (`armv6m::provenance::Provenance::derivation`): each node with
+    /// what it was (`node_json`), the copies it was before, how many
+    /// times the same code made it of itself before, and what it was
+    /// made of — `role` `value` part of it, `chose` what chose an entry of
+    /// a table, `before` its own value before the repeats. A node left
+    /// out is `cut`, to be asked about by its tag; one said already,
+    /// `same`.
+    pub fn derive_json(&self, subject: Option<Subject>, node: Option<u32>, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
+        use crate::system::server::quoted;
+        use armv6m::provenance::{Derived, Role, What};
+        let Some(p) = &self.machine.provenance else {
+            return r#"{"following":false}"#.to_string();
+        };
+        let (tag, about) = match (subject, node) {
+            (Some(Subject::Address(address)), _) => (p.memory.get(&address).copied().unwrap_or(0), format!(r#""address":{address},"what":{}"#, quoted(&self.describe(address, map)))),
+            (Some(Subject::Register(n)), _) => (p.regs[n as usize], format!(r#""register":"r{n}","value":{},"what":"r{n}""#, self.machine.cpu.reg(n as usize))),
+            (None, Some(tag)) => (tag, format!(r#""node":{tag}"#)),
+            (None, None) => (0, String::new()),
+        };
+        let pointer = |value: u32| self.machine.bus.ram_at(value).is_some() || value >= 0x0800_0000;
+        let says_nothing = |node: &armv6m::provenance::Node| match node.what {
+            What::Held { addr, size, value, .. } => addr.wrapping_sub(node.pc) < 4096 || (size == 4 && pointer(value)),
+            What::Register { n: 13 | 15, .. } => true,
+            What::Register { value, .. } => pointer(value),
+            // A pointer the code made and kept: which struct, which table.
+            What::Store { size: 4, value, .. } => pointer(value),
+            _ => false,
+        };
+        let tree = p.derivation(tag, 24, 240, &says_nothing);
+        fn json(board: &Board, p: &armv6m::provenance::Provenance, d: &Derived, role: Role, byte: u32, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
+            let Some(node) = p.node(d.tag) else { return "null".into() };
+            let role = match role {
+                Role::Value => "value",
+                Role::Chose => "chose",
+                Role::Again => "before",
+            };
+            let mut out = format!(r#"{{"tag":{},"role":"{role}","step":{}"#, d.tag, board.node_json(node, byte, map, read));
+            if !d.copies.is_empty() {
+                let copies: Vec<String> = d.copies.iter().filter_map(|&c| p.node(c)).map(|n| board.node_json(n, 0, map, read)).collect();
+                out += &format!(r#","copies":[{}]"#, copies.join(","));
+            }
+            if d.repeats > 0 {
+                out += &format!(r#","repeats":{},"earliest":{}"#, d.repeats, p.node(d.earliest).map_or("null".into(), |n| board.node_json(n, 0, map, read)));
+            }
+            if d.cut {
+                out += r#","cut":true"#;
+            }
+            if d.same {
+                out += r#","same":true"#;
+            }
+            let operands: Vec<String> = d.operands.iter().map(|(role, o)| json(board, p, o, *role, 0, map, read)).collect();
+            format!(r#"{out},"operands":[{}]}}"#, operands.join(","))
+        }
+        let byte = match subject {
+            Some(Subject::Address(address)) => address,
+            _ => 0,
+        };
+        let root = if tag == 0 { "null".to_string() } else { json(self, p, &tree, Role::Value, byte, map, read) };
+        let comma = if about.is_empty() { "" } else { "," };
+        format!(r#"{{"following":true,"everything":{},"since_ns":{}{comma}{about},"tree":{root}}}"#, p.everything, p.since / 1000)
+    }
+
     /// A history's steps as JSON: each node, with the byte it is about.
     fn why_steps(
         &self,
@@ -1814,56 +1929,24 @@ impl Board {
         read: ReadFile,
         depth: usize,
     ) -> Vec<String> {
-        use crate::system::server::quoted;
         use armv6m::provenance::What;
         let mut out = Vec::new();
         for (node, byte) in story {
-            let lines: Vec<String> = self.lines_at(node.pc, map, read).iter().map(dwarf::line_json).collect();
-            // The byte followed, where it is one of those the node is about.
-            let within = |addr: u32, size: u32| if byte.wrapping_sub(addr) < size { byte } else { addr };
-            let common = format!(
-                r#""byte":{byte},"t":{},"pc":{},"code":{},"lines":[{}]"#,
-                node.time / 1000,
-                node.pc,
-                quoted(&self.code_at(node.pc, map)),
-                lines.join(",")
-            );
             out.push(match node.what {
-                What::Store { addr, size, value } => format!(
-                    r#"{{"what":"store","addr":{addr},"size":{size},"value":{value},"where":{},{common}}}"#,
-                    quoted(&self.describe_typed(within(addr, size), map, read))
-                ),
-                What::Read { addr, value } => {
-                    let register = armv6m::names::data_register(&self.machine.bus.soc, addr).unwrap_or_default();
-                    let record = self.record_of(&register, value, node.time);
-                    format!(
-                        r#"{{"what":"read","addr":{addr},"value":{value},"register":{},"record":{},{common}}}"#,
-                        quoted(&register),
-                        record.map_or("null".into(), |(n, t)| format!(r#"{{"n":{n},"t":{}}}"#, t / 1000))
-                    )
-                }
-                What::Merge => {
+                What::Store { .. } | What::Read { .. } | What::Held { .. } | What::Register { .. } => self.node_json(node, byte, map, read),
+                What::Merge { .. } => {
                     let other = p.history(node.parents[1], depth / 2).into_iter().map(|(_, node)| (node, 0)).collect();
                     let other = self.why_steps(p, other, map, read, depth / 2);
-                    format!(r#"{{"what":"merge","other":[{}],{common}}}"#, other.join(","))
+                    let step = self.node_json(node, byte, map, read);
+                    format!(r#"{{"other":[{}],{}"#, other.join(","), &step[1..])
                 }
-                What::Held { addr, size, value, written } => format!(
-                    r#"{{"what":"held","addr":{addr},"size":{size},"value":{value},"where":{},"ram":{},"written":{},{common}}}"#,
-                    quoted(&self.describe_typed(within(addr, size), map, read)),
-                    self.machine.bus.ram_at(addr).is_some(),
-                    written.map_or("null".into(), |mark| format!(
-                        r#"{{"stamp":{},"by":{}}}"#,
-                        mark.stamp,
-                        self.writer_json(mark.writer, map, read)
-                    ))
-                ),
                 // Followed through, lane by lane: never a step of its own.
                 What::Bytes { .. } => continue,
                 // What the address it was read from was worked out from:
                 // the values that chose which entry of a table it was, each
                 // where it came into the window. A constant the code loaded
                 // from beside itself — a table's address — says nothing.
-                What::Load { addr } => {
+                What::Load { .. } => {
                     let leaves: Vec<(&armv6m::provenance::Node, u32)> = p
                         .origins(node.parents[1], 8)
                         .into_iter()
@@ -1877,21 +1960,9 @@ impl Board {
                         continue;
                     }
                     let leaves = self.why_steps(p, leaves, map, read, depth / 2);
-                    format!(
-                        r#"{{"what":"load","addr":{addr},"where":{},"address":[{}],{common}}}"#,
-                        quoted(&self.describe_typed(byte, map, read)),
-                        leaves.join(",")
-                    )
+                    let step = self.node_json(node, byte, map, read);
+                    format!(r#"{{"address":[{}],{}"#, leaves.join(","), &step[1..])
                 }
-                What::Register { n, value } => format!(
-                    r#"{{"what":"register","register":"{}","value":{value},{common}}}"#,
-                    match n {
-                        13 => "sp".to_string(),
-                        14 => "lr".to_string(),
-                        15 => "pc".to_string(),
-                        n => format!("r{n}"),
-                    }
-                ),
             });
         }
         out

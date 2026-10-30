@@ -292,6 +292,18 @@
   .mem-story .depends-label { font-weight: 600; opacity: .8; }
   .mem-story .depends-kind ul { margin: 2px 0; padding-left: 1.2em; list-style: none; }
   .mem-story .depends-kind ol { margin: 2px 0; padding-left: 1.6em; }
+  .mem-story .made-hint { margin: 4px 0 2px; font-size: 12px; }
+  .mem-story .made-tree, .mem-story .made-tree ul { list-style: none; margin: 0; padding: 0; }
+  .mem-story .made-tree ul { margin-left: 7px; padding-left: 10px; border-left: 1px solid var(--line); }
+  .mem-story .made-row { display: flex; gap: 4px; align-items: baseline; padding: 1px 2px; border-radius: 3px; }
+  .mem-story .made-row:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .mem-story .made-toggle { flex: none; width: 1em; text-align: center; color: var(--accent); cursor: pointer; user-select: none; }
+  .mem-story .made-src { display: block; margin: 1px 0 2px; padding: 1px 6px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; border-left: 2px solid var(--line); opacity: .9; }
+  .mem-story .made-expr { font-weight: 600; }
+  .mem-story .made-merge > .made-row .made-value { color: light-dark(#0550ae, #79c0ff); }
+  .mem-story .made-role { --chip: #8250df; }
+  .mem-story .made-fold { --chip: #bf8700; }
+  .mem-story .made-more { font-size: 12px; }
   .mem-story summary { cursor: pointer; }
   .time-strip { display: block; width: 100%; margin: 4px 0; }
   .time-strip .axis { stroke: var(--line); stroke-width: 2; }

@@ -23,11 +23,12 @@
 
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
 import { alike, depend, dependsField, dependsSummary, grouped, pathTo, reachField, timeStrip } from "./depends.js";
+import { deriveField, expression, goOn, nodeLine, onwards, operation, readTree, recurrence, valueOf, valueText } from "./derive.js";
 import { highlight } from "./highlight.js";
 import { definitionsOf, markUse, readIndex, shortFile } from "./symbols.js";
 import { progressHtml } from "./progress.js";
 import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
-import { HOPS, byteOf, folded, follow, functionOf, leafText, shortFunction, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, storyField, summary } from "./trail.js";
+import { HOPS, WINDOW, byteOf, folded, follow, functionOf, leafText, shortFunction, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, storyField, summary } from "./trail.js";
 
 const MODES = [
   ["variables", "variables"],
@@ -380,11 +381,21 @@ export class Inspector {
     }
     let trail = this.trail;
     if (!more) {
-      trail = { address, label, hops: [], asked: from?.time ?? null };
+      // How it was made, first: its way back, write by write, on its tab.
+      trail = { address, label, hops: [], asked: from?.time ?? null, start: from, tab: "made" };
       // A new story drops the ones gone back from, as a browser does.
       this.stories = [...this.stories.slice(0, this.stories.indexOf(this.trail) + 1), trail];
     }
     trail.from = from;
+    this.trail = trail;
+    if (trail.tab === "made") return this.readMade();
+    return this.followStory(trail);
+  }
+
+  /// The story's way back, write by write: see `trail.js`.
+  async followStory(trail) {
+    const from = trail.from;
+    const address = trail.address;
     trail.end = null;
     trail.error = null;
     trail.stopped = false;
@@ -408,13 +419,66 @@ export class Inspector {
     if (this.trail === trail) this.draw(true);
   }
 
+  /// How the story's value was made, as a tree: see `derive.js`. Read once,
+  /// from the write that put it there; each part gone on with, asked.
+  async readMade() {
+    const trail = this.trail;
+    if (!trail) return;
+    trail.tab = "made";
+    const made = trail.made ?? { nodes: new Map(), root: null };
+    trail.made = made;
+    if (made.root || made.running || made.ended) return this.draw(true);
+    made.stopped = false;
+    made.running = { progress: null };
+    const wanted = () => this.trail === trail && trail.tab === "made" && !made.stopped;
+    const update = () => this.trail === trail && this.draw(true);
+    update();
+    try {
+      let start = trail.start;
+      if (!start) {
+        const written = await this.view.read(`board/written/${trail.address}/1`);
+        const [stamp, writer] = written?.words ?? [0, -1];
+        if (stamp && written.writers?.[writer]?.pc !== undefined) start = { at: trail.address, time: stamp * 1e6 };
+        else made.ended = stamp ? "writer" : "unwritten";
+      }
+      if (start) {
+        const window = { time: start.time, from: Math.max(0, start.time - WINDOW) };
+        const answer = await this.view.query({ time: window.time, follow: { from: window.from } }, `board/derive/${start.at}`, (p) => wanted() && this.progressed("made", made.running, p));
+        made.root = readTree(answer?.tree ?? null, window, made.nodes);
+        if (!made.root) made.ended = "untracked";
+      }
+    } catch (why) {
+      made.error = String(why);
+    }
+    made.running = null;
+    update();
+  }
+
+  /// Goes on from a part of how the value was made: see `derive.js`'s
+  /// `goOn`.
+  async madeOn(id) {
+    const trail = this.trail;
+    const made = trail?.made;
+    const node = made?.nodes.get(id);
+    if (!node || node.running) return;
+    made.stopped = false;
+    const wanted = () => this.trail === trail && !made.stopped;
+    const progress = { progress: null };
+    made.going = progress;
+    const query = (options, path) => this.view.query(options, path, (p) => wanted() && this.progressed("made", progress, p));
+    await goOn(node, { query, update: () => this.trail === trail && this.draw(true), wanted, nodes: made.nodes });
+    if (made.going === progress) made.going = null;
+    if (this.trail === trail) this.draw(true);
+  }
+
   /// Everything the story's value depended on: see `depends.js`. Kept on
   /// the story, and gone on with from where it stopped.
   async readDepends() {
     const trail = this.trail;
-    if (!trail?.hops[0]) return;
+    if (!trail) return;
     trail.tab = "depends";
-    const graph = trail.depends ?? { address: trail.address, nodes: [], origins: [], from: { at: trail.hops[0].at, time: trail.hops[0].time } };
+    const first = trail.hops[0] ?? trail.start;
+    const graph = trail.depends ?? { address: trail.address, nodes: [], origins: [], from: first ? { at: first.at, time: first.time } : null };
     trail.depends = graph;
     graph.stopped = false;
     const wanted = () => this.trail === trail && trail.tab === "depends" && !graph.stopped;
@@ -739,6 +803,7 @@ export class Inspector {
     const t = this.trail;
     if (!t) return null;
     if (t.tab === "depends" && t.depends) return { label: `what ${t.label ?? hex(t.address)} depended on`, back: true, points: dependsField(t.depends) };
+    if (t.tab === "made") return { label: `what ${t.label ?? hex(t.address)} was made of`, back: true, points: t.made?.root ? deriveField(t.made.root) : [] };
     return { label: `where ${t.label ?? hex(t.address)} came from`, back: true, points: storyField(t) };
   }
 
@@ -954,6 +1019,133 @@ export class Inspector {
     return `${head}<div class="mem-ticks" title="each write, across the window">${ticks}</div><table class="mem-table">${rows}</table>${dropped}</div>`;
   }
 
+  /// Whether a part of how a value was made is shown folded: as it was
+  /// toggled, or, untouched, if deep.
+  madeClosed(node) {
+    if (node.closed !== undefined) return node.closed;
+    let depth = 0;
+    for (let at = node.parent; at; at = at.parent) depth++;
+    return depth >= 5;
+  }
+
+  /// A source line's text, coloured, once its file has been read.
+  lineHtml(line) {
+    if (!line?.file || !(line.line > 0)) return null;
+    const text = this.fileOf(line.file);
+    if (typeof text !== "string") return null;
+    this.lineCache ??= new Map();
+    let lines = this.lineCache.get(line.file);
+    if (!lines) {
+      lines = text.split("\n");
+      this.lineCache.set(line.file, lines);
+    }
+    const own = lines[line.line - 1];
+    if (own === undefined || !own.trim()) return null;
+    return highlight(own.trim(), line.file)[0];
+  }
+
+  /// How a value was made, as a tree: the store that put it where it is
+  /// at the top, what it was made of below, each part with its code and
+  /// source line; each part held since before, or a register's, to go on
+  /// from, asked.
+  madeHtml(t) {
+    const e = this.e;
+    const made = t.made;
+    if (!made) return "";
+    let html = "";
+    if (made.running) html += `<div class="dim">following every value over the ${span(WINDOW)} before the write, for how it was made</div><div data-progress="made">${progressHtml(made.running.progress)}</div>`;
+    const ends = {
+      unwritten: "It has never been written: it is what the RAM held at reset.",
+      writer: "It was written by something not an instruction: the probe, or DMA.",
+      untracked: "Nothing followed made it: it was written by something not followed.",
+    };
+    if (made.ended) html += `<div class="story-summary">${e(ends[made.ended] ?? made.ended)}</div>`;
+    if (made.error) html += `<div class="dim">${e(made.error)}</div>`;
+    if (made.root) {
+      html += `<div class="dim made-hint">read it top down: each value, then what it was made of. <b>chose</b>: what picked which entry of a table. Hover a line to see it on the memory map.</div>`;
+      html += `<ul class="made-tree">${this.madeNodeHtml(made.root)}</ul>`;
+    }
+    if (made.going) html += `<div data-progress="made">${progressHtml(made.going.progress)}</div>`;
+    return html;
+  }
+
+  madeNodeHtml(node) {
+    const e = this.e;
+    const step = node.step ?? {};
+    const hex = (n) => `0x${(n >>> 0).toString(16)}`;
+    const v = `<b class="made-value">${e(valueText(step.value))}</b>`;
+    const place = (s) => {
+      const owner = placeOwner(s);
+      return `<a data-goto="${s.addr}" title="${e(`${hex(s.addr)} · ${s.where ?? ""}`)}">${e(shortPlace(s.where) || hex(s.addr))}</a>${owner ? ` ${this.ownerChip(owner)}` : ""}`;
+    };
+    const by = (s) => {
+      const line = lineOf(s);
+      const owner = ownerOf(s);
+      return `${e(functionOf(s))}${line?.file ? ` ${this.lineLink(line)}` : ""}${owner && owner !== placeOwner(s) ? ` <span class="dim">in</span> ${this.ownerChip(owner)}` : ""}`;
+    };
+    const when = (s) => (s.t === undefined ? "" : ` <a class="dim when" data-stand="${Math.floor(s.t / 1000) + 1}" title="stand the board here">t=${(s.t / 1e6).toFixed(3)} ms</a>`);
+    let head;
+    switch (step.what) {
+      case "store": {
+        head = `${place(step)} = ${v} <span class="dim">stored by</span> ${by(step)}${when(step)}`;
+        if (node.copies.length) {
+          const maker = node.copies.at(-1);
+          head = `${place(step)} = ${v} <span class="dim">copied from</span> ${node.copies.map(place).join(" ← ")} <span class="dim">· made by</span> ${by(maker)}${when(maker)}`;
+        }
+        if (node.repeats) {
+          const since = node.earliest?.t !== undefined ? ` since t=${(node.earliest.t / 1e6).toFixed(3)} ms` : "";
+          head += ` <span class="chip made-fold" title="the same code stored here ${node.repeats + 1} times, each made of what it stored here before: a count, a sum, a step at a time">×${node.repeats + 1}${since}</span>`;
+        }
+        if (!node.operands.length && !node.cut && !node.same) head += ` <span class="dim">— a constant the code made</span>`;
+        break;
+      }
+      case "merge": {
+        const values = node.operands.map(valueOf);
+        head = `${v} = <span class="made-expr">${e(expression(step.op, values))}</span> <span class="dim">· ${e(operation(step.op).word)} by</span> ${by(step)}`;
+        break;
+      }
+      case "load":
+        head = `${v} <span class="dim">looked up in</span> ${place(step)} <span class="dim">by</span> ${by(step)}`;
+        break;
+      case "bytes":
+        head = `${v} <span class="dim">put together from the bytes of</span> ${place(step)} <span class="dim">by</span> ${by(step)}`;
+        break;
+      case "held": {
+        head = `${v} <span class="dim">was in</span> ${place(step)}`;
+        if (!step.ram) head += step.addr >= 0x4000_0000 && step.addr < 0x6000_0000 ? ` <span class="dim">— a peripheral's register</span>` : ` <span class="dim">— data in flash or the NOR</span>`;
+        else if (!step.written) head += ` <span class="dim">— never written since reset</span>`;
+        else head += ` <span class="dim">since before</span>`;
+        break;
+      }
+      case "read":
+        head = `${v} <span class="dim">read off</span> <b>${e(step.register)}</b>${step.record ? ` <a data-record="${step.record.n}" data-stand="${Math.floor(step.record.t / 1000) + 1}" title="stand the board at the trace record">trace record ${step.record.n}</a>` : ""} <span class="dim">by</span> ${by(step)}${when(step)}`;
+        break;
+      case "register":
+        head = `${v} <span class="dim">was in ${e(step.register)} as the window began</span>${/^r\d+$/.test(step.register ?? "") ? "" : ` <span class="dim">— where the code was, not what it made</span>`}`;
+        break;
+      default:
+        head = `${v}`;
+    }
+    const role = node.role === "chose" ? `<span class="chip made-role" title="what picked which entry of a table it was read from: an index, a coordinate">chose</span> ` : node.role === "before" ? `<span class="chip made-role" title="what the place held before the repeats above began">began from</span> ` : "";
+    if (node.same) head += ` <span class="dim">(as above)</span>`;
+    if (node.running) head += ` <span class="dim">following…</span>`;
+    else if (onwards(node)) {
+      const label = node.cut ? "more" : recurrence(node) ? "count back" : "how it got there";
+      const title = node.cut ? "what this was made of, left out for length" : recurrence(node) ? "its own value before, a window at a time: how many times, since when" : "how this was made, in the window before";
+      head += ` <a data-made-on="${node.id}" title="${title}">${label}</a>`;
+    }
+    if (node.lost) head += ` <span class="dim">— the register held ${hex(node.lost.found)}, not ${hex(node.lost.expected)}, where the window before ended: lost there</span>`;
+    if (node.ended) head += ` <span class="dim">— nothing followed made it</span>`;
+    if (node.error) head += ` <span class="dim">${e(node.error)}</span>`;
+    const line = nodeLine(node);
+    const src = step.what === "held" || step.what === "register" ? null : this.lineHtml(line);
+    const closed = this.madeClosed(node);
+    const toggle = node.operands.length ? `<a class="made-toggle" data-made-toggle="${node.id}" title="${closed ? "show" : "hide"} what it was made of">${closed ? "▸" : "▾"}</a>` : `<span class="made-toggle"></span>`;
+    const at = step.what === "merge" || step.addr === undefined ? "" : ` data-lit="${step.addr}"`;
+    const children = node.operands.length && !closed ? `<ul>${node.operands.map((o) => this.madeNodeHtml(o)).join("")}</ul>` : closed && node.operands.length ? `<span class="dim made-more"> ${node.operands.length} part${node.operands.length === 1 ? "" : "s"}</span>` : "";
+    return `<li class="made-${e(step.what ?? "node")}"><div class="made-row"${at}>${toggle}<span>${role}${head}${src ? `<code class="made-src">${src}</code>` : ""}</span></div>${children}</li>`;
+  }
+
   /// A value's story, latest first: each window's history, the write that
   /// leads to the next, and where it came in.
   trailHtml() {
@@ -1043,10 +1235,12 @@ export class Inspector {
     const index = this.stories.indexOf(t);
     const nav = `<button type="button" data-story="${index - 1}" ${index > 0 ? "" : "disabled"} title="the story before">‹</button><button type="button" data-story="${index + 1}" ${index < this.stories.length - 1 ? "" : "disabled"} title="the story after">›</button>`;
     const value = stepsOf(t)[0]?.step;
-    const head = `<div class="story-head"><span class="controls">${nav}</span> <b>where ${e(t.label ?? hex(t.address))}${value && byteOf(value) !== null ? ` = ${byte(byteOf(value))}` : ""} came from</b> <span class="dim">${hex(t.address)}</span> <span class="controls">${t.running || (t.tab === "depends" && t.depends?.running) ? `<button type="button" data-story-stop>stop</button>` : ""}${t.hops[0] ? `<button type="button" data-reach="${t.address},${t.hops[0].time}" title="follow this value forward from here: everywhere it, and anything made of it, went">where it went</button>` : ""}<button type="button" data-close="trail" title="close the story; ‹ brings it back">close</button></span></div>`;
-    const tabs = t.hops[0] ? `<div class="story-tabs controls"><button type="button" data-story-tab="story"${t.tab !== "depends" ? ' class="on"' : ""}>its way back</button><button type="button" data-story-tab="depends"${t.tab === "depends" ? ' class="on"' : ""} title="every value it was made of or chosen by, each followed back in turn">everything it depended on</button></div>` : "";
+    const head = `<div class="story-head"><span class="controls">${nav}</span> <b>where ${e(t.label ?? hex(t.address))}${value && byteOf(value) !== null ? ` = ${byte(byteOf(value))}` : ""} came from</b> <span class="dim">${hex(t.address)}</span> <span class="controls">${t.running || (t.tab === "depends" && t.depends?.running) || (t.tab === "made" && (t.made?.running || t.made?.going)) ? `<button type="button" data-story-stop>stop</button>` : ""}${(t.hops[0] ?? t.start) ? `<button type="button" data-reach="${t.address},${(t.hops[0] ?? t.start).time}" title="follow this value forward from here: everywhere it, and anything made of it, went">where it went</button>` : ""}<button type="button" data-close="trail" title="close the story; ‹ brings it back">close</button></span></div>`;
+    const tab = (name, label, title) => `<button type="button" data-story-tab="${name}"${t.tab === name ? ' class="on"' : ""} title="${title}">${label}</button>`;
+    const tabs = `<div class="story-tabs controls">${tab("made", "how it was made", "what it was made of, by what code and arithmetic, down to where each part came in")}${tab("story", "its way back", "write by write, each copy back to where it came in")}${tab("depends", "everything it depended on", "every value it was made of or chosen by, each followed back in turn")}</div>`;
     let html = `<div class="mem-story">${head}${tabs}`;
     if (t.tab === "depends") return `${html}${this.dependsHtml(t)}</div>`;
+    if (t.tab === "made") return `${html}${this.madeHtml(t)}</div>`;
     if (said) html += `<div class="story-summary">${e(said)}</div>`;
     html += timeStrip(stepsOf(t).map(({ step }) => ({ t: step.t, kind: step.what === "read" || step === stepsOf(t).at(-1)?.step ? "origin" : "step", label: e(`${step.what} ${shortPlace(step.where ?? step.register ?? "")}`) })).filter((p) => p.t !== undefined));
     if (rows) html += `<ol class="story-steps">${rows}</ol>`;
@@ -1436,7 +1630,12 @@ export class Inspector {
     if (t("[data-story-tab]") && this.trail) {
       const tab = t("[data-story-tab]").dataset.storyTab;
       if (tab === "depends" && !this.trail.depends) this.readDepends();
-      else {
+      else if (tab === "made") this.readMade();
+      else if (tab === "story" && !this.trail.hops.length && !this.trail.running && !this.trail.end) {
+        this.trail.tab = "story";
+        this.trail.from = this.trail.start;
+        this.followStory(this.trail);
+      } else {
         this.trail.tab = tab;
         this.draw(true);
       }
@@ -1454,7 +1653,22 @@ export class Inspector {
       }
       return true;
     }
+    if (t("[data-made-on]") && this.trail?.made) {
+      this.madeOn(Number(t("[data-made-on]").dataset.madeOn));
+      return true;
+    }
+    if (t("[data-made-toggle]") && this.trail?.made) {
+      const node = this.trail.made.nodes.get(Number(t("[data-made-toggle]").dataset.madeToggle));
+      if (node) node.closed = !this.madeClosed(node);
+      this.draw(true);
+      return true;
+    }
     if (t("[data-story-stop]") && this.trail) {
+      if (this.trail.tab === "made" && this.trail.made) {
+        this.trail.made.stopped = true;
+        this.draw(true);
+        return true;
+      }
       if (this.trail.tab === "depends" && this.trail.depends) {
         this.trail.depends.stopped = true;
         this.draw(true);
