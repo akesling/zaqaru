@@ -295,7 +295,10 @@ begin:
     derivation_text(p, &tree, "", 0, &mut text);
     let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
     assert_eq!(lines[..2], ["store 90 to 0x24000200", "load 90 from 0x24000102"], "{text}");
-    assert!(lines.contains(&"chose: held 2 at 0x24000180"), "{text}");
+    // The address the entry was read at, the table's own left out, of the
+    // index.
+    assert_eq!(lines[3..5], ["chose: merge 603980034", "held 2 at 0x24000180"], "{text}");
+    assert!(tree.operands[0].1.operands[1].1.pointer, "the table's address, left out");
 }
 
 #[test]
@@ -523,4 +526,113 @@ after:
     let store = p.node(p.memory[&0x2400_0300]).unwrap();
     let popped = p.node(store.parents[0]).unwrap();
     assert!(matches!(popped.what, What::Held { value: 9, .. }), "{popped:?}");
+}
+
+#[test]
+fn a_value_masked_by_a_constant_is_a_step_of_its_own() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100
+    ldr r1, =0x12345678
+    str r1, [r3]
+    nop
+begin:
+    ldr r0, [r3]
+    mov.w r2, #0xfc0
+    and.w r2, r2, r0, lsr #4
+    ldr r6, =0x24000200
+    str r2, [r6]
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 4), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let store = p.node(p.memory[&0x2400_0200]).unwrap();
+    let made = p.node(store.parents[0]).unwrap();
+    assert!(matches!(made.what, What::Merge { value: Some(0x540) }), "{made:?}");
+}
+
+#[test]
+fn a_value_masked_in_a_loop_begun_before_the_window_is_a_step_of_its_own() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100
+    ldr r1, =0x00010001
+    str r1, [r3]
+    mov.w r2, #0xfc0
+    ldr r0, =0x12345678
+    nop
+begin:
+    ldr r1, [r3]
+    add r0, r1               @ the position, stepped
+    and.w r4, r2, r0, lsr #4
+    ldr r6, =0x24000200
+    str r4, [r6]
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 6), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let store = p.node(p.memory[&0x2400_0200]).unwrap();
+    let made = p.node(store.parents[0]).unwrap();
+    let parents: Vec<_> = made.parents.iter().map(|&t| p.node(t).map(|n| n.what)).collect();
+    assert!(matches!(made.what, What::Merge { value: Some(0x540) }), "{made:?} {parents:?}");
+}
+
+#[test]
+fn a_span_s_texture_index_is_its_position_shifted_and_masked() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100
+    ldr r1, =0x00010001
+    str r1, [r3]
+    ldr r1, =0x24001000      @ the flat
+    str r1, [r3, #4]
+    ldr r1, =0x24002000      @ the colour map
+    str r1, [r3, #8]
+    ldr r0, =0x12345678
+    nop
+begin:
+    ldr r1, [r3]             @ the step
+    ldr r9, =0x24000104
+    ldr r8, =0x24000108
+    mov.w r2, #0xfc0
+    ldr r6, =0x24000200
+    movs r5, #4
+1:  ldr.w r4, [r9]
+    and.w r12, r2, r0, lsr #4
+    add.w r4, r4, r0, lsr #26
+    ldrb.w r12, [r4, r12]
+    ldr.w r7, [r8]
+    ldrb.w r12, [r7, r12]
+    strb r12, [r6], #1
+    add r0, r1
+    subs r5, #1
+    bne 1b
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 9), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let says_nothing = |node: &armv6m::provenance::Node| match node.what {
+        What::Held { addr, value, .. } => addr.wrapping_sub(node.pc) < 4096 || value >= 0x2000_0000,
+        What::Register { value, .. } => value >= 0x2000_0000,
+        What::Store { size: 4, value, .. } => value >= 0x2000_0000,
+        _ => false,
+    };
+    let tree = p.derivation(p.memory[&0x2400_0202], 24, 200, &says_nothing);
+    let mut text = String::new();
+    derivation_text(p, &tree, "", 0, &mut text);
+        // The entry chosen by the position, shifted and masked: a step of its
+    // own, not the position itself.
+    assert!(text.contains(&format!("merge {}", (0x12345678u32 >> 4) & 0xfc0)), "the mask's own step:\n{text}");
 }

@@ -91,6 +91,10 @@ pub struct Provenance {
     /// bus is then no origin.
     pub seeded: bool,
     pub regs: [Tag; 16],
+    /// What each register held when it was given its tag: to tell an
+    /// instruction that changed a value it read — shifted it, masked it,
+    /// added a constant — from one that moved it.
+    pub values: [u32; 16],
     /// By byte address; an address not here is untagged.
     pub memory: HashMap<u32, Tag>,
     pub nodes: Vec<Node>,
@@ -120,6 +124,9 @@ pub struct Derived {
     pub cut: bool,
     /// Said already, elsewhere in the tree.
     pub same: bool,
+    /// Under what chose an entry of a table, made of a pointer too — which
+    /// table — left out.
+    pub pointer: bool,
 }
 
 /// What a value was to the one made of it.
@@ -154,7 +161,7 @@ impl Provenance {
 
     /// Following everything from `since`, the registers holding `regs`.
     pub fn everything(since: u64, regs: &[u32; 16]) -> Provenance {
-        let mut p = Provenance { since, everything: true, ..Provenance::default() };
+        let mut p = Provenance { since, everything: true, values: *regs, ..Provenance::default() };
         for (n, &value) in regs.iter().enumerate() {
             p.regs[n] = p.add(Node { what: What::Register { n: n as u8, value }, pc: regs[15], time: since, parents: [0, 0] });
         }
@@ -305,13 +312,25 @@ impl Provenance {
                 None => *computed.get_or_insert_with(|| {
                     let made = self.nodes.len() as Tag;
                     let tag = self.union(from_registers.iter().copied(), pc, time);
-                    // A merge made here: what the instruction came to.
                     if tag > made {
+                        // A merge made here: what the instruction came to.
                         self.nodes[tag as usize - 1].what = What::Merge { value: Some(value) };
+                        return tag;
+                    }
+                    // Of one value, changed — shifted, masked, a constant
+                    // added — not moved: a step of its own.
+                    let changed = tag != 0 && (0..15).filter(|&m| read & 1 << m != 0 && self.regs[m] == tag).all(|m| self.values[m] != value);
+                    if changed {
+                        return self.add(Node { what: What::Merge { value: Some(value) }, pc, time, parents: [tag, 0] });
                     }
                     tag
                 }),
             };
+        }
+        for n in 0..16 {
+            if written & 1 << n != 0 {
+                self.values[n] = values[n];
+            }
         }
     }
 
@@ -475,9 +494,7 @@ impl Provenance {
                     tag = first;
                 }
                 Some(node @ Node { what: What::Load { .. }, .. }) => {
-                    let chooser = node.parents[1];
-                    let plain = *walk.plain.entry(chooser).or_insert_with(|| self.origins(chooser, 8).iter().all(|(_, n)| (walk.says_nothing)(n)));
-                    if !plain {
+                    if !self.only_pointers(node.parents[1], walk) {
                         break;
                     }
                     tag = node.parents[0];
@@ -543,6 +560,7 @@ impl Provenance {
             }
             _ => {}
         }
+        let mut dropped = false;
         for (role, operand) in operands {
             let operand = self.through(operand, walk);
             if operand == 0 {
@@ -559,16 +577,22 @@ impl Provenance {
                 continue;
             }
             let choosing = choosing || role == Role::Chose;
-            if choosing && self.node(operand).is_some_and(|n| n.parents == [0, 0] && (walk.says_nothing)(n)) {
+            if choosing && self.only_pointers(operand, walk) {
+                dropped = true;
                 continue;
             }
             out.operands.push((role, self.derive(operand, depth - 1, walk, again, choosing)));
         }
-        // What chose, of a pointer and one other: the other.
-        if choosing && matches!(node.what, What::Merge { .. }) && out.operands.len() == 1 {
-            return out.operands.pop().unwrap().1;
-        }
+        out.pointer = dropped;
         out
+    }
+
+    /// Whether everything the value tagged `tag` came from says nothing
+    /// (see [`Provenance::derivation`]): a pointer, however it got here —
+    /// which table, not which entry.
+    fn only_pointers(&self, tag: Tag, walk: &mut Walk) -> bool {
+        let says_nothing = walk.says_nothing;
+        *walk.plain.entry(tag).or_insert_with(|| self.origins(tag, 8).iter().all(|(_, n)| says_nothing(n)))
     }
 
     /// The operands of the merges an instruction made of what it read:

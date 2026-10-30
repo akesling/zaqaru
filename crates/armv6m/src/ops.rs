@@ -14,6 +14,97 @@ pub fn operation(hw1: u32, hw2: u32) -> &'static str {
     if wide(hw1) { wide_operation(hw1, hw2) } else { narrow_operation(hw1) }
 }
 
+/// For a load or a store whose address is a register plus a register —
+/// `ldr r0, [r1, r2, lsl #2]`, `tbh [r0, r1, lsl #1]` — how far left the
+/// second is shifted; `None` for any other.
+pub fn index_shift(hw1: u32, hw2: u32) -> Option<u32> {
+    if !wide(hw1) {
+        // LDR, STR and their kin, register offset.
+        return (hw1 >> 12 == 0b0101).then_some(0);
+    }
+    // Thumb-2's loads and stores of one, register offset.
+    if hw1 >> 9 == 0b1111100 && hw1 >> 7 & 1 == 0 && hw2 >> 6 & 0x3f == 0 {
+        return Some(hw2 >> 4 & 3);
+    }
+    // TBB and TBH.
+    if hw1 & 0xfff0 == 0xe8d0 && hw2 & 0xffe0 == 0xf000 {
+        return Some(hw2 >> 4 & 1);
+    }
+    None
+}
+
+/// For Thumb-2's data processing with a shifted register for its second
+/// operand — `add.w r4, r4, r0, lsr #26` — the shift and how far: `("lsr",
+/// 26)`; `None` for any other, or for no shift.
+pub fn shifted_operand(hw1: u32, hw2: u32) -> Option<(&'static str, u32)> {
+    if !(wide(hw1) && hw1 >> 11 == 0b11101 && hw1 >> 9 & 3 == 0b01) || hw1 & 15 == 15 {
+        return None;
+    }
+    let amount = (hw2 >> 12 & 7) << 2 | hw2 >> 6 & 3;
+    match (hw2 >> 4 & 3, amount) {
+        (0, 0) => None,
+        (kind @ (1 | 2), 0) => Some((SHIFTS[kind as usize], 32)),
+        (kind, n) => Some((SHIFTS[kind as usize], n)),
+    }
+}
+
+/// The constant an instruction works with, besides the registers it
+/// reads: what it adds, masks with, shifts by, or the bits it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Immediate {
+    Value(u32),
+    /// `ubfx`, `sbfx`, `bfi`, `bfc`: the bits `[lsb, lsb + width)`.
+    Bits { lsb: u32, width: u32 },
+}
+
+/// The constant of the instruction `hw1` (and `hw2`), if it has one and
+/// it goes into what the instruction makes — not an address's offset.
+pub fn immediate(hw1: u32, hw2: u32) -> Option<Immediate> {
+    use Immediate::*;
+    if !wide(hw1) {
+        let hw = hw1;
+        return match hw >> 11 {
+            // Shifts by an immediate: LSR and ASR encode 32 as 0.
+            0b00000 => Some(Value(hw >> 6 & 31)),
+            0b00001 | 0b00010 => Some(Value(match hw >> 6 & 31 {
+                0 => 32,
+                n => n,
+            })),
+            // ADD and SUB of three bits.
+            0b00011 if hw >> 10 & 1 == 1 => Some(Value(hw >> 6 & 7)),
+            // MOV, CMP, ADD, SUB of eight.
+            0b00100..=0b00111 => Some(Value(hw & 0xff)),
+            _ => None,
+        };
+    }
+    match hw1 >> 11 {
+        // A shifted register: a move's shift, by its amount.
+        0b11101 if hw1 >> 9 & 3 == 0b01 && hw1 & 15 == 15 && hw1 >> 5 & 15 == 2 => {
+            let amount = (hw2 >> 12 & 7) << 2 | hw2 >> 6 & 3;
+            match (hw2 >> 4 & 3, amount) {
+                (0, 0) => None,
+                (1 | 2, 0) => Some(Value(32)),
+                (_, n) => Some(Value(n)),
+            }
+        }
+        0b11110 if hw2 >> 15 == 0 && hw1 >> 9 & 1 == 0 => {
+            let imm12 = (hw1 >> 10 & 1) << 11 | (hw2 >> 12 & 7) << 8 | hw2 & 0xff;
+            crate::thumb2::thumb_expand_imm_c(imm12, false).map(|(v, _)| Value(v))
+        }
+        0b11110 if hw2 >> 15 == 0 => {
+            let imm12 = (hw1 >> 10 & 1) << 11 | (hw2 >> 12 & 7) << 8 | hw2 & 0xff;
+            let lsb = (hw2 >> 12 & 7) << 2 | hw2 >> 6 & 3;
+            match hw1 >> 4 & 31 {
+                0b00000 | 0b01010 => Some(Value(imm12)),
+                0b10100 | 0b11100 => Some(Bits { lsb, width: (hw2 & 31) + 1 }),
+                0b10110 => Some(Bits { lsb, width: ((hw2 & 31) + 1).saturating_sub(lsb) }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 const SHIFTS: [&str; 4] = ["lsl", "lsr", "asr", "ror"];
 
 fn narrow_operation(hw: u32) -> &'static str {
@@ -232,5 +323,38 @@ mod tests {
         assert_eq!(named(&[0xf101, 0x0001]), "add"); // add.w r0, r1, #1
         assert_eq!(named(&[0xf2c1, 0x2034]), "movt"); // movt r0, #0x1234
         assert_eq!(named(&[0xfab1, 0xf081]), "clz"); // clz r0, r1
+    }
+
+    #[test]
+    fn an_instruction_s_constant_is_read_out_of_it() {
+        use Immediate::*;
+        let imm = |h: &[u16]| immediate(u32::from(h[0]), u32::from(*h.get(1).unwrap_or(&0)));
+        assert_eq!(imm(&[0x0108]), Some(Value(4))); // lsls r0, r1, #4
+        assert_eq!(imm(&[0x15d2]), Some(Value(23))); // asrs r2, r2, #0x17
+        assert_eq!(imm(&[0x3001]), Some(Value(1))); // adds r0, #1
+        assert_eq!(imm(&[0x1c48]), Some(Value(1))); // adds r0, r1, #1
+        assert_eq!(imm(&[0x1888]), None); // adds r0, r1, r2
+        assert_eq!(imm(&[0xea4f, 0x1021]), Some(Value(4))); // asr.w r0, r1, #4
+        assert_eq!(imm(&[0xf101, 0x0001]), Some(Value(1))); // add.w r0, r1, #1
+        assert_eq!(imm(&[0xf3c1, 0x1003]), Some(Bits { lsb: 4, width: 4 })); // ubfx r0, r1, #4, #4
+        assert_eq!(imm(&[0xf401, 0x607c]), Some(Value(0xfc0))); // and r0, r1, #0xfc0
+    }
+
+    #[test]
+    fn a_second_operand_s_shift_is_read_out_of_it() {
+        assert_eq!(shifted_operand(0xeb04, 0x6490), Some(("lsr", 26))); // add.w r4, r4, r0, lsr #26
+        assert_eq!(shifted_operand(0xea47, 0x2606), Some(("lsl", 8))); // orr.w r6, r7, r6, lsl #8
+        assert_eq!(shifted_operand(0xeb01, 0x0002), None); // add.w r0, r1, r2
+        assert_eq!(shifted_operand(0xea4f, 0x1021), None); // asr.w r0, r1, #4: a move
+    }
+
+    #[test]
+    fn an_address_of_two_registers_says_how_far_the_index_is_shifted() {
+        assert_eq!(index_shift(0xf855, 0x002a), Some(2)); // ldr.w r0, [r5, r10, lsl #2]
+        assert_eq!(index_shift(0xf840, 0x1022), Some(2)); // str.w r1, [r0, r2, lsl #2]
+        assert_eq!(index_shift(0x5c8a, 0), Some(0)); // ldrb r2, [r1, r2]
+        assert_eq!(index_shift(0xe8d0, 0xf011), Some(1)); // tbh [r0, r1, lsl #1]
+        assert_eq!(index_shift(0x6900, 0), None); // ldr r0, [r0, #0x10]
+        assert_eq!(index_shift(0xf8d3, 0xe000), None); // ldr.w lr, [r3]
     }
 }

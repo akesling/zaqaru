@@ -321,6 +321,7 @@ impl Machine {
                     let at = sp.wrapping_add(4 * slot as u32);
                     provenance.hold(at, 4, frame[slot], written[slot], pc, time);
                     provenance.regs[reg] = provenance.of_memory(at, 4, frame[slot], pc, time);
+                    provenance.values[reg] = frame[slot];
                 }
             }
         }
