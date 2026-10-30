@@ -57,12 +57,14 @@ pub enum What {
     Read { addr: u32, value: u32 },
     /// A store of a tagged value to memory.
     Store { addr: u32, size: u32, value: u32 },
-    /// A value made of two tagged ones.
-    Merge,
+    /// A value made of two tagged ones: what it came to, if the
+    /// instruction's result — `None` for one of the merges between that a
+    /// result of three or more is made of.
+    Merge { value: Option<u32> },
     /// Bytes loaded together that came from different places: the tag of
     /// each, by its place in the value — what a word copy of bytes stored
     /// one by one carries, and what a byte's story follows its own lane of.
-    Bytes { addr: u32, lanes: [Tag; 4] },
+    Bytes { addr: u32, lanes: [Tag; 4], value: u32 },
     /// Following everything: `size` bytes at `addr` that held `value`
     /// before following began, the first time one was loaded; and the last
     /// write to them then, if they are RAM.
@@ -72,7 +74,7 @@ pub enum What {
     /// A value loaded from `addr`, an address worked out from other
     /// values: the loaded value's history the first parent, the address's
     /// the second — what chose which entry of a table was read.
-    Load { addr: u32 },
+    Load { addr: u32, value: u32 },
 }
 
 /// A node's number, from 1; 0 is untagged.
@@ -94,6 +96,51 @@ pub struct Provenance {
     pub nodes: Vec<Node>,
     /// This instruction's loads: what each gave, its size, and its tag.
     loads: Vec<(u32, u32, Tag)>,
+}
+
+/// How a value was made: a node of its history, and the values it was
+/// made of, each the same — a tree, read top down as the value was made
+/// bottom up (see [`Provenance::derivation`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Derived {
+    /// The node: a store, a merge, a load, bytes loaded together from
+    /// different places, or where a value came into the window.
+    pub tag: Tag,
+    /// For a store, the stores of the same value it was a copy of, newest
+    /// first: the value's earlier places. The operand is what the last was
+    /// made of.
+    pub copies: Vec<Tag>,
+    /// For a store, how many times before it the same code stored to the
+    /// same place a value made of what it had stored there before — a
+    /// count, a sum, a step — and the earliest of them.
+    pub repeats: u32,
+    pub earliest: Tag,
+    pub operands: Vec<(Role, Derived)>,
+    /// Left out, past the depth or the budget.
+    pub cut: bool,
+    /// Said already, elsewhere in the tree.
+    pub same: bool,
+}
+
+/// What a value was to the one made of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Role {
+    /// Part of it.
+    #[default]
+    Value,
+    /// What chose the entry of a table it was read from.
+    Chose,
+    /// The place's own value before the repeats (see [`Derived::repeats`]).
+    Again,
+}
+
+struct Walk<'a> {
+    budget: usize,
+    expanded: std::collections::HashSet<Tag>,
+    says_nothing: &'a dyn Fn(&Node) -> bool,
+    /// Whether what a load's address was worked out from, by its tag,
+    /// says nothing.
+    plain: std::collections::HashMap<Tag, bool>,
 }
 
 fn mask(size: u32) -> u32 {
@@ -143,14 +190,14 @@ impl Provenance {
             if tag == 0 || tag == out {
                 continue;
             }
-            out = if out == 0 { tag } else { self.add(Node { what: What::Merge, pc, time, parents: [out, tag] }) };
+            out = if out == 0 { tag } else { self.add(Node { what: What::Merge { value: None }, pc, time, parents: [out, tag] }) };
         }
         out
     }
 
     /// The tag of the bytes `[addr, addr + size)`: theirs, if they share
     /// one; or what each was, lane by lane.
-    pub fn of_memory(&mut self, addr: u32, size: u32, pc: u32, time: u64) -> Tag {
+    pub fn of_memory(&mut self, addr: u32, size: u32, value: u32, pc: u32, time: u64) -> Tag {
         let tags: Vec<Tag> = (0..size).map(|i| self.memory.get(&addr.wrapping_add(i)).copied().unwrap_or(0)).collect();
         if tags.iter().all(|&t| t == tags[0]) {
             return tags[0];
@@ -161,7 +208,7 @@ impl Provenance {
         let mut lanes = [0; 4];
         lanes[..tags.len()].copy_from_slice(&tags);
         let first = tags.iter().copied().find(|&t| t != 0).unwrap_or(0);
-        self.add(Node { what: What::Bytes { addr, lanes }, pc, time, parents: [first, 0] })
+        self.add(Node { what: What::Bytes { addr, lanes, value: value & mask(size) }, pc, time, parents: [first, 0] })
     }
 
     /// Following everything, bytes loaded untagged are what they held
@@ -191,14 +238,19 @@ impl Provenance {
             self.add(Node { what: What::Read { addr, value }, pc, time, parents: [0, 0] })
         } else {
             self.hold(addr, size, value, written, pc, time);
-            self.of_memory(addr, size, pc, time)
+            self.of_memory(addr, size, value, pc, time)
         };
         // Where it was read from, if that was worked out from values
         // followed: the stack pointer's and the pc's say nothing of which.
         let from: Vec<Tag> = (0..13).filter(|n| address & 1 << n != 0).map(|n| self.regs[n]).collect();
+        let made = self.nodes.len() as Tag;
         let from = self.union(from, pc, time);
+        // A merge made here: the address.
+        if from > made {
+            self.nodes[from as usize - 1].what = What::Merge { value: Some(addr) };
+        }
         if from != 0 && from != tag && tag != 0 {
-            tag = self.add(Node { what: What::Load { addr }, pc, time, parents: [tag, from] });
+            tag = self.add(Node { what: What::Load { addr, value: value & mask(size) }, pc, time, parents: [tag, from] });
         }
         self.loads.push((value & mask(size), size, tag));
     }
@@ -248,7 +300,15 @@ impl Provenance {
             let loaded = self.loads.iter().position(|&(v, size, _)| value & mask(size) == v);
             self.regs[n] = match loaded {
                 Some(i) => self.loads.remove(i).2,
-                None => *computed.get_or_insert_with(|| self.union(from_registers.iter().copied(), pc, time)),
+                None => *computed.get_or_insert_with(|| {
+                    let made = self.nodes.len() as Tag;
+                    let tag = self.union(from_registers.iter().copied(), pc, time);
+                    // A merge made here: what the instruction came to.
+                    if tag > made {
+                        self.nodes[tag as usize - 1].what = What::Merge { value: Some(value) };
+                    }
+                    tag
+                }),
             };
         }
     }
@@ -280,17 +340,17 @@ impl Provenance {
                     lane = byte.wrapping_sub(addr).min(size.saturating_sub(1));
                     out.push((tag, node, byte));
                 }
-                What::Bytes { addr, lanes } => {
+                What::Bytes { addr, lanes, .. } => {
                     byte = addr.wrapping_add(lane);
                     next = lanes[lane.min(3) as usize];
                     lane = 0;
                 }
                 What::Held { addr, size, .. } => out.push((tag, node, addr.wrapping_add(lane.min(size.saturating_sub(1))))),
-                What::Merge => {
+                What::Merge { .. } => {
                     lane = 0;
                     out.push((tag, node, byte));
                 }
-                What::Load { addr } => out.push((tag, node, addr.wrapping_add(lane))),
+                What::Load { addr, .. } => out.push((tag, node, addr.wrapping_add(lane))),
                 _ => out.push((tag, node, byte)),
             }
             if out.len() >= depth {
@@ -320,7 +380,7 @@ impl Provenance {
             let Some(node) = self.node(at) else { continue };
             match node.what {
                 What::Bytes { lanes, .. } => queue.extend(lanes),
-                What::Merge => queue.extend(node.parents),
+                What::Merge { .. } => queue.extend(node.parents),
                 What::Load { .. } => queue.push_back(node.parents[0]),
                 What::Store { .. } if node.parents[0] != 0 => queue.push_back(node.parents[0]),
                 What::Register { n: 13 | 15, .. } => {}
@@ -356,7 +416,7 @@ impl Provenance {
         let mut queue = std::collections::VecDeque::new();
         for &(tag, node, byte) in &story {
             match node.what {
-                What::Merge => queue.push_back((node.parents[1], false)),
+                What::Merge { .. } => queue.push_back((node.parents[1], false)),
                 What::Load { .. } if !moves(node.pc) => queue.push_back((node.parents[1], true)),
                 What::Load { .. } | What::Store { .. } | What::Bytes { .. } => {}
                 What::Register { n: 13 | 15, .. } => {}
@@ -374,7 +434,7 @@ impl Provenance {
             let Some(node) = self.node(at) else { continue };
             match node.what {
                 What::Bytes { lanes, .. } => queue.extend(lanes.map(|l| (l, via))),
-                What::Merge => queue.extend(node.parents.map(|p| (p, via))),
+                What::Merge { .. } => queue.extend(node.parents.map(|p| (p, via))),
                 What::Load { .. } if moves(node.pc) => queue.push_back((node.parents[0], via)),
                 What::Load { .. } => queue.extend([(node.parents[0], via), (node.parents[1], true)]),
                 What::Store { .. } if node.parents[0] != 0 => queue.push_back((node.parents[0], via)),
@@ -384,6 +444,177 @@ impl Provenance {
             }
         }
         out
+    }
+
+    /// How the value tagged `tag` was made, as a tree: see [`Derived`].
+    /// At most `budget` nodes of it, none deeper than `depth`; what is
+    /// left out is [`Derived::cut`], to be asked about by its tag.
+    /// `says_nothing(node)`: an origin that, as what an address was worked
+    /// out from, says only which table or which struct — a pointer, a
+    /// constant beside the code — so that a load from that address is the
+    /// value loaded, and nothing chose it.
+    pub fn derivation(&self, tag: Tag, depth: usize, budget: usize, says_nothing: &dyn Fn(&Node) -> bool) -> Derived {
+        let mut walk = Walk { budget, expanded: std::collections::HashSet::new(), says_nothing, plain: std::collections::HashMap::new() };
+        self.derive(tag, depth, &mut walk, (0, 0), false)
+    }
+
+    /// Past a word loaded together from bytes that all came from one
+    /// place, and a load from an address that says nothing of which: the
+    /// value itself.
+    fn through(&self, mut tag: Tag, walk: &mut Walk) -> Tag {
+        loop {
+            match self.node(tag) {
+                Some(Node { what: What::Bytes { lanes, .. }, .. }) => {
+                    let mut one = lanes.iter().copied().filter(|&l| l != 0);
+                    let Some(first) = one.next() else { break };
+                    if one.any(|l| l != first) {
+                        break;
+                    }
+                    tag = first;
+                }
+                Some(node @ Node { what: What::Load { .. }, .. }) => {
+                    let chooser = node.parents[1];
+                    let plain = *walk.plain.entry(chooser).or_insert_with(|| self.origins(chooser, 8).iter().all(|(_, n)| (walk.says_nothing)(n)));
+                    if !plain {
+                        break;
+                    }
+                    tag = node.parents[0];
+                }
+                _ => break,
+            }
+        }
+        tag
+    }
+
+    /// `again`: within a store's repeats, the one before it, and the
+    /// earliest — said in the place of the one before.
+    /// `choosing`: under what chose an entry of a table, where a pointer
+    /// — which table — is left out.
+    fn derive(&self, tag: Tag, depth: usize, walk: &mut Walk, mut again: (Tag, Tag), choosing: bool) -> Derived {
+        let tag = self.through(tag, walk);
+        let mut out = Derived { tag, ..Derived::default() };
+        let Some(node) = self.node(tag) else { return out };
+        if depth == 0 || walk.budget == 0 {
+            out.cut = true;
+            return out;
+        }
+        if !walk.expanded.insert(tag) {
+            out.same = true;
+            return out;
+        }
+        walk.budget -= 1;
+        let mut operands: Vec<(Role, Tag)> = Vec::new();
+        match node.what {
+            What::Store { .. } => {
+                // The copies it was before: stores of the same value.
+                let mut at = tag;
+                while let Some(before) = self.copied_from(at, walk) {
+                    out.copies.push(before);
+                    at = before;
+                }
+                let made = self.node(at).map_or(0, |n| n.parents[0]);
+                // The same code storing to the same place what it made of
+                // what it stored there before: a count, a sum, folded.
+                if let Some(previous) = self.repeated(at, walk) {
+                    let (mut earliest, mut times) = (previous, 1);
+                    while let Some(before) = self.repeated(earliest, walk) {
+                        if times >= 1 << 20 {
+                            break;
+                        }
+                        earliest = before;
+                        times += 1;
+                    }
+                    out.repeats = times;
+                    out.earliest = earliest;
+                    again = (previous, earliest);
+                }
+                operands.push((Role::Value, made));
+            }
+            What::Merge { .. } => self.flatten(tag, node, walk, &mut operands),
+            What::Load { .. } => operands.extend([(Role::Value, node.parents[0]), (Role::Chose, node.parents[1])]),
+            What::Bytes { lanes, .. } => {
+                for lane in lanes {
+                    if lane != 0 && !operands.iter().any(|&(_, t)| t == lane) {
+                        operands.push((Role::Value, lane));
+                    }
+                }
+            }
+            _ => {}
+        }
+        for (role, operand) in operands {
+            let operand = self.through(operand, walk);
+            if operand == 0 {
+                continue;
+            }
+            // The place's value before the repeats: the earliest of them,
+            // in its stead, and what that was made of.
+            if again.0 != 0 && operand == again.0 {
+                let mut earliest = Derived { tag: again.1, ..Derived::default() };
+                if let Some(first) = self.node(again.1).map(|n| n.parents[0]).map(|t| self.through(t, walk)).filter(|&t| t != 0) {
+                    earliest.operands.push((Role::Value, self.derive(first, depth - 1, walk, (0, 0), choosing)));
+                }
+                out.operands.push((Role::Again, earliest));
+                continue;
+            }
+            let choosing = choosing || role == Role::Chose;
+            if choosing && self.node(operand).is_some_and(|n| n.parents == [0, 0] && (walk.says_nothing)(n)) {
+                continue;
+            }
+            out.operands.push((role, self.derive(operand, depth - 1, walk, again, choosing)));
+        }
+        // What chose, of a pointer and one other: the other.
+        if choosing && matches!(node.what, What::Merge { .. }) && out.operands.len() == 1 {
+            return out.operands.pop().unwrap().1;
+        }
+        out
+    }
+
+    /// The operands of the merges an instruction made of what it read:
+    /// one merge each but the last, of two; all of them at once.
+    fn flatten(&self, tag: Tag, node: &Node, walk: &mut Walk, out: &mut Vec<(Role, Tag)>) {
+        for parent in node.parents {
+            let parent = self.through(parent, walk);
+            match self.node(parent) {
+                Some(inner @ Node { what: What::Merge { value: None }, .. }) if inner.pc == node.pc && inner.time == node.time && parent != tag => self.flatten(parent, inner, walk, out),
+                _ if parent != 0 && !out.iter().any(|&(_, t)| t == parent) => out.push((Role::Value, parent)),
+                _ => {}
+            }
+        }
+    }
+
+    /// The store `tag` is a copy of, if it is one: a store of the same
+    /// value, straight from it.
+    fn copied_from(&self, tag: Tag, walk: &mut Walk) -> Option<Tag> {
+        let Some(Node { what: What::Store { size, value, .. }, parents, .. }) = self.node(tag) else { return None };
+        let before = self.through(parents[0], walk);
+        match self.node(before)?.what {
+            What::Store { size: s, value: v, .. } if v & mask(s.min(*size)) == value & mask(s.min(*size)) => Some(before),
+            _ => None,
+        }
+    }
+
+    /// The store before `tag` by the same code to the same place, if what
+    /// `tag` stored was made of it — within a few steps back.
+    fn repeated(&self, tag: Tag, walk: &mut Walk) -> Option<Tag> {
+        let Some(&Node { what: What::Store { addr, .. }, pc, .. }) = self.node(tag) else { return None };
+        let mut queue = std::collections::VecDeque::from([self.node(tag)?.parents[0]]);
+        let mut seen = 0;
+        while let Some(at) = queue.pop_front() {
+            seen += 1;
+            if at == 0 || at >= tag || seen > 64 {
+                continue;
+            }
+            let node = self.node(at)?;
+            match node.what {
+                What::Store { addr: a, .. } if a == addr && node.pc == pc => return Some(at),
+                What::Store { .. } => queue.push_back(node.parents[0]),
+                What::Merge { .. } => queue.extend(node.parents),
+                What::Bytes { lanes, .. } => queue.extend(lanes),
+                What::Load { .. } => queue.push_back(node.parents[0]),
+                _ => {}
+            }
+        }
+        None
     }
 
     /// A value's history, newest first: the node `tag`, then what it came

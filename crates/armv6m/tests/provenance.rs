@@ -106,7 +106,7 @@ fn a_copy_leads_back_through_every_step_to_the_bytes_off_the_bus() {
     // first part from the buffer; and the buffer from RXDR.
     assert!(matches!(kinds[0], What::Store { addr: 0x2400_0200, size: 2, value: 0x0117 }), "{kinds:?}");
     assert!(matches!(kinds[1], What::Store { size: 4, value: 0x0117, .. }), "the push: {kinds:?}");
-    assert_eq!(kinds[2], What::Merge, "{kinds:?}");
+    assert!(matches!(kinds[2], What::Merge { value: Some(0x0117) }), "{kinds:?}");
     assert!(matches!(kinds[3], What::Store { addr: 0x2400_0100, size: 1, value: 0x01 }), "{kinds:?}");
     assert_eq!(kinds[4], What::Read { addr: 0x4000_5824, value: 0x01 }, "{kinds:?}");
     assert_eq!(kinds.len(), 5);
@@ -275,7 +275,7 @@ begin:
     let p = m.provenance.as_ref().unwrap();
     let story = p.story(0x2400_0200, 8);
     let load = story.iter().find_map(|&(_, node, _)| match node.what {
-        What::Load { addr } => Some((addr, node.parents[1])),
+        What::Load { addr, .. } => Some((addr, node.parents[1])),
         _ => None,
     });
     let (addr, address) = load.expect("the lookup is a step of the story");
@@ -283,6 +283,19 @@ begin:
     assert!(matches!(story.last().unwrap().1.what, What::Held { addr: 0x2400_0102, value: 0x5A, .. }), "the entry, held since before");
     let origins: Vec<What> = p.origins(address, 8).iter().map(|(_, node)| node.what).collect();
     assert!(origins.iter().any(|w| matches!(w, What::Held { addr: 0x2400_0180, value: 2, .. })), "the index: {origins:?}");
+    // As a derivation: the entry, chosen by the index — the table's own
+    // address saying nothing of which.
+    let says_nothing = |node: &armv6m::provenance::Node| match node.what {
+        What::Held { addr, value, .. } => addr.wrapping_sub(node.pc) < 4096 || value >= 0x2000_0000,
+        What::Register { value, .. } => value >= 0x2000_0000,
+        _ => false,
+    };
+    let tree = p.derivation(p.memory[&0x2400_0200], 16, 100, &says_nothing);
+    let mut text = String::new();
+    derivation_text(p, &tree, "", 0, &mut text);
+    let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
+    assert_eq!(lines[..2], ["store 90 to 0x24000200", "load 90 from 0x24000102"], "{text}");
+    assert!(lines.contains(&"chose: held 2 at 0x24000180"), "{text}");
 }
 
 #[test]
@@ -352,4 +365,95 @@ begin:
     assert!(held.contains(&(0x2400_0102, false)), "the entry: {held:?}");
     assert!(held.contains(&(0x2400_0190, false)), "what was added: {held:?}");
     assert!(held.contains(&(0x2400_0180, true)), "the index, which chose: {held:?}");
+}
+
+/// A derivation as text, a node a line, indented by depth: what each is,
+/// its value, its role, how often it repeated.
+fn derivation_text(p: &armv6m::provenance::Provenance, d: &armv6m::provenance::Derived, role: &str, depth: usize, out: &mut String) {
+    let node = p.node(d.tag).unwrap();
+    let what = match node.what {
+        What::Store { addr, value, .. } => format!("store {value} to {addr:#x}"),
+        What::Merge { value: Some(value) } => format!("merge {value}"),
+        What::Merge { value: None } => "merge".to_string(),
+        What::Load { addr, value } => format!("load {value} from {addr:#x}"),
+        What::Bytes { value, .. } => format!("bytes {value}"),
+        What::Held { addr, value, .. } => format!("held {value} at {addr:#x}"),
+        What::Register { n, value } => format!("r{n} {value}"),
+        What::Read { value, .. } => format!("read {value}"),
+    };
+    let copies = if d.copies.is_empty() { String::new() } else { format!(" copied {}", d.copies.len()) };
+    let repeats = if d.repeats > 0 { format!(" repeated {}", d.repeats) } else { String::new() };
+    out.push_str(&format!("{}{role}{what}{copies}{repeats}\n", "  ".repeat(depth)));
+    for (role, operand) in &d.operands {
+        let role = match role {
+            armv6m::provenance::Role::Value => "",
+            armv6m::provenance::Role::Chose => "chose: ",
+            armv6m::provenance::Role::Again => "before: ",
+        };
+        derivation_text(p, operand, role, depth + 1, out);
+    }
+}
+
+#[test]
+fn a_value_s_derivation_says_what_it_was_made_of_and_folds_a_count() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100      @ x, y and a scale
+    movs r1, #5
+    str r1, [r3]
+    movs r1, #3
+    str r1, [r3, #4]
+    movs r1, #2
+    str r1, [r3, #8]
+    ldr r4, =0x24000180      @ a count
+    movs r1, #0
+    str r1, [r4]
+begin:
+    movs r2, #4
+1:  ldr r1, [r4]             @ counted four times
+    adds r1, #1
+    str r1, [r4]
+    subs r2, #1
+    bne 1b
+    ldr r5, [r3]
+    ldr r6, [r3, #4]
+    ldr r7, [r3, #8]
+    mla r0, r6, r7, r5       @ x + y * scale: 11
+    ldr r1, [r4]
+    add r0, r1               @ and the count: 15
+    ldr r6, =0x24000200
+    str r0, [r6]
+    ldr r1, [r6]
+    ldr r7, =0x24000204
+    str r1, [r7]             @ a copy
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 10), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    // Pointers, and constants beside the code, say nothing of which.
+    let says_nothing = |node: &armv6m::provenance::Node| match node.what {
+        What::Held { addr, value, .. } => addr.wrapping_sub(node.pc) < 4096 || value >= 0x2000_0000,
+        What::Register { value, .. } => value >= 0x2000_0000,
+        _ => false,
+    };
+    let tree = p.derivation(p.memory[&0x2400_0204], 16, 100, &says_nothing);
+    let mut text = String::new();
+    derivation_text(p, &tree, "", 0, &mut text);
+    let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
+    // The copy, of what the add made of the multiply-add and the count.
+    assert_eq!(lines[0], "store 15 to 0x24000204 copied 1", "{text}");
+    assert_eq!(lines[1], "merge 15", "{text}");
+    assert_eq!(lines[2], "merge 11", "{text}");
+    // The multiply-add's three, each held since before.
+    for value in [3, 2, 5] {
+        assert!(text.contains(&format!("held {value} at")), "{value}: {text}");
+    }
+    // The count: its store, repeated, from what the first began from.
+    assert!(text.contains("store 4 to 0x24000180 repeated 3"), "{text}");
+    assert!(text.contains("before: store 1 to 0x24000180"), "{text}");
+    assert!(text.contains("held 0 at 0x24000180"), "{text}");
 }

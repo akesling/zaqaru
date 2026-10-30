@@ -54,6 +54,7 @@ pub mod hubris;
 pub mod i2c;
 pub mod ltdc;
 pub mod names;
+pub mod ops;
 pub mod net;
 pub mod part;
 pub mod provenance;

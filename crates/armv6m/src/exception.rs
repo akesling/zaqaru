@@ -320,7 +320,7 @@ impl Machine {
                 for (slot, reg) in [0, 1, 2, 3, 12, 14].into_iter().enumerate() {
                     let at = sp.wrapping_add(4 * slot as u32);
                     provenance.hold(at, 4, frame[slot], written[slot], pc, time);
-                    provenance.regs[reg] = provenance.of_memory(at, 4, pc, time);
+                    provenance.regs[reg] = provenance.of_memory(at, 4, frame[slot], pc, time);
                 }
             }
         }
