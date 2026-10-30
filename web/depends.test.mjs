@@ -1,7 +1,7 @@
 // Checks `depends.js` under Node: node --test web/depends.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { alike, depend, dependsSummary, family, grouped, pathTo, timeStrip } from "./depends.js";
+import { alike, depend, dependsField, dependsSummary, family, grouped, pathTo, reachField, timeStrip } from "./depends.js";
 
 const by = { pc: 0x0800_1234, code: "doom: R_DrawColumn" };
 const held = (addr, stamp, via = "value") => ({ what: "held", ram: true, addr, byte: addr, size: 1, value: 1, via, where: `doom .uninit: ZONE_AXI[${addr & 0xffff}] (AXI SRAM + 0x1)`, written: { stamp, by } });
@@ -73,4 +73,13 @@ test("the same origin found again and again is one, with how many", () => {
   const status = { kind: "bus", via: "address", leaf: { what: "held", where: "USART3 + 0x1c", value: 0, pc: 8 } };
   const other = { ...status, leaf: { ...status.leaf, value: 0x20 } };
   assert.deepEqual(alike([status, status, other, status]).map((a) => a.count), [3, 1]);
+});
+
+test("what a value depended on, and where one went, as heat", () => {
+  const graph = { nodes: [{ at: 0x2400, what: "doom .uninit: ZONE_AXI[3] (AXI SRAM + 0x3)" }], origins: [{ kind: "rom", leaf: wad("COLORMAP"), node: 0, via: "value" }, { kind: "bus", leaf: { what: "read", register: "USART3 RDR" }, node: 0, via: "value" }] };
+  assert.deepEqual(dependsField(graph), [
+    { addr: 0x2400, length: 1, weight: 1, name: "ZONE_AXI" },
+    { addr: 0x9000_0000, length: 1, weight: 1, name: "WAD lump COLORMAP" },
+  ]);
+  assert.deepEqual(reachField({ went: [{ addr: 8, length: 4, writes: 8, where: "x .bss: FRAME[2]" }] }), [{ addr: 8, length: 4, weight: 8, name: "FRAME" }]);
 });

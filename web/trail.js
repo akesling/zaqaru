@@ -275,3 +275,16 @@ export function summary(trail) {
   }
   return `${parts.join(", ")}.`;
 }
+
+/// A story as heat for the memory pictures: each place its value was
+/// written, held or loaded on the way back — `[{ addr, length, weight,
+/// name }]`.
+export function storyField(trail) {
+  const points = [];
+  for (const { step } of stepsOf(trail)) {
+    const at = step.byte ?? step.addr;
+    if (at === undefined || step.what === "read") continue;
+    points.push({ addr: at, length: 1, weight: 1, name: shortPlace(step.where ?? "").replace(/(\[\d+\]|\s\+\s0x[0-9a-f]+).*$/, "") || "somewhere" });
+  }
+  return points;
+}

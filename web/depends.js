@@ -167,3 +167,27 @@ export function timeStrip(points, width = 640, height = 34) {
     .join("");
   return `<svg class="time-strip" viewBox="0 0 ${width} ${height}"><line x1="8" x2="${width - 8}" y1="14" y2="14" class="axis"/>${ticks}${dots}</svg>`;
 }
+
+/// What a value depended on, as heat for the memory pictures: each place
+/// a value was written on the way back, and each place it came from, one
+/// each — `[{ addr, length, weight, name }]`.
+export function dependsField(graph) {
+  const points = graph.nodes.map((n) => ({ addr: n.at, length: 1, weight: 1, name: shortPlace(n.what ?? "").replace(/(\[\d+\]|\s\+\s0x[0-9a-f]+).*$/, "") || "somewhere" }));
+  for (const origin of graph.origins) {
+    const at = origin.leaf.byte ?? origin.leaf.addr;
+    if (at !== undefined) points.push({ addr: at, length: 1, weight: 1, name: family(origin) });
+  }
+  return points;
+}
+
+/// Where a value went (`board/reached`), as heat: each run of places a
+/// store of something made of it wrote, as hot as the times each of its
+/// bytes was written.
+export function reachField(answer) {
+  return (answer?.went ?? answer?.shown ?? []).map((run) => ({
+    addr: run.addr,
+    length: run.length,
+    weight: Math.max(1, (run.writes ?? 1) / run.length) * run.length,
+    name: shortPlace(run.where ?? "").replace(/(\[\d+\]|\s\+\s0x[0-9a-f]+).*$/, "") || "somewhere",
+  }));
+}

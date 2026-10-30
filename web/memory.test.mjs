@@ -1,7 +1,7 @@
 // Checks `memory.js` under Node: node --test web/memory.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cellOwners, clusters, coarser, heat, hilbert, layout, owners, rectAround, rectOnBox, refine, rounded, runOf, shortName, tiles } from "./memory.js";
+import { cellOwners, clusters, coarser, fieldCells, fieldHeat, heat, hilbert, layout, owners, rectAround, rectOnBox, refine, rounded, runOf, shortName, tiles } from "./memory.js";
 
 test("a Hilbert curve visits every point of its square once, each next to the last", () => {
   const seen = new Set();
@@ -148,4 +148,21 @@ test("statics are read in clusters, word aligned, and only so much", () => {
   ];
   assert.deepEqual(clusters(statics, 256), [{ base: 0x100, end: 0x110 }, { base: 0x1000, end: 0x1008 }]);
   assert.deepEqual(clusters(statics, 256, 0x14), [{ base: 0x100, end: 0x110 }, { base: 0x1000, end: 0x1004 }]);
+});
+
+test("heat laid on a picture sums each cell's share, and says what is in no picture", () => {
+  const points = [
+    { addr: 0x100, length: 1, weight: 1, name: "ZONE" },
+    { addr: 0x101, length: 1, weight: 1, name: "ZONE" },
+    { addr: 0x10e, length: 4, weight: 4, name: "frame" },
+    { addr: 0x9000_0000, length: 1, weight: 1, name: "WAD lump COLORMAP" },
+    { addr: 0x9000_0004, length: 1, weight: 1, name: "WAD lump COLORMAP" },
+  ];
+  const { weights, most, outside } = fieldCells(0x100, 0x20, 16, points);
+  assert.deepEqual([...weights], [4, 2]);
+  assert.equal(most, 4);
+  assert.deepEqual([...outside], [["WAD lump COLORMAP", 2]]);
+  assert.equal(fieldHeat(0, most), 0);
+  assert.equal(fieldHeat(4, most), 1);
+  assert.ok(fieldHeat(1, 1000) > 0.2 && fieldHeat(1, 1000) < 0.3);
 });

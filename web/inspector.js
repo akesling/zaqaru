@@ -22,10 +22,10 @@
 // memory in the pictures.
 
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
-import { alike, depend, dependsSummary, grouped, pathTo, timeStrip } from "./depends.js";
+import { alike, depend, dependsField, dependsSummary, grouped, pathTo, reachField, timeStrip } from "./depends.js";
 import { progressHtml } from "./progress.js";
 import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
-import { HOPS, byteOf, folded, follow, functionOf, leafText, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, summary } from "./trail.js";
+import { HOPS, byteOf, folded, follow, functionOf, leafText, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, storyField, summary } from "./trail.js";
 
 const MODES = [
   ["variables", "variables"],
@@ -137,7 +137,7 @@ export class Inspector {
   fileOf(path) {
     if (!this.files.has(path)) {
       const reading = this.view
-        .read(`board/file${path}`)
+        .read(`board/file/${path.replace(/^\/+/, "")}`)
         .then((answer) => answer?.text ?? null)
         .catch(() => null)
         .then((text) => {
@@ -572,7 +572,24 @@ export class Inspector {
       near.scrollIntoView({ block: "nearest" });
     }
     this.view.setArrows([...(this.arrows ?? []), ...this.storyArrows()]);
+    this.view.setField(this.field());
     this.paintPicture();
+  }
+
+  /// The heat the pictures show: where the value the story is open on
+  /// went, once known; else everything it depended on, on that tab; else
+  /// its way back.
+  field() {
+    const hex = (n) => `0x${(n >>> 0).toString(16)}`;
+    const r = this.reach;
+    if (r?.answer?.following) {
+      const points = reachField(r.answer);
+      return { label: `where ${r.label ?? hex(r.address)} went${points.length ? "" : ": nowhere, in the window"}`, back: false, points };
+    }
+    const t = this.trail;
+    if (!t) return null;
+    if (t.tab === "depends" && t.depends) return { label: `what ${t.label ?? hex(t.address)} depended on`, back: true, points: dependsField(t.depends) };
+    return { label: `where ${t.label ?? hex(t.address)} came from`, back: true, points: storyField(t) };
   }
 
   scheduleText(doing) {

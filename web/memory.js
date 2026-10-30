@@ -149,6 +149,40 @@ export function hot(h) {
   return stops.at(-1)[1];
 }
 
+/// Heat laid on a picture of memory: `points` — `{ addr, length, weight,
+/// name }`, `weight` over the run's bytes evenly — summed into the cells of
+/// `[base, base + length)` at `cell` bytes each. `{ weights, most, outside
+/// }`: each cell's, the most any has, and the weight of the points outside
+/// the picture by name.
+export function fieldCells(base, length, cell, points) {
+  const weights = new Float32Array(Math.ceil(length / cell));
+  let most = 0;
+  const outside = new Map();
+  for (const { addr, length: n, weight, name } of points) {
+    const from = Math.max(addr, base);
+    const to = Math.min(addr + n, base + length);
+    if (from >= to) {
+      outside.set(name, (outside.get(name) ?? 0) + weight);
+      continue;
+    }
+    const each = weight / n;
+    for (let c = Math.floor((from - base) / cell); c * cell + base < to; c++) {
+      const lo = Math.max(from, base + c * cell);
+      const hi = Math.min(to, base + (c + 1) * cell);
+      weights[c] += each * (hi - lo);
+      most = Math.max(most, weights[c]);
+    }
+  }
+  return { weights, most, outside };
+}
+
+/// How hot a cell of weight `w` is, with `most` the hottest's: on a scale
+/// of logarithms, so that one value and a thousand both show; 0 for none.
+export function fieldHeat(w, most) {
+  if (!(w > 0) || !(most > 0)) return 0;
+  return 0.2 + (0.8 * Math.log1p(w)) / Math.log1p(most);
+}
+
 /// `hsl(h s% l%)` as [r, g, b].
 export function rgbOf(color) {
   const m = /hsl\(\s*([\d.]+)\s+([\d.]+)%\s+([\d.]+)%/.exec(color);
@@ -330,6 +364,8 @@ export class MemoryView {
     this.focus = null; // an address the inspector shows
     this.highlight = null; // runs of memory outlined in the pictures: [address, length]
     this.arrows = []; // pointers drawn in the pictures: [from, to]
+    this.field = null; // heat laid on the pictures: { label, back, points }, see `setField`
+    this.fieldShown = true;
     this.zooms = []; // the way down: each a rectangle of a RAM's picture, and what it reads
     this.layouts = new Map(); // pictures' layouts, by RAM length and cell
     // Bumped whenever what is shown is changed under the reads made for
@@ -341,7 +377,7 @@ export class MemoryView {
     this.reset();
     this.image = null;
     this.owners = [];
-    element.innerHTML = `<div class="mem-head"><span class="controls mem-halves"></span> <span class="controls"><button type="button" data-mark title="mark this instant: the cells written since are outlined, and the inspector can show only what was">mark</button></span> <span class="dim mem-note"></span></div>
+    element.innerHTML = `<div class="mem-head"><span class="controls mem-halves"></span> <span class="controls"><button type="button" data-mark title="mark this instant: the cells written since are outlined, and the inspector can show only what was">mark</button></span> <span class="dim mem-note"></span><div class="mem-field"></div></div>
       <div class="mem-crumbs"></div>
       <div class="mem-maps"></div>
       <div class="mem-readout dim">&nbsp;</div>
@@ -613,6 +649,7 @@ export class MemoryView {
   }
 
   drawMaps() {
+    this.drawField();
     const box = this.element.querySelector(".mem-maps");
     const pictures = this.shown();
     if (!pictures.length) return;
@@ -667,6 +704,7 @@ export class MemoryView {
       return null;
     };
     const lines = s >= 3;
+    const field = this.fieldOf(picture);
     this.eachCell(picture, (c, x, y) => {
       const owner = picture.owner[c];
       const stamp = picture.stamps[c];
@@ -679,6 +717,12 @@ export class MemoryView {
         if (hh > 0.02) rgb = mix(rgb, hot(hh), Math.min(1, 0.25 + hh));
       }
       if (chosen >= 0 && owner !== chosen) rgb = mix(BACKGROUND, rgb, 0.35);
+      // Heat laid on: what it is of, hot; the rest dimmed, without its
+      // writes' heat, which would read as the same.
+      if (field) {
+        const f = fieldHeat(field.weights[c], field.most);
+        rgb = f ? hot(f) : mix(BACKGROUND, owner >= 0 ? colors[owner] : [44, 48, 56], 0.1);
+      }
       const marked = this.mark !== null && stamp > this.mark;
       const right = edge(c, at(x + 1, y));
       const below = edge(c, at(x, y + 1));
@@ -727,6 +771,43 @@ export class MemoryView {
     this.overlay(g, picture, s);
   }
 
+  /// The heat laid on `picture`, its cells', worked out once a field.
+  fieldOf(picture) {
+    if (!this.field || !this.fieldShown) return null;
+    if (picture.field?.of !== this.field) picture.field = { of: this.field, ...fieldCells(picture.base, picture.length, picture.cell, this.field.points) };
+    return picture.field;
+  }
+
+  /// Heat to lay on the pictures: `{ label, back, points }` — what it is
+  /// of, in words; whether it is what a value depended on rather than
+  /// where it went; and `points` as `fieldCells` takes them — or null.
+  /// Redrawn when it changes.
+  setField(field) {
+    const key = field ? `${field.label} ${field.back} ${field.points.length}` : "";
+    if (key === this.fieldKey) return;
+    if (field?.label !== this.field?.label) this.fieldShown = true;
+    this.fieldKey = key;
+    this.field = field ?? null;
+    this.drawMaps();
+  }
+
+  /// The field's legend: what it is, its scale, and what of it is in no
+  /// picture — flash, a NOR, a peripheral.
+  drawField() {
+    const box = this.element.querySelector(".mem-field");
+    const field = this.field;
+    if (!field) return set(box, "");
+    const e = this.escape;
+    const pictured = (p) => (this.rams ?? []).some((r) => p.addr < r.base + r.length && p.addr + p.length > r.base);
+    const { outside } = fieldCells(0, 0, 1, field.points.filter((p) => !pictured(p)));
+    const most = [...outside].sort((a, b) => b[1] - a[1]);
+    const shown = most.slice(0, 4).map(([name, w]) => `${e(name)} ×${Math.round(w)}`);
+    const rest = most.length > 4 ? ` and ${most.length - 4} more` : "";
+    const scale = `<span class="field-scale" title="each cell as hot as how many ${field.back ? "values it depended on were there" : "of its bytes were written with something made of it"}, on a scale of logarithms"></span>`;
+    const away = shown.length ? ` <span class="dim">· not in the pictures: ${shown.join(", ")}${rest}</span>` : "";
+    set(box, `<span class="dim">heat:</span> <b>${e(field.label)}</b> ${scale}${away} <span class="controls"><button type="button" data-field-shown${this.fieldShown ? ' class="on"' : ""} title="show or hide it on the pictures">${this.fieldShown ? "shown" : "hidden"}</button></span>`);
+  }
+
   /// What the inspector asked to be shown on the pictures: the memory a
   /// source line wrote, outlined, and where the chosen task's pointers
   /// point, as arrows from each pointer to its target.
@@ -741,6 +822,21 @@ export class MemoryView {
       const y = view.place[2 * c + 1] - rect.y;
       return x < 0 || y < 0 || x >= rect.w || y >= rect.h ? null : [x * s, y * s];
     };
+    // Few cells hot, each ringed, that one cell of a big picture is seen.
+    const field = this.fieldOf(picture);
+    if (field) {
+      const rings = [];
+      this.eachCell(picture, (c, x, y) => field.weights[c] > 0 && rings.length <= 64 && rings.push([x, y, fieldHeat(field.weights[c], field.most)]));
+      if (rings.length <= 64) {
+        g.lineWidth = 2;
+        for (const [x, y, f] of rings) {
+          g.strokeStyle = `rgb(${hot(f).join(" ")})`;
+          g.beginPath();
+          g.arc((x + 0.5) * s, (y + 0.5) * s, Math.max(7, s * 1.5), 0, 2 * Math.PI);
+          g.stroke();
+        }
+      }
+    }
     if (this.highlight) {
       g.lineWidth = Math.max(1, s / 3);
       g.strokeStyle = "#fff";
@@ -807,7 +903,9 @@ export class MemoryView {
       const what = this.named(address);
       const written = stamp ? `written ${age(this.now - stamp)} ago` : "never written";
       const inside = picture.statics && picture.statics[c] >= 0 ? picture.fullNames[picture.statics[c]] : null;
-      readout().textContent = `0x${address.toString(16).padStart(8, "0")}–0x${(address + picture.cell - 1).toString(16)} · ${what ?? inside ?? (owner ? owner.name : picture.name)} · ${written}`;
+      const field = this.fieldOf(picture);
+      const weight = field?.weights[c] ? ` · ${this.field.back ? `${+field.weights[c].toFixed(1)} of what it depended on` : `${+field.weights[c].toFixed(1)} bytes written with what was made of it`}` : "";
+      readout().textContent = `0x${address.toString(16).padStart(8, "0")}–0x${(address + picture.cell - 1).toString(16)} · ${what ?? inside ?? (owner ? owner.name : picture.name)} · ${written}${weight}`;
     };
     canvas.onmouseleave = () => this.dragging || (readout().textContent = "\u00a0");
     // A press and a release in place is a click: what is there, to the
@@ -1182,6 +1280,10 @@ export class MemoryView {
       // The write was within this microsecond of the board's; its end is
       // just after it.
       return this.stand(Number(t("[data-stand]").dataset.stand) * 1e6);
+    }
+    if (t("[data-field-shown]")) {
+      this.fieldShown = !this.fieldShown;
+      return this.drawMaps();
     }
     if (t("[data-mark]")) {
       this.mark = this.mark === null ? this.now : null;
