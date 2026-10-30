@@ -67,6 +67,13 @@ echo "build: the archive, deflated"
 linux '"$T/release/zaqaru-m0" repack "$W/bench/hubris.zip" "$W/bench/hubris.zip.new" \
   && mv "$W/bench/hubris.zip.new" "$W/bench/hubris.zip" && cp "$W/bench/hubris.zip" "$W/bench/archives/doom.zip"'
 
+# The source the archive's DWARF names — Hubris's, the crates', Doom's C —
+# for the page to show beside a frame or a write: see demo/hubris.
+echo "build: the sources"
+linux '"$W/bench/zaqaru-m0" sources "$W/bench/archives/doom.zip" | sort -u > "$W/sources.txt"'
+rm -rf "$work/bench/src"
+"$repo/demo/hubris/sources.sh" "$hubris" "$work/sources.txt" "$work/bench/src"
+
 echo "build: the bench image"
 cp "$here/Dockerfile" "$here/board" "$wad" "$work/bench/"
 [ "$(basename "$wad")" = doom1.wad ] || mv "$work/bench/$(basename "$wad")" "$work/bench/doom1.wad"

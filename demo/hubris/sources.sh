@@ -13,6 +13,10 @@
 #   /rustc/HASH/…      the standard library at that compiler's commit, from
 #                      rust-lang/rust on GitHub, which is where a toolchain
 #                      without its rust-src component has it
+#   task/doom/…        relative: C a task built with the cc crate, whose
+#                      DWARF joins the directory it was compiled in to a
+#                      path that already has it — the first file of the
+#                      checkout's that the path, or a tail of it, names
 #
 #   demo/hubris/sources.sh <hubris-checkout> <list> <out-dir>
 #
@@ -38,9 +42,17 @@ while IFS= read -r path; do
     /crates.io/*) from="$registry/${path#/crates.io/}" ;;
     /git/*) from="$cargo_home/git/checkouts/${path#/git/}" ;;
     /rustc/*) from= ;;
-    *) continue ;;
+    /*) continue ;;
+    ./*|*/./*|*/../*) continue ;;
+    *)
+      from=/nonexistent
+      rest=$path
+      while [ -n "$rest" ]; do
+        [ -f "$hubris/$rest" ] && from="$hubris/$rest" && break
+        case "$rest" in */*) rest=${rest#*/} ;; *) rest= ;; esac
+      done ;;
   esac
-  to="$out$path"
+  to="$out/${path#/}"
   [ -f "$to" ] && { found=$((found + 1)); continue; }
   mkdir -p "$(dirname "$to")"
   if [ -n "$from" ] && [ -f "$from" ]; then
