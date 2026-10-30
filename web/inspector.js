@@ -161,8 +161,15 @@ export class Inspector {
   loadIndex() {
     this.indexing ??= this.view
       .read("board/index")
-      .then((answer) => (this.index = readIndex(answer)))
-      .catch(() => (this.index = readIndex(null)));
+      .then((answer) => {
+        if (!answer?.symbols) throw new Error(answer?.error ?? "no index");
+        this.index = readIndex(answer);
+      })
+      .catch((why) => {
+        // Asked again the next time it is wanted.
+        this.indexing = null;
+        this.indexError = String(why);
+      });
     return this.indexing;
   }
 

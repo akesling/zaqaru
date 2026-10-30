@@ -656,7 +656,7 @@ export class MemoryView {
       const e = this.escape;
       list.innerHTML = found.length
         ? found.map((s, n) => `<div class="sym-row${n === chosen ? " on" : ""}" data-sym="${n}" title="${e(s.file)}:${s.line}"><b>${e(s.name)}</b> <span class="dim">${s.kind}${s.path !== s.name ? ` · ${e(s.path)}` : ""} · ${e(shortFile(s.file))}:${s.line}</span></div>`).join("")
-        : `<div class="dim sym-row">${this.inspector.index ? "nothing by that name" : "reading the index…"}</div>`;
+        : `<div class="dim sym-row">${this.inspector.index ? "nothing by that name" : this.inspector.indexError ? `no index: ${e(this.inspector.indexError)}` : "reading the index…"}</div>`;
     };
     const open = (s) => {
       if (!s) return;

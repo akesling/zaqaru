@@ -2323,6 +2323,9 @@ $("load").onclick = () => {
 
 // For a test driving the page from outside.
 window.zaqaruDebug = {
+  get memory() {
+    return memoryView;
+  },
   seek,
   advance,
   send,
