@@ -59,15 +59,15 @@ const OPS = {
   sel: [null, "lanes chosen"],
   pkh: [null, "halves packed"],
   mov: [null, "moved"],
-  // A merge at a load or a store: the address it worked out.
-  ldr: [null, "an address worked out"],
-  ldrd: [null, "an address worked out"],
-  ldm: [null, "an address worked out"],
-  pop: [null, "an address worked out"],
-  str: [null, "an address worked out"],
-  strd: [null, "an address worked out"],
-  stm: [null, "an address worked out"],
-  push: [null, "an address worked out"],
+  // A merge at a load or a store: the address it read or wrote at.
+  ldr: ["+", "address"],
+  ldrd: ["+", "address"],
+  ldm: ["+", "address"],
+  pop: ["+", "address"],
+  str: ["+", "address"],
+  strd: ["+", "address"],
+  stm: ["+", "address"],
+  push: ["+", "address"],
   fpu: [null, "by the FPU"],
 };
 
@@ -96,6 +96,7 @@ export function readTree(tree, window, nodes, parent = null) {
     earliest: tree.earliest ?? null,
     cut: !!tree.cut,
     same: !!tree.same,
+    pointer: !!tree.pointer,
     window,
     parent,
     operands: [],
@@ -271,14 +272,89 @@ export function valueText(value) {
   return Math.abs(signed) < 100000 ? `${hex} (${signed})` : hex;
 }
 
+const hex = (v) => (v === null || v === undefined ? "?" : `0x${(v >>> 0).toString(16)}`);
+
+/// `v` shifted as an instruction shifts its second operand.
+function shiftBy(v, kind, n) {
+  v >>>= 0;
+  switch (kind) {
+    case "lsl":
+      return n >= 32 ? 0 : (v << n) >>> 0;
+    case "lsr":
+      return n >= 32 ? 0 : v >>> n;
+    case "asr":
+      return (n >= 32 ? (v | 0) >> 31 : (v | 0) >> n) >>> 0;
+    default:
+      return ((v >>> n) | (v << (32 - n))) >>> 0;
+  }
+}
+
+/// What an operation makes of two values, where it is one of the few
+/// that are a symbol between them: to tell its operands apart.
+function apply(op, a, b) {
+  const f = { add: a + b, adc: a + b, sub: a - b, rsb: b - a, orr: a | b, eor: a ^ b, and: a & b, bic: a & ~b }[op];
+  return f === undefined ? null : f >>> 0;
+}
+
 /// A merge as an expression: its operands' values with the operation
-/// between them — `0xa38000 + 0x8000` — or, where no symbol says it, in
-/// words. `values`, the operands' values in order.
-export function expression(op, values) {
+/// between them — `0xa38000 + 0x8000` — its second operand shifted where
+/// the instruction shifts it (`step.rshift`), the constant it worked with
+/// (`step.imm`, `step.bits`): `0x10c492e8 >> 10`, `bits 4–9 of 0x1f3`; and
+/// where a pointer was left out (`pointer`), the pointer, from what the
+/// rest came to. Or, where no symbol says it, in words. Null with no
+/// operand to say.
+export function expression(op, values, step = {}, pointer = false) {
   const { symbol, word } = operation(op);
-  const shown = values.map((v) => (v === null || v === undefined ? "?" : `0x${(v >>> 0).toString(16)}`));
-  if (symbol && shown.length >= 2) return shown.join(` ${symbol} `);
-  return `${word}${shown.length ? ` (${shown.join(", ")})` : ""}`;
+  if (!values.length) return null;
+  const shift = ["lsl", "lsr", "asr", "ror"].includes(op);
+  const value = step.value;
+  const shifted = (v) => (step.rshift ? `${hex(v)} ${{ lsl: "<<", lsr: ">>", asr: ">>", ror: "rotated" }[step.rshift[0]]} ${step.rshift[1]}` : hex(v));
+  if (step.rshift && symbol) {
+    const [kind, n] = step.rshift;
+    if (values.length === 2) {
+      // Which was shifted: the way round that comes to the value.
+      for (const [a, b] of [values, [...values].reverse()]) if (apply(op, a, shiftBy(b, kind, n)) === value >>> 0) return `${hex(a)} ${symbol} ${shifted(b)}`;
+    }
+    if (values.length === 1 && pointer && (op === "add" || op === "adc")) return `${hex(value - shiftBy(values[0], kind, n))} ${symbol} ${shifted(values[0])}`;
+    // The other a constant the code had made before: not followed.
+    if (values.length === 1 && !pointer) return `${shifted(values[0])} ${symbol} a constant`;
+  }
+  if (values.length === 1 && pointer && symbol === "+" && value !== null && value !== undefined) return `${hex(value - values[0])} + ${hex(values[0])}`;
+  if (step.bits && values.length === 1) {
+    const [lsb, width] = step.bits;
+    return `${op === "bfi" || op === "bfc" ? word : "bits"} ${lsb}–${lsb + width - 1} of ${hex(values[0])}`;
+  }
+  if (step.imm !== undefined && values.length === 1) {
+    const imm = shift || step.imm < 10 ? String(step.imm) : hex(step.imm);
+    if (symbol) return `${hex(values[0])} ${symbol} ${imm}`;
+    if (shift) return `${hex(values[0])} rotated by ${imm}`;
+  }
+  if (symbol && values.length >= 2) return values.map(hex).join(` ${symbol} `);
+  return `${word} (${values.map(hex).join(", ")})`;
+}
+
+/// Whether a merge is an address a load or a store worked out.
+export function isAddress(step) {
+  return step?.what === "merge" && operation(step.op).word === "address";
+}
+
+/// An address worked out of a base and an index, as an expression: `base
+/// + index << shift` — the two told apart by which way round comes to
+/// `value` — or, of one, or of more, their sum.
+export function addressExpression(value, values, shift = 0) {
+  const known = values.filter((v) => v !== null && v !== undefined);
+  // The table's own address left out: what the index comes to, taken from
+  // the address.
+  if (known.length === 1 && value !== null && value !== undefined) {
+    const index = known[0];
+    return `${hex(value - index * 2 ** shift)} + ${hex(index)}${shift ? ` << ${shift}` : ""}`;
+  }
+  if (known.length === 2 && value !== null && value !== undefined) {
+    for (const [base, index] of [known, [...known].reverse()]) {
+      if (((base + index * 2 ** shift) >>> 0) === value >>> 0) return `${hex(base)} + ${hex(index)}${shift ? ` << ${shift}` : ""}`;
+    }
+  }
+  return known.length ? known.map(hex).join(" + ") : hex(value ?? 0);
 }
 
 /// The value a node's step holds, as its parent sees it.

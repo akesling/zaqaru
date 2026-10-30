@@ -1843,17 +1843,26 @@ impl Board {
                     n => format!("r{n}"),
                 }
             ),
-            What::Merge { value } => format!(r#"{{"what":"merge","op":"{}","value":{},{common}}}"#, self.operation_at(node.pc), value.map_or("null".into(), |v| v.to_string())),
+            What::Merge { value } => {
+                // An address of a register and a register: how far the
+                // second is shifted.
+                let half = |at: u32| self.machine.bus.peek(at, 2).unwrap_or(0);
+                let first = half(node.pc);
+                let second = if armv6m::ops::wide(first) { half(node.pc.wrapping_add(2)) } else { 0 };
+                let shift = armv6m::ops::index_shift(first, second).map_or(String::new(), |k| format!(r#""shift":{k},"#));
+                // A second operand shifted: `add.w r4, r4, r0, lsr #26`.
+                let shifted = armv6m::ops::shifted_operand(first, second).map_or(String::new(), |(kind, n)| format!(r#""rshift":["{kind}",{n}],"#));
+                // And the constant it worked with: what it added, shifted by.
+                let imm = match armv6m::ops::immediate(first, second) {
+                    Some(armv6m::ops::Immediate::Value(v)) => format!(r#""imm":{v},"#),
+                    Some(armv6m::ops::Immediate::Bits { lsb, width }) => format!(r#""bits":[{lsb},{width}],"#),
+                    None => String::new(),
+                };
+                format!(r#"{{"what":"merge","op":"{}",{shift}{shifted}{imm}"value":{},{common}}}"#, armv6m::ops::operation(first, second), value.map_or("null".into(), |v| v.to_string()))
+            }
             What::Load { addr, value } => format!(r#"{{"what":"load","addr":{addr},"value":{value},"where":{},{common}}}"#, quoted(&self.describe_typed(addr, map, read))),
             What::Bytes { addr, value, .. } => format!(r#"{{"what":"bytes","addr":{addr},"value":{value},"where":{},{common}}}"#, quoted(&self.describe_typed(addr, map, read))),
         }
-    }
-
-    /// The operation of the instruction at `pc`, in a word: `add`, `mul`.
-    fn operation_at(&self, pc: u32) -> &'static str {
-        let half = |at: u32| self.machine.bus.peek(at, 2).unwrap_or(0);
-        let first = half(pc);
-        armv6m::ops::operation(first, if armv6m::ops::wide(first) { half(pc.wrapping_add(2)) } else { 0 })
     }
 
     /// How the value at an address, in a register, or of a node of the
@@ -1882,11 +1891,12 @@ impl Board {
             What::Held { addr, size, value, .. } => addr.wrapping_sub(node.pc) < 4096 || (size == 4 && pointer(value)),
             What::Register { n: 13 | 15, .. } => true,
             What::Register { value, .. } => pointer(value),
-            // A pointer the code made and kept: which struct, which table.
-            What::Store { size: 4, value, .. } => pointer(value),
+            // A pointer the code made and kept, or loaded: which struct,
+            // which table.
+            What::Store { size: 4, value, .. } | What::Load { value, .. } | What::Bytes { value, .. } => pointer(value),
             _ => false,
         };
-        let tree = p.derivation(tag, 24, 240, &says_nothing);
+        let tree = p.derivation(tag, 40, 400, &says_nothing);
         fn json(board: &Board, p: &armv6m::provenance::Provenance, d: &Derived, role: Role, byte: u32, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
             let Some(node) = p.node(d.tag) else { return "null".into() };
             let role = match role {
@@ -1907,6 +1917,9 @@ impl Board {
             }
             if d.same {
                 out += r#","same":true"#;
+            }
+            if d.pointer {
+                out += r#","pointer":true"#;
             }
             let operands: Vec<String> = d.operands.iter().map(|(role, o)| json(board, p, o, *role, 0, map, read)).collect();
             format!(r#"{out},"operands":[{}]}}"#, operands.join(","))

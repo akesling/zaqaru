@@ -23,7 +23,7 @@
 
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
 import { alike, depend, dependsField, dependsSummary, grouped, pathTo, reachField, timeStrip } from "./depends.js";
-import { deriveField, expression, goOn, nodeLine, onwards, operation, readTree, recurrence, valueOf, valueText } from "./derive.js";
+import { addressExpression, deriveField, expression, goOn, isAddress, nodeLine, onwards, operation, readTree, recurrence, valueOf, valueText } from "./derive.js";
 import { highlight } from "./highlight.js";
 import { definitionsOf, markUse, readIndex, shortFile } from "./symbols.js";
 import { progressHtml } from "./progress.js";
@@ -1101,7 +1101,13 @@ export class Inspector {
       }
       case "merge": {
         const values = node.operands.map(valueOf);
-        head = `${v} = <span class="made-expr">${e(expression(step.op, values))}</span> <span class="dim">· ${e(operation(step.op).word)} by</span> ${by(step)}`;
+        if (isAddress(step)) {
+          const table = node.pointer ? ` <span class="dim" title="the table's own address, which says which table, not which entry">(the table's address + the index)</span>` : "";
+          head = `<span class="dim">address</span> ${v} = <span class="made-expr">${e(addressExpression(step.value, values, step.shift ?? 0))}</span>${table} <span class="dim">· worked out by</span> ${by(step)}`;
+          break;
+        }
+        const said = expression(step.op, values, step, node.pointer);
+        head = `${v}${said ? ` = <span class="made-expr">${e(said)}</span>` : ""} <span class="dim">· ${e(operation(step.op).word)} by</span> ${by(step)}`;
         break;
       }
       case "load":
