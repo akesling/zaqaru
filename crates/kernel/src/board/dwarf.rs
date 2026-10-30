@@ -25,8 +25,10 @@ const FRAMES: usize = 32;
 /// archive's path: when the archive changes, all of it is read again.
 #[derive(Default)]
 pub struct Cache {
-    archive: String,
+    pub archive: String,
     owners: HashMap<String, Rc<Result<Debug, String>>>,
+    /// `board/index`, once made: see index.rs.
+    pub index: Option<Rc<String>>,
 }
 
 impl Board {
@@ -36,7 +38,7 @@ impl Board {
         let archive = self.archive.as_ref()?;
         let mut cache = self.debug.borrow_mut();
         if cache.archive != *archive {
-            *cache = Cache { archive: archive.clone(), owners: HashMap::new() };
+            *cache = Cache { archive: archive.clone(), owners: HashMap::new(), index: None };
         }
         if let Some(debug) = cache.owners.get(owner) {
             return Some(Rc::clone(debug));

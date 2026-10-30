@@ -24,6 +24,7 @@
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
 import { alike, depend, dependsField, dependsSummary, grouped, pathTo, reachField, timeStrip } from "./depends.js";
 import { highlight } from "./highlight.js";
+import { definitionsOf, readIndex, shortFile } from "./symbols.js";
 import { progressHtml } from "./progress.js";
 import { addressOf, clutBytes, colour, firstView, layerFor, pixelOf, shapeOf } from "./views.js";
 import { HOPS, byteOf, folded, follow, functionOf, leafText, lineOf, next, ownerOf, placeOwner, shortPlace, span, stepsOf, storyField, summary } from "./trail.js";
@@ -84,6 +85,9 @@ export class Inspector {
     this.writers = new Map(); // owner → { answer, read }
     this.files = new Map(); // path → text, or a promise of it
     this.source = null; // { file, line, whole }
+    this.sourceBack = []; // where the source was, to go back to
+    this.sourceForward = [];
+    this.index = null; // the board's code, indexed: see `loadIndex`
     this.history = null; // { key, address, size, type, owner, answer | error }
     this.trail = null; // { address, label, hops, end, running, error }: see trail.js
     this.windows = new Map(); // the stories' windows run so far: see trail.js
@@ -150,6 +154,51 @@ export class Inspector {
     }
     const text = this.files.get(path);
     return text instanceof Promise ? undefined : text;
+  }
+
+  /// The board's code, indexed (`board/index`, see symbols.js): read once,
+  /// the first time it is wanted.
+  loadIndex() {
+    this.indexing ??= this.view
+      .read("board/index")
+      .then((answer) => (this.index = readIndex(answer)))
+      .catch(() => (this.index = readIndex(null)));
+    return this.indexing;
+  }
+
+  /// Shows `line` of `file` — a source line clicked, a name gone to — the
+  /// whole file, the line in the middle; where it was before, kept to go
+  /// back to.
+  openSource(file, line, whole = true) {
+    if (this.source && (this.source.file !== file || this.source.line !== line)) {
+      this.sourceBack.push(this.source);
+      this.sourceForward = [];
+    }
+    this.source = { file, line, whole, choices: null, note: null };
+    const owner = this.view.selected;
+    if (owner) this.readWriters(owner);
+    this.draw(true);
+    this.box.querySelector(".mem-source")?.scrollIntoView({ block: "nearest" });
+  }
+
+  /// Goes to where the name clicked in the source is defined: there at
+  /// once when it is plain where, or a list of where it could be.
+  async goToName(name) {
+    const source = this.source;
+    if (!source) return;
+    await this.loadIndex();
+    if (this.source !== source) return;
+    const all = definitionsOf(this.index, name, source.file);
+    // Where it already is is nowhere to go.
+    const elsewhere = all.filter((d) => !(d.file === source.file && d.line === source.line));
+    const defined = elsewhere.filter((d) => !d.declared);
+    const best = defined.length === 1 ? defined[0] : elsewhere.length === 1 ? elsewhere[0] : null;
+    if (best) return this.openSource(best.file, best.line);
+    source.choices = null;
+    if (!all.length) source.note = `nothing known defines ${name}`;
+    else if (!elsewhere.length) source.note = `${name} is defined here`;
+    else source.choices = { name, all: elsewhere };
+    this.draw(true);
   }
 
   /// Brought up to date as the panel polls: the stack when it was written
@@ -1164,7 +1213,15 @@ export class Inspector {
     const { file, line, whole } = this.source;
     const text = this.fileOf(file);
     const close = `<a data-close="source">close</a>`;
-    const head = `<div class="mem-source-head"><b>${e(file.split("/").slice(-3).join("/"))}</b>:${line} <span class="dim" title="${e(file)}">${e(file)}</span> <a data-whole>${whole ? "around the line" : "the whole file"}</a> ${close}</div>`;
+    const nav = `<span class="controls"><button type="button" data-source-back${this.sourceBack.length ? "" : " disabled"} title="back to where it was">‹</button><button type="button" data-source-forward${this.sourceForward.length ? "" : " disabled"} title="forward again">›</button></span>`;
+    const choices = this.source.choices
+      ? `<div class="mem-source-choices"><span class="dim">${e(this.source.choices.name)} could be:</span>${this.source.choices.all
+          .slice(0, 12)
+          .map((d) => `<a data-src="${e(d.file)}" data-line="${d.line}" data-hop title="${e(d.file)}"><b>${e(d.path)}</b> <span class="dim">${d.kind}${d.declared ? ", declared" : ""} · ${e(shortFile(d.file))}:${d.line}</span></a>`)
+          .join("")}</div>`
+      : "";
+    const note = this.source.note ? `<div class="dim">${e(this.source.note)}</div>` : "";
+    const head = `<div class="mem-source-head">${nav} <b>${e(file.split("/").slice(-3).join("/"))}</b>:${line} <span class="dim" title="${e(file)}">${e(file)}</span> <a data-whole>${whole ? "around the line" : "the whole file"}</a> ${close}</div>${choices}${note}`;
     if (text === undefined) return `<div class="mem-source">${head}<div class="dim">reading…</div></div>`;
     if (text === null) return `<div class="mem-source">${head}<div class="dim">the build did not keep this file</div></div>`;
     // Coloured once a file: the file's whole text, for what spans lines.
@@ -1338,10 +1395,25 @@ export class Inspector {
     }
     if (t("[data-src]")) {
       const a = t("[data-src]");
-      this.source = { file: a.dataset.src, line: Number(a.dataset.line), whole: false };
-      const owner = this.view.selected;
-      if (owner) this.readWriters(owner);
+      this.openSource(a.dataset.src, Number(a.dataset.line), a.dataset.hop !== undefined);
+      return true;
+    }
+    if (t("[data-source-back]") && this.sourceBack.length) {
+      this.sourceForward.push(this.source);
+      this.source = this.sourceBack.pop();
       this.draw(true);
+      return true;
+    }
+    if (t("[data-source-forward]") && this.sourceForward.length) {
+      this.sourceBack.push(this.source);
+      this.source = this.sourceForward.pop();
+      this.draw(true);
+      return true;
+    }
+    // A name in the source: where it is defined.
+    const name = t(".mem-source .code .hl-i, .mem-source .code .hl-f, .mem-source .code .hl-t, .mem-source .code .hl-x, .mem-source .code .hl-m");
+    if (name) {
+      this.goToName(name.textContent.replace(/!$/, ""));
       return true;
     }
     if (t("[data-whole]")) {

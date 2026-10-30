@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { highlight, tokens } from "./highlight.js";
 
-const classes = (text, file) => tokens(text, file).filter(([c]) => c).map(([c, t]) => `${c}:${t}`);
+const classes = (text, file) => tokens(text, file).filter(([c]) => c && c !== "i").map(([c, t]) => `${c}:${t}`);
 
 test("Rust: keywords, types, calls, macros, lifetimes, attributes, strings and numbers", () => {
   assert.deepEqual(classes(`#[inline(always)]\npub fn copy<'a>(x: &'a [u8], n: usize) -> Option<u32> { let c = b'\\n'; debug_assert!(n != 0x10_u32); f::<u8>(r#"a"b"#) }`, "src/lib.rs"), [
@@ -20,7 +20,7 @@ test("C: the preprocessor, types, calls and constants", () => {
 });
 
 test("a comment over many lines is a comment on each, the rest escaped", () => {
-  assert.deepEqual(highlight("/* a\n b */ x < 1", "a.c"), [`<span class="hl-c">/* a</span>`, `<span class="hl-c"> b */</span> x &lt; <span class="hl-n">1</span>`]);
+  assert.deepEqual(highlight("/* a\n b */ x < 1", "a.c"), [`<span class="hl-c">/* a</span>`, `<span class="hl-c"> b */</span> <span class="hl-i">x</span> &lt; <span class="hl-n">1</span>`]);
   assert.deepEqual(highlight("plain <text>\n", "notes.txt"), ["plain &lt;text&gt;", ""]);
-  assert.deepEqual(classes("x1 = a2", "a.rs"), []);
+  assert.deepEqual(tokens("x1 = a2", "a.rs"), [["i", "x1"], [null, " = "], ["i", "a2"]]);
 });

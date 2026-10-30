@@ -151,6 +151,16 @@
   .memory-panel .dim { opacity: .65; }
   .mem-head { margin: 2px 0 6px; }
   .mem-field:empty { display: none; }
+  .mem-symbol { position: relative; display: inline-block; margin-left: 8px; }
+  .mem-symbol input { font: inherit; width: 18em; padding: 1px 6px; border: 1px solid var(--line); border-radius: 4px; background: Canvas; color: CanvasText; }
+  .sym-results { position: absolute; z-index: 20; top: 100%; left: 0; margin-top: 2px; width: 44em; max-width: 80vw; max-height: 50vh; overflow: auto; background: Canvas; border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 6px 20px #0005; }
+  .sym-results[hidden] { display: none; }
+  .sym-row { padding: 2px 8px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sym-row.on, .sym-row[data-sym]:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+  .mem-source .code [class^="hl-"]:not(.hl-c):not(.hl-s):not(.hl-n):not(.hl-k):not(.hl-a):not(.hl-l):hover { text-decoration: underline; cursor: pointer; }
+  .mem-source-choices { display: flex; flex-direction: column; gap: 1px; padding: 3px 0 5px; border-bottom: 1px solid var(--line); margin-bottom: 3px; }
+  .mem-source-choices a { cursor: pointer; }
+  .mem-source-head .controls button { padding: 0 5px; }
   .mem-field { margin-top: 4px; }
   .field-scale { display: inline-block; width: 90px; height: 9px; border-radius: 2px; vertical-align: -1px; background: linear-gradient(to right, rgb(120 20 30), rgb(220 70 20) 40%, rgb(255 190 40) 75%, rgb(255 255 230)); }
   .mem-maps { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end; }

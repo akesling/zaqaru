@@ -15,6 +15,7 @@
 // `board/whatis` for what the pointer is on.
 
 import { Inspector } from "./inspector.js";
+import { search, shortFile } from "./symbols.js";
 
 /// The bytes a cell of the picture stands for.
 export const CELL = 64;
@@ -377,7 +378,7 @@ export class MemoryView {
     this.reset();
     this.image = null;
     this.owners = [];
-    element.innerHTML = `<div class="mem-head"><span class="controls mem-halves"></span> <span class="controls"><button type="button" data-mark title="mark this instant: the cells written since are outlined, and the inspector can show only what was">mark</button></span> <span class="dim mem-note"></span><div class="mem-field"></div></div>
+    element.innerHTML = `<div class="mem-head"><span class="controls mem-halves"></span> <span class="controls"><button type="button" data-mark title="mark this instant: the cells written since are outlined, and the inspector can show only what was">mark</button></span> <span class="dim mem-note"></span> <span class="mem-symbol"><input type="search" data-symbol placeholder="go to a symbol…" autocomplete="off" spellcheck="false" title="a function, static, type, constant or macro of the board's code, by name or path (Task::new): its source"><span class="sym-results" hidden></span></span><div class="mem-field"></div></div>
       <div class="mem-crumbs"></div>
       <div class="mem-maps"></div>
       <div class="mem-readout dim">&nbsp;</div>
@@ -386,6 +387,7 @@ export class MemoryView {
     element.onclick = (event) => this.clicked(event);
     this.whatis = new Map();
     this.inspector = new Inspector(this, element.querySelector(".mem-inspector"));
+    this.equipSearch(element.querySelector("[data-symbol]"), element.querySelector(".sym-results"));
     this.inspectedMost = INSPECTED;
   }
 
@@ -640,6 +642,56 @@ export class MemoryView {
     this.polled = 0;
     if (this.busy) this.again = true;
     this.poll(true);
+  }
+
+  /// The box that finds a symbol of the board's code by name, and opens
+  /// its source: the arrows choose among what it found, Enter opens it,
+  /// Esc lets it go.
+  equipSearch(input, list) {
+    let found = [];
+    let chosen = 0;
+    const show = () => {
+      list.hidden = !found.length && !input.value.trim();
+      if (!input.value.trim()) return (list.innerHTML = "");
+      const e = this.escape;
+      list.innerHTML = found.length
+        ? found.map((s, n) => `<div class="sym-row${n === chosen ? " on" : ""}" data-sym="${n}" title="${e(s.file)}:${s.line}"><b>${e(s.name)}</b> <span class="dim">${s.kind}${s.path !== s.name ? ` · ${e(s.path)}` : ""} · ${e(shortFile(s.file))}:${s.line}</span></div>`).join("")
+        : `<div class="dim sym-row">${this.inspector.index ? "nothing by that name" : "reading the index…"}</div>`;
+    };
+    const open = (s) => {
+      if (!s) return;
+      list.hidden = true;
+      this.inspector.openSource(s.file, s.line);
+    };
+    input.oninput = async () => {
+      await this.inspector.loadIndex();
+      found = search(this.inspector.index, input.value);
+      chosen = 0;
+      show();
+    };
+    input.onfocus = () => {
+      this.inspector.loadIndex();
+      if (input.value.trim()) show();
+    };
+    input.onkeydown = (event) => {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        chosen = Math.max(0, Math.min(found.length - 1, chosen + (event.key === "ArrowDown" ? 1 : -1)));
+        show();
+        list.querySelector(".on")?.scrollIntoView({ block: "nearest" });
+        event.preventDefault();
+      } else if (event.key === "Enter") open(found[chosen]);
+      else if (event.key === "Escape") {
+        list.hidden = true;
+        event.stopPropagation();
+      }
+    };
+    // Chosen with the pointer before the box, losing it, hides the list.
+    list.onmousedown = (event) => {
+      const row = event.target.closest("[data-sym]");
+      if (row) open(found[Number(row.dataset.sym)]);
+      event.preventDefault();
+    };
+    input.onblur = () => (list.hidden = true);
   }
 
   /// The pictures shown: the RAMs, or the part of one zoomed in on.

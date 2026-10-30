@@ -50,7 +50,7 @@ export function languageOf(file) {
 /// plain text — `c` a comment, `s` a string or character, `n` a number,
 /// `k` a keyword, `t` a type, `f` a function called or defined, `m` a
 /// macro, `a` an attribute or a preprocessor line, `l` a lifetime, `x` a
-/// constant named in capitals.
+/// constant named in capitals, `i` any other name.
 export function tokens(text, file) {
   const language = languageOf(file);
   if (!language) return [[null, text]];
@@ -108,7 +108,7 @@ function word(w, text, at, language, keywords, types) {
   if (rest[0] === "(" || (rest[0] === " " && text[after + 1] === "(" && language === "c") || (language === "rust" && rest === "::" && text[after + 2] === "<")) return "f";
   if (language === "rust" && /^[A-Z]/.test(w) && /[a-z]/.test(w)) return "t";
   if (/^[A-Z][A-Z\d_]+$/.test(w) && w.length > 1) return "x";
-  return null;
+  return "i";
 }
 
 function escape(text) {

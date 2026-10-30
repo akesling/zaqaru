@@ -153,6 +153,33 @@ pub struct Variable {
     pub bytes: Vec<Option<u8>>,
 }
 
+/// What a definition is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Kind {
+    Function,
+    Static,
+    Type,
+}
+
+/// Where something was defined, as the DWARF says it was declared: a
+/// function, a static, a type.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Definition {
+    /// Its own name, a type's without its generic arguments:
+    /// `R_DrawColumn`, `copy_forward_bytes`, `I2cController`.
+    pub name: String,
+    /// With the modules, types and functions it is in:
+    /// `drv_stm32xx_i2c::I2cController::write_read`.
+    pub path: String,
+    pub kind: Kind,
+    /// As the line tables name it, which is what a build keeps.
+    pub file: String,
+    pub line: u32,
+    /// Only declared here — C's `extern`, a prototype — and defined
+    /// elsewhere.
+    pub declaration: bool,
+}
+
 /// The most of a variable's bytes read.
 pub const VARIABLE_BYTES: u32 = 1024;
 
@@ -260,6 +287,65 @@ impl Debug {
             }
         }
         out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Every function, static and type the DWARF says where it declared:
+    /// each once, however many units or instances of a generic name it.
+    /// A function's locals, and what is nameless, are left out.
+    pub fn definitions(&self) -> Vec<Definition> {
+        let mut out = Vec::new();
+        for (u, unit) in self.units.iter().enumerate() {
+            // The unit's files, by their index.
+            let files = |index: u64| -> Option<String> {
+                let header = unit.line_program.as_ref()?.header();
+                let file = header.file(index)?;
+                let string = |value: AttributeValue<R>| -> Option<String> { Some(self.dwarf.attr_string(unit, value).ok()?.to_string_lossy().ok()?.into_owned()) };
+                let name = string(file.path_name())?;
+                let dir = file.directory(header).and_then(string).unwrap_or_default();
+                let comp_dir = unit.comp_dir.as_ref().and_then(|d| Some(d.to_string_lossy().ok()?.into_owned())).unwrap_or_default();
+                Some(join(&join(&comp_dir, &dir), &name))
+            };
+            let mut known: HashMap<u64, Option<String>> = HashMap::new();
+            // What each entry is in: its depth, its name, and whether it is
+            // a function.
+            let mut path: Vec<(isize, String, bool)> = Vec::new();
+            let mut cursor = unit.entries();
+            while let Ok(Some(entry)) = cursor.next_dfs() {
+                let depth = entry.depth();
+                while path.last().is_some_and(|(d, ..)| *d >= depth) {
+                    path.pop();
+                }
+                let tag = entry.tag();
+                let kind = match tag {
+                    DW_TAG_subprogram => Some(Kind::Function),
+                    DW_TAG_variable if !path.iter().any(|(_, _, function)| *function) => Some(Kind::Static),
+                    DW_TAG_structure_type | DW_TAG_union_type | DW_TAG_enumeration_type | DW_TAG_typedef | DW_TAG_class_type => Some(Kind::Type),
+                    _ => None,
+                };
+                let name = entry.attr_value(DW_AT_name).and_then(|v| self.string(u, v));
+                if matches!(tag, DW_TAG_namespace | DW_TAG_subprogram | DW_TAG_structure_type | DW_TAG_union_type | DW_TAG_enumeration_type)
+                    && let Some(name) = &name
+                {
+                    path.push((depth, name.clone(), tag == DW_TAG_subprogram));
+                }
+                let (Some(kind), Some(name)) = (kind, name) else { continue };
+                let Some(AttributeValue::FileIndex(index)) = entry.attr_value(DW_AT_decl_file) else { continue };
+                let Some(line) = entry.attr_value(DW_AT_decl_line).and_then(|v| v.udata_value()) else { continue };
+                let Some(file) = known.entry(index).or_insert_with(|| files(index)).clone() else { continue };
+                let own = name.split('<').next().unwrap_or(&name).to_string();
+                if own.is_empty() {
+                    continue;
+                }
+                // The path it is in, without itself, which it was pushed as.
+                let within: Vec<&str> = path.iter().filter(|(d, ..)| *d < depth).map(|(_, p, _)| p.split('<').next().unwrap_or(p)).collect();
+                let full = within.into_iter().chain([own.as_str()]).collect::<Vec<_>>().join("::");
+                let declaration = matches!(entry.attr_value(DW_AT_declaration), Some(AttributeValue::Flag(true)));
+                out.push(Definition { name: own, path: full, kind, file, line: line as u32, declaration });
+            }
+        }
+        out.sort_unstable();
         out.dedup();
         out
     }
