@@ -1584,7 +1584,8 @@ const renderers = {
     const parts = path.split("/").filter(Boolean);
     let crumb = `<div class="crumb"><a data-path="">/</a>`;
     parts.forEach((part, i) => {
-      crumb += `<a data-path="${escape(parts.slice(0, i + 1).join("/"))}">${escape(part)}</a><span class="sep">/</span>`;
+      const last = i === parts.length - 1 && value.kind !== "directory";
+      crumb += `<a data-path="${escape(parts.slice(0, i + 1).join("/"))}">${escape(part)}</a>${last ? "" : `<span class="sep">/</span>`}`;
     });
     crumb += `<span style="opacity:.6"> · cwd ${escape(value.cwd ?? "?")}</span></div>`;
     let html = crumb;
