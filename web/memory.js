@@ -344,6 +344,10 @@ const ZOOM_CELLS = 65536; // the most cells a zoomed picture is drawn with
 const SERVED = 4096; // bytes a read of memory answers with
 const INSPECTED = 65536; // the most of an owner's statics the inspector reads
 const BACKGROUND = [22, 25, 30];
+/// Where the inspector is, on the pictures.
+const HERE = "#4cc2ff";
+/// How many places it was before are ringed.
+const VISITS = 6;
 const AROUND = 256; // bytes shown around an address nothing describes
 
 export class MemoryView {
@@ -363,6 +367,7 @@ export class MemoryView {
     this.mark = null;
     this.selected = null; // an owner's name
     this.focus = null; // an address the inspector shows
+    this.visits = []; // the addresses shown before it, the latest last: where it was
     this.highlight = null; // runs of memory outlined in the pictures: [address, length]
     this.arrows = []; // pointers drawn in the pictures: [from, to]
     this.field = null; // heat laid on the pictures: { label, back, points }, see `setField`
@@ -860,6 +865,101 @@ export class MemoryView {
     set(box, `<span class="dim">heat:</span> <b>${e(field.label)}</b> ${scale}${away} <span class="controls"><button type="button" data-field-shown${this.fieldShown ? ' class="on"' : ""} title="show or hide it on the pictures">${this.fieldShown ? "shown" : "hidden"}</button></span>`);
   }
 
+  /// The static the inspector's address is in, as `[base, size]`: the
+  /// smallest of those known that holds it; or just the address.
+  hereRun() {
+    const at = this.focus;
+    let best = null;
+    for (const statics of this.symbols?.values() ?? [])
+      for (const st of statics) if (at >= st.base && at < st.base + st.size && (!best || st.size < best.size)) best = st;
+    return best ? [best.base, best.size] : [at, 1];
+  }
+
+  /// Where the inspector is, on a picture: the static its address is in
+  /// outlined, the address ringed with guides across the picture to it,
+  /// and the places it was before ringed fainter, numbered back from it.
+  drawHere(g, picture, s, placeOf) {
+    if (this.focus === null) return;
+    const { view, rect } = picture;
+    const centre = (p) => [p[0] + s / 2, p[1] + s / 2];
+    // The places it was: 1 the latest.
+    this.visits
+      .slice()
+      .reverse()
+      .forEach((address, n) => {
+        const p = placeOf(address);
+        if (!p) return;
+        const [x, y] = centre(p);
+        const fade = 0.85 - n * 0.12;
+        g.lineWidth = 2;
+        g.strokeStyle = `rgb(200 220 255 / ${fade})`;
+        g.beginPath();
+        g.arc(x, y, Math.max(6, s * 1.2), 0, 2 * Math.PI);
+        g.stroke();
+        g.font = "bold 10px ui-monospace, monospace";
+        g.textAlign = "center";
+        g.textBaseline = "middle";
+        g.lineWidth = 3;
+        g.strokeStyle = "#000c";
+        const label = String(n + 1);
+        const [lx, ly] = [x + Math.max(6, s * 1.2) + 4, y - Math.max(6, s * 1.2)];
+        g.strokeText(label, lx, ly);
+        g.fillStyle = `rgb(200 220 255 / ${fade})`;
+        g.fillText(label, lx, ly);
+      });
+    // The static it is in: its edge, where a cell of it meets one not.
+    const [base, size] = this.hereRun();
+    const first = Math.max(0, Math.floor((base - picture.base) / picture.cell));
+    const last = Math.min(view.cells - 1, Math.floor((base + size - 1 - picture.base) / picture.cell));
+    if (last >= first && last - first < 1 << 16) {
+      const inside = (gx, gy) => {
+        const c = gx < 0 || gy < 0 || gx >= view.width ? -1 : view.at[gy * view.width + gx];
+        return c !== undefined && c >= first && c <= last;
+      };
+      g.strokeStyle = HERE;
+      g.lineWidth = Math.max(1.5, s / 4);
+      g.beginPath();
+      for (let c = first; c <= last; c++) {
+        const gx = view.place[2 * c];
+        const gy = view.place[2 * c + 1];
+        const x = (gx - rect.x) * s;
+        const y = (gy - rect.y) * s;
+        if (x < -s || y < -s || x > rect.w * s || y > rect.h * s) continue;
+        if (!inside(gx, gy - 1)) (g.moveTo(x, y), g.lineTo(x + s, y));
+        if (!inside(gx, gy + 1)) (g.moveTo(x, y + s), g.lineTo(x + s, y + s));
+        if (!inside(gx - 1, gy)) (g.moveTo(x, y), g.lineTo(x, y + s));
+        if (!inside(gx + 1, gy)) (g.moveTo(x + s, y), g.lineTo(x + s, y + s));
+      }
+      g.stroke();
+    }
+    // The address: guides across the picture, and a ring.
+    const p = placeOf(this.focus);
+    if (!p) return;
+    const [x, y] = centre(p);
+    g.save();
+    g.setLineDash([4, 4]);
+    g.lineWidth = 1;
+    g.strokeStyle = "rgb(76 194 255 / 0.55)";
+    g.beginPath();
+    g.moveTo(0, y);
+    g.lineTo(rect.w * s, y);
+    g.moveTo(x, 0);
+    g.lineTo(x, rect.h * s);
+    g.stroke();
+    g.restore();
+    const r = Math.max(9, s * 2);
+    g.lineWidth = 4;
+    g.strokeStyle = "#000a";
+    g.beginPath();
+    g.arc(x, y, r, 0, 2 * Math.PI);
+    g.stroke();
+    g.lineWidth = 2.5;
+    g.strokeStyle = HERE;
+    g.beginPath();
+    g.arc(x, y, r, 0, 2 * Math.PI);
+    g.stroke();
+  }
+
   /// What the inspector asked to be shown on the pictures: the memory a
   /// source line wrote, outlined, and where the chosen task's pointers
   /// point, as arrows from each pointer to its target.
@@ -889,6 +989,7 @@ export class MemoryView {
         }
       }
     }
+    this.drawHere(g, picture, s, placeOf);
     if (this.highlight) {
       g.lineWidth = Math.max(1, s / 3);
       g.strokeStyle = "#fff";
@@ -1090,12 +1191,33 @@ export class MemoryView {
     return rectOnBox(rect, cell, picture.rect, picture.cell, box.width, box.height);
   }
 
+  /// Moves what the inspector shows to `address`, keeping where it was.
+  visit(address) {
+    if (this.focus !== null && this.focus !== address) {
+      this.visits = this.visits.filter((a) => a !== this.focus && a !== address);
+      this.visits.push(this.focus);
+      this.visits = this.visits.slice(-VISITS);
+    }
+    this.focus = address;
+    // Whose it is: their statics, for the one it is in to be outlined.
+    const owner = this.owners.find((o) => o.ranges.some((r) => address >= r.base && address < r.end));
+    if (owner && !this.symbols.has(owner.name)) {
+      this.symbols.set(owner.name, []);
+      this.read(`board/symbols/${owner.name}`)
+        .then((answer) => {
+          this.symbols.set(owner.name, answer?.statics ?? []);
+          this.drawMaps();
+        })
+        .catch(() => {});
+    }
+  }
+
   pick(canvas, event) {
     const hit = this.cellAt(canvas, event.clientX, event.clientY);
     if (!hit || hit.c < 0) return;
     const owner = this.owners[hit.picture.owner[hit.c]];
     this.selected = owner?.name ?? null;
-    this.focus = hit.address;
+    this.visit(hit.address);
     this.inspected = null;
     this.draw();
     this.inspect();
@@ -1291,9 +1413,9 @@ export class MemoryView {
   goTo(address) {
     const owner = this.owners.find((o) => o.ranges.some((r) => address >= r.base && address < r.end));
     this.selected = owner?.name ?? null;
-    this.focus = address;
+    this.visit(address);
     this.inspected = null;
-    this.highlight = [[address, 1]];
+    this.highlight = null;
     this.draw();
     this.inspect();
   }
