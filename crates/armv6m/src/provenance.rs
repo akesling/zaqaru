@@ -258,10 +258,21 @@ impl Provenance {
     /// the byte is in; through a merge — arithmetic — the first parent's,
     /// the byte no longer told apart. At most `depth` nodes.
     pub fn story(&self, address: u32, depth: usize) -> Vec<(Tag, &Node, u32)> {
+        self.story_from(self.memory.get(&address).copied().unwrap_or(0), address, depth)
+    }
+
+    /// The history of what register `n` holds, as [`story`] tells a
+    /// byte's: its lowest byte's.
+    ///
+    /// [`story`]: Provenance::story
+    pub fn register_story(&self, n: usize, depth: usize) -> Vec<(Tag, &Node, u32)> {
+        self.story_from(self.regs.get(n).copied().unwrap_or(0), 0, depth)
+    }
+
+    fn story_from(&self, mut tag: Tag, byte: u32, depth: usize) -> Vec<(Tag, &Node, u32)> {
         let mut out = Vec::new();
-        let mut tag = self.memory.get(&address).copied().unwrap_or(0);
         // The byte followed, and its place in the value the next node holds.
-        let (mut byte, mut lane) = (address, 0);
+        let (mut byte, mut lane) = (byte, 0);
         while let Some(node) = self.node(tag) {
             let mut next = node.parents[0];
             match node.what {
@@ -332,7 +343,15 @@ impl Provenance {
     ///
     /// [`story`]: Provenance::story
     pub fn influences(&self, address: u32, most: usize, moves: &dyn Fn(u32) -> bool) -> Vec<(Tag, &Node, u32, bool)> {
-        let story = self.story(address, 64);
+        self.influences_of(self.story(address, 64), most, moves)
+    }
+
+    /// The same, of what register `n` holds.
+    pub fn register_influences(&self, n: usize, most: usize, moves: &dyn Fn(u32) -> bool) -> Vec<(Tag, &Node, u32, bool)> {
+        self.influences_of(self.register_story(n, 64), most, moves)
+    }
+
+    fn influences_of<'a>(&'a self, story: Vec<(Tag, &'a Node, u32)>, most: usize, moves: &dyn Fn(u32) -> bool) -> Vec<(Tag, &'a Node, u32, bool)> {
         let mut out: Vec<(Tag, &Node, u32, bool)> = Vec::new();
         let mut queue = std::collections::VecDeque::new();
         for &(tag, node, byte) in &story {

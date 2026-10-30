@@ -47,12 +47,15 @@ test("the walk stops at its budget and says what it left", async () => {
   assert.equal(graph.nodes.length, 5, "and goes on from there");
 });
 
-test("a value that sat in a register widens its window once", async () => {
-  const windows = [];
-  const query = async ({ time, follow: { from } }) => (windows.push(time - from), { steps: [], influences: windows.length === 1 ? [{ what: "register", register: "r3", via: "value" }] : [wad("PLAYPAL")] });
-  const graph = { address: 1, nodes: [], origins: [], from: { at: 1, time: 1e13 } };
+test("a value in a register is followed into the window before, as small as the first", async () => {
+  const asked = [];
+  const query = async ({ time, follow: { from } }, path) => {
+    asked.push([path.split("/").at(-1), time, time - from]);
+    return path.endsWith("r3") ? { value: 5, steps: [], influences: [wad("PLAYPAL")] } : { steps: [], influences: [{ what: "register", register: "r3", value: 5, t: 9_000_000, via: "value" }] };
+  };
+  const graph = { address: 1, nodes: [], origins: [], from: { at: 1, time: 1e10 } };
   await depend(graph, { read: async () => ({}), query });
-  assert.deepEqual(windows, [1e9, 1e11]);
+  assert.deepEqual(asked, [["1", 1e10, 1e9], ["r3", 9e9, 1e9]]);
   assert.equal(graph.origins[0].kind, "rom");
 });
 

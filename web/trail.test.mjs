@@ -15,26 +15,28 @@ test("a history's last step says where to go on, or that it ends", () => {
   assert.deepEqual(next({ what: "held", addr: 0x4000_4c1c, ram: false }), { end: "bus" }, "a peripheral's status register");
   assert.deepEqual(next({ what: "read" }), { end: "bus" });
   assert.deepEqual(next({ what: "store" }), { end: "constant" });
-  assert.deepEqual(next({ what: "register" }), { widen: true });
+  assert.deepEqual(next({ what: "register", register: "r3", value: 7, t: 19_000_000 }), { at: "r3", time: 19e9, value: 7 }, "the window before, ending where this began");
+  assert.deepEqual(next({ what: "register", register: "lr" }), { end: "register" });
   assert.deepEqual(next(undefined), { end: "unfollowed" });
 });
 
-test("a story hops from write to write, widening for a register, to where the value came in", async () => {
+test("a story hops from write to write, and through a register into the window before, to where the value came in", async () => {
   const asked = [];
   const answers = {
     // The frame's byte: copied by the kernel from doom's buffer.
-    [`${30e9} 2400`]: [{ what: "store" }, held(0x2400_0100, 20000)],
-    // Doom's buffer: from its colormap, which sat in a register at first.
-    [`${20e9} 24000100`]: [{ what: "store" }, { what: "register" }],
-    [`${20e9} 24000100 wide`]: [{ what: "store" }, held(0x2400_0200, 5000)],
+    [`${30e9} 2400`]: { steps: [{ what: "store" }, held(0x2400_0100, 20000)] },
+    // Doom's buffer: from its colormap, which was in r3 when the window began.
+    [`${20e9} 24000100`]: { steps: [{ what: "store" }, { what: "register", register: "r3", value: 0x42, t: 19_000_000 }] },
+    // r3, in the window before: loaded from what was held since.
+    [`${19e9} r3`]: { value: 0x42, steps: [{ what: "load" }, held(0x2400_0200, 5000)] },
     // The colormap: out of the WAD.
-    [`${5e9} 24000200`]: [{ what: "store" }, { what: "held", addr: 0x9000_1000, ram: false }],
+    [`${5e9} 24000200`]: { steps: [{ what: "store" }, { what: "held", addr: 0x9000_1000, ram: false }] },
   };
   const query = async ({ time, follow: { from } }, path) => {
-    const at = Number(path.split("/").at(-1)).toString(16);
+    const last = path.split("/").at(-1);
+    const at = /^r/.test(last) ? last : Number(last).toString(16);
     asked.push([time, time - from]);
-    const wide = time - from > WINDOW ? " wide" : "";
-    return { what: at, steps: answers[`${time} ${at}${wide}`] ?? answers[`${time} ${at}`] };
+    return { what: at, ...answers[`${time} ${at}`] };
   };
   const read = async () => ({ words: [30000, 0], writers: [by] });
   const trail = { address: 0x2400, hops: [] };
@@ -44,11 +46,20 @@ test("a story hops from write to write, widening for a register, to where the va
     [
       [0x2400, 30e9],
       [0x2400_0100, 20e9],
+      ["r3", 19e9],
       [0x2400_0200, 5e9],
     ],
   );
   assert.equal(trail.end.kind, "rom");
-  assert.deepEqual(asked.map(([, w]) => w), [WINDOW, WINDOW, 10 * WINDOW, WINDOW]);
+  assert.deepEqual(asked.map(([, w]) => w), [WINDOW, WINDOW, WINDOW, WINDOW], "every window as small as the first");
+});
+
+test("a register that holds other than it was found holding is lost there", async () => {
+  const query = async ({ time }, path) =>
+    path.endsWith("r3") ? { value: 9, steps: [] } : { steps: [{ what: "store" }, { what: "register", register: "r3", value: 0x42, t: time / 1000 - 1000 }] };
+  const trail = { address: 0x2400, hops: [] };
+  await follow(trail, { read: async () => ({ words: [30000, 0], writers: [by] }), query });
+  assert.deepEqual(trail.end, { kind: "lost", register: "r3", expected: 0x42, found: 9 });
 });
 
 test("a story stops after so many windows, and goes on from there", async () => {

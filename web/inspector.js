@@ -461,7 +461,7 @@ export class Inspector {
             // How the value asked about came to depend on it: the writes
             // between, newest first.
             const chain = f.origins[0].node !== null ? pathTo(graph, f.origins[0].node) : [];
-            const how = chain.length > 1 ? `<div class="depends-how dim">${chain.map((n) => `<a data-goto="${n.at}" title="${e(n.what ?? "")}">${e(shortPlace(n.what ?? "").replace(/(\[\d+\]).*$/, "$1"))}</a>`).join(" ← ")} ← <b>${e(f.name)}</b></div>` : "";
+            const how = chain.length > 1 ? `<div class="depends-how dim">${chain.map((n) => `<a${typeof n.at === "number" ? ` data-goto="${n.at}"` : ""} title="${e(n.what ?? "")}">${e(shortPlace(n.what ?? "").replace(/(\[\d+\]).*$/, "$1"))}</a>`).join(" ← ")} ← <b>${e(f.name)}</b></div>` : "";
             return `<li><details${g.families.length <= 2 ? " open" : ""}><summary><b>${e(f.name)}</b> <span class="dim">×${f.origins.length}</span>${runs.length ? ` <a data-runs='${e(JSON.stringify(runs))}' title="outline them in the pictures">show</a>` : ""}</summary>${how}<ol>${alike(f.origins).slice(0, 40).map(origin).join("")}</ol>${alike(f.origins).length > 40 ? `<div class="dim">and ${alike(f.origins).length - 40} more</div>` : ""}</details></li>`;
           })
           .join("");
@@ -505,7 +505,7 @@ export class Inspector {
   reachHtml() {
     const e = this.e;
     const r = this.reach;
-    const hex = (n) => `0x${(n >>> 0).toString(16)}`;
+    const hex = (n) => (typeof n === "string" ? n : `0x${(n >>> 0).toString(16)}`);
     const windows = [
       [1e9, "1 ms"],
       [1e10, "10 ms"],
@@ -730,7 +730,7 @@ export class Inspector {
   /// went, once known; else everything it depended on, on that tab; else
   /// its way back.
   field() {
-    const hex = (n) => `0x${(n >>> 0).toString(16)}`;
+    const hex = (n) => (typeof n === "string" ? n : `0x${(n >>> 0).toString(16)}`);
     const r = this.reach;
     if (r?.answer?.following) {
       const points = reachField(r.answer);
@@ -959,7 +959,7 @@ export class Inspector {
   trailHtml() {
     const e = this.e;
     const t = this.trail;
-    const hex = (n) => `0x${(n >>> 0).toString(16)}`;
+    const hex = (n) => (typeof n === "string" ? n : `0x${(n >>> 0).toString(16)}`);
     const byte = (n) => `0x${n.toString(16).padStart(2, "0")}`;
     // A place: its static and offset, whose memory it is beside it; the
     // memory's own name on hover.
@@ -1391,8 +1391,11 @@ export class Inspector {
       return true;
     }
     if (t("[data-retrail]")) {
-      const [at, time] = t("[data-retrail]").dataset.retrail.split(",").map(Number);
-      this.readTrail(at, null, { at, time });
+      const [first, second] = t("[data-retrail]").dataset.retrail.split(",");
+      // An address, or a register: `r3`.
+      const at = /^r\d+$/.test(first) ? first : Number(first);
+      const time = Number(second);
+      this.readTrail(at, typeof at === "string" ? at : null, { at, time });
       return true;
     }
     if (t("[data-reach]")) {

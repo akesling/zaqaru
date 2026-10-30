@@ -7,20 +7,19 @@
 // runs back through copies and stores to where the value came into the
 // window: off a bus, out of flash or a NOR, made by the code itself — or
 // held in RAM since before, with the last write to it, which is the next
-// window's end. A value that sat in a register from before the window
-// widens it and runs again.
+// window's end; or in a register since before, which the window before
+// this one, ending where this began, is asked about.
 
 /// The first window, in picoseconds of the board's time: 1 ms.
 export const WINDOW = 1e9;
-/// The widest a window is made for a value that sat in a register: 1 s.
-export const WIDEST = 1e12;
 /// How many windows back a story goes before it asks to go on.
 export const HOPS = 16;
 
 /// What the last step of a window's history says to do next: follow the
 /// byte it was held in (`byte`, of the `addr` loaded) back to the write
-/// that put it there (`{ at, time }`), run the window again wider (`{
-/// widen }`), or end (`{ end }`):
+/// that put it there (`{ at, time }`); follow the register it was in at
+/// the window's start into the window before (`{ at: "r3", time, value }`,
+/// what it held then); or end (`{ end }`):
 /// `bus` off a peripheral, `rom` out of flash or a NOR or a register,
 /// `constant` made by the code, `unwritten` never written, `writer` written
 /// by no instruction — DMA, the probe — or `unfollowed`.
@@ -29,7 +28,12 @@ export function next(last) {
     case "read":
       return { end: "bus" };
     case "register":
-      return { widen: true };
+      // The stack pointer, the link register: where the code is, not what
+      // it made.
+      if (!/^r\d+$/.test(last.register ?? "")) return { end: "register" };
+      // The window began at its node's instant, in nanoseconds: the one
+      // before ends there.
+      return { at: last.register, time: last.t * 1000, value: last.value };
     case "store":
       return { end: "constant" };
     case "held":
@@ -68,6 +72,8 @@ export async function follow(trail, { read, query, update = () => {}, wanted = (
   }
   let window = WINDOW;
   let taken = 0;
+  // What a register asked about should hold.
+  let expected;
   while (wanted()) {
     if (taken >= hops) return (trail.end = { kind: "more", at, time });
     trail.running = { at, time, window };
@@ -77,14 +83,14 @@ export async function follow(trail, { read, query, update = () => {}, wanted = (
     cache?.set(key, answer);
     const steps = answer?.steps ?? [];
     const step = next(steps.at(-1));
-    if (step.widen && window < WIDEST) {
-      window *= 10;
-      continue;
-    }
+    // A register asked about: what it held where the window ends should be
+    // what it was found holding, or this is not the instant it was.
+    if (expected !== undefined && answer?.value !== undefined && answer.value !== expected) return (trail.end = { kind: "lost", register: at, expected, found: answer.value });
     trail.hops.push({ at, time, window, what: answer?.what ?? null, steps });
     taken++;
     if (step.at === undefined) return (trail.end = { kind: step.end ?? "register", step: steps.at(-1) ?? null });
     ({ at, time } = step);
+    expected = step.value;
     window = WINDOW;
   }
   return null;
@@ -212,7 +218,9 @@ export function originText(trail) {
     case "writer":
       return `was written by ${end.by?.code ?? last?.written?.by?.code ?? "something not an instruction"}`;
     case "register":
-      return `sat in ${last?.register ?? "a register"} longer than the widest window`;
+      return `was in ${last?.register ?? "a register"}, which says where the code was, not what it made`;
+    case "lost":
+      return `was in ${end.register}, which held 0x${(end.found >>> 0).toString(16)} rather than 0x${(end.expected >>> 0).toString(16)} where the window before ended: lost there`;
     case "unfollowed":
       return `was written by something not followed (the probe, or DMA)`;
     default:

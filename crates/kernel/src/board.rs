@@ -73,6 +73,24 @@ mod dwarf;
 mod index;
 mod watch;
 pub use dwarf::ReadFile;
+
+/// What a value's story is of: the byte at an address, or what a core
+/// register (`r0`–`r12`) holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Subject {
+    Address(u32),
+    Register(u8),
+}
+
+impl Subject {
+    /// `0x2400_1000`, `603979776`, or `r3`.
+    pub fn parse(text: &str, number: impl Fn(&str) -> Option<u64>) -> Option<Subject> {
+        match text.strip_prefix('r') {
+            Some(n) => n.parse::<u8>().ok().filter(|&n| n < 13).map(Subject::Register),
+            None => number(text).map(|a| Subject::Address(a as u32)),
+        }
+    }
+}
 use crate::socket::{Address, Endpoint, State};
 
 /// The most of the board's memory one read of it serves.
@@ -1530,20 +1548,19 @@ impl Board {
     /// data register, and the trace record of the byte it gave — with its
     /// time in the board's nanoseconds. Empty when nothing is being
     /// followed, or the byte came from nowhere followed.
-    pub fn why_json(&self, address: u32, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
+    pub fn why_json(&self, subject: Subject, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
         use crate::system::server::quoted;
         let Some(p) = &self.machine.provenance else {
             return r#"{"following":false,"steps":[]}"#.to_string();
         };
-        let story: Vec<_> = p.story(address, 32).into_iter().map(|(_, node, byte)| (node, byte)).collect();
+        let (story, about) = match subject {
+            Subject::Address(address) => (p.story(address, 32), format!(r#""address":{address},"what":{}"#, quoted(&self.describe(address, map)))),
+            // What it holds now, to tell that this is the instant asked about.
+            Subject::Register(n) => (p.register_story(n as usize, 32), format!(r#""register":"r{n}","value":{},"what":"r{n}""#, self.machine.cpu.reg(n as usize))),
+        };
+        let story: Vec<_> = story.into_iter().map(|(_, node, byte)| (node, byte)).collect();
         let steps = self.why_steps(p, story, map, read, 32);
-        format!(
-            r#"{{"following":true,"everything":{},"since_ns":{},"address":{address},"what":{},"steps":[{}]}}"#,
-            p.everything,
-            p.since / 1000,
-            quoted(&self.describe(address, map)),
-            steps.join(",")
-        )
+        format!(r#"{{"following":true,"everything":{},"since_ns":{},{about},"steps":[{}]}}"#, p.everything, p.since / 1000, steps.join(","))
     }
 
     /// Where the value at `address` came from, as `why_json` says, and
@@ -1553,7 +1570,7 @@ impl Board {
     /// constant — with `via` saying whether it chose which value (`address`)
     /// or went into it (`value`). Pointers, and constants the code loaded
     /// from beside itself, which say only which table, are left out.
-    pub fn influences_json(&self, address: u32, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
+    pub fn influences_json(&self, subject: Subject, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
         use armv6m::provenance::What;
         let Some(p) = &self.machine.provenance else {
             return r#"{"following":false,"steps":[],"influences":[]}"#.to_string();
@@ -1565,7 +1582,10 @@ impl Board {
             let code = self.code_at(pc, map);
             code.starts_with("kernel") || ["memcpy", "memmove", "copy_forward", "copy_backward", "compiler_builtins::mem"].iter().any(|n| code.contains(n))
         };
-        let all = p.influences(address, 128, &moves);
+        let all = match subject {
+            Subject::Address(address) => p.influences(address, 128, &moves),
+            Subject::Register(n) => p.register_influences(n as usize, 128, &moves),
+        };
         let total = all.len();
         let leaves: Vec<String> = all
             .into_iter()
@@ -1581,7 +1601,7 @@ impl Board {
                 Some(format!(r#"{{"via":"{}",{}"#, if via { "address" } else { "value" }, &step[1..]))
             })
             .collect();
-        let why = self.why_json(address, map, read);
+        let why = self.why_json(subject, map, read);
         format!(r#"{},"influences":[{}],"considered":{total}}}"#, &why[..why.len() - 1], leaves.join(","))
     }
 

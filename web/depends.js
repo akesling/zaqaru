@@ -5,12 +5,13 @@
 // Each window is a re-execution following everything (`board/influences`),
 // as a story's is (see trail.js). A value held in RAM since before the
 // window is followed on from the write that put it there, in a window of
-// its own; one in a register widens its window; the rest are where values
+// its own; one in a register, in the window before, ending where it began;
+// the rest are where values
 // came in — off a bus, out of flash or a NOR, made by the code. The walk
 // goes breadth first, nearest first, until it has run `budget` windows,
 // and says what it left unexplored.
 
-import { WIDEST, WINDOW, functionOf, next, shortPlace } from "./trail.js";
+import { WINDOW, functionOf, next, shortPlace } from "./trail.js";
 
 /// Walks back from `graph.address`, filling `graph.nodes` — `{ id, at,
 /// time, window, depth, via, parent, what, steps }`, the value at `at` as
@@ -43,19 +44,18 @@ async function walk(graph, { query, update, wanted, budget, cache }) {
   let runs = 0;
   while (queue.length && runs < budget && wanted()) {
     const item = queue.shift();
-    let window = WINDOW;
-    let answer;
-    for (;;) {
-      const key = `influences ${item.at} ${item.time} ${window}`;
-      graph.running = { ...item, window };
-      update();
-      answer = cache?.get(key) ?? (await query({ time: item.time, follow: { from: Math.max(0, item.time - window) } }, `board/influences/${item.at}`));
-      cache?.set(key, answer);
-      runs++;
-      // A value that sat in a register from before: a wider window, once.
-      const sat = (answer?.influences ?? []).some((leaf) => leaf.what === "register");
-      if (!sat || window >= WIDEST || runs >= budget) break;
-      window = Math.min(WIDEST, window * 100);
+    const window = WINDOW;
+    const key = `influences ${item.at} ${item.time} ${window}`;
+    graph.running = { ...item, window };
+    update();
+    const answer = cache?.get(key) ?? (await query({ time: item.time, follow: { from: Math.max(0, item.time - window) } }, `board/influences/${item.at}`));
+    cache?.set(key, answer);
+    runs++;
+    // A register asked about holding other than it was found holding: not
+    // the instant it was.
+    if (item.value !== undefined && answer?.value !== undefined && answer.value !== item.value) {
+      graph.origins.push({ kind: "lost", leaf: { what: "register", register: item.at, value: item.value }, node: item.parent, via: item.via });
+      continue;
     }
     const node = { id: graph.nodes.length, ...item, window, what: answer?.what ?? null, steps: answer?.steps ?? [] };
     graph.nodes.push(node);
@@ -67,8 +67,8 @@ async function walk(graph, { query, update, wanted, budget, cache }) {
         const key = `${step.at} ${step.time}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        queue.push({ at: step.at, time: step.time, depth: item.depth + 1, via, parent: node.id, leaf });
-      } else graph.origins.push({ kind: step.widen ? "register" : step.end, leaf, node: node.id, via });
+        queue.push({ at: step.at, time: step.time, value: step.value, depth: item.depth + 1, via, parent: node.id, leaf });
+      } else graph.origins.push({ kind: step.end, leaf, node: node.id, via });
     }
     update();
   }
@@ -93,7 +93,8 @@ const KINDS = [
   ["constant", "made by the code"],
   ["unwritten", "never written"],
   ["writer", "written by no instruction"],
-  ["register", "in a register from before"],
+  ["register", "where the code was"],
+  ["lost", "lost in a register"],
   ["unfollowed", "not followed"],
 ];
 
