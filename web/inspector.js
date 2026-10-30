@@ -559,7 +559,18 @@ export class Inspector {
     else if (this.mode === "writers") body = this.writersHtml(owner);
     else body = this.variablesHtml(owner);
     const story = (this.trail ? this.trailHtml() : "") + (this.reach ? this.reachHtml() : "");
+    // What scrolls inside it kept where it was, the live board redrawing
+    // it as it writes on.
+    const scrolled = new Map([...box.querySelectorAll("[data-scroll-key]")].map((el) => [el.dataset.scrollKey, el.scrollTop]));
     box.innerHTML = `${head}${story}<div class="mem-views"><div class="mem-view">${body}</div>${this.sourceHtml()}</div>`;
+    for (const el of box.querySelectorAll("[data-scroll-key]")) {
+      if (scrolled.has(el.dataset.scrollKey)) el.scrollTop = scrolled.get(el.dataset.scrollKey);
+      else {
+        // Shown afresh: its line in the middle.
+        const here = el.querySelector(".here");
+        if (here) el.scrollTop = here.offsetTop - el.offsetTop - el.clientHeight / 2;
+      }
+    }
     box.onmouseover = (event) => this.hovered(event);
     box.onchange = (event) => {
       if (!event.target.matches("[data-view-width]") || !this.viewing) return;
@@ -1169,7 +1180,7 @@ export class Inspector {
       const heat = w ? `<span class="heat" data-heat-stamp="${w.latest}" title="${w.words * 4} bytes of ${e(owner)}'s memory last written here"></span>` : `<span class="heat none"></span>`;
       rows.push(`<div class="sl${n + 1 === line ? " here" : ""}"${w ? ` data-runs="${e(JSON.stringify(w.runs))}"` : ""}><span class="ln">${n + 1}</span>${heat}<span class="code">${lines[n] || " "}</span>${w ? ` <span class="dim wrote">${w.words * 4} B</span>` : ""}</div>`);
     }
-    return `<div class="mem-source">${head}<div class="mem-source-body">${rows.join("")}</div><div class="dim">a line's colour: how lately it wrote what of ${owner ? e(owner) : "the task"}'s memory it holds; click one to outline that memory</div></div>`;
+    return `<div class="mem-source">${head}<div class="mem-source-body" data-scroll-key="${e(`${file}:${line}:${whole}`)}">${rows.join("")}</div><div class="dim">a line's colour: how lately it wrote what of ${owner ? e(owner) : "the task"}'s memory it holds; click one to outline that memory</div></div>`;
   }
 
   hovered(event) {
