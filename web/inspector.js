@@ -1094,7 +1094,7 @@ export class Inspector {
         }
         if (node.repeats) {
           const since = node.earliest?.t !== undefined ? ` since t=${(node.earliest.t / 1e6).toFixed(3)} ms` : "";
-          head += ` <span class="chip made-fold" title="the same code stored here ${node.repeats + 1} times, each made of what it stored here before: a count, a sum, a step at a time">×${node.repeats + 1}${since}</span>`;
+          head += ` <span class="chip made-fold" title="made ${node.repeats + 1} times over, each time of what it was the time before: a count, a sum, a position moved a step at a time">×${node.repeats + 1}${since}</span>`;
         }
         if (!node.operands.length && !node.cut && !node.same) head += ` <span class="dim">— a constant the code made</span>`;
         break;
@@ -1138,11 +1138,15 @@ export class Inspector {
     if (node.ended) head += ` <span class="dim">— nothing followed made it</span>`;
     if (node.error) head += ` <span class="dim">${e(node.error)}</span>`;
     const line = nodeLine(node);
-    const src = step.what === "held" || step.what === "register" ? null : this.lineHtml(line);
+    // A line said once: not again for a part made on the same line.
+    const above = node.parent ? nodeLine(node.parent) : null;
+    const repeated = above && line && above.file === line.file && above.line === line.line;
+    const src = step.what === "held" || step.what === "register" || repeated ? null : this.lineHtml(line);
     const closed = this.madeClosed(node);
     const toggle = node.operands.length ? `<a class="made-toggle" data-made-toggle="${node.id}" title="${closed ? "show" : "hide"} what it was made of">${closed ? "▸" : "▾"}</a>` : `<span class="made-toggle"></span>`;
     const at = step.what === "merge" || step.addr === undefined ? "" : ` data-lit="${step.addr}"`;
-    const children = node.operands.length && !closed ? `<ul>${node.operands.map((o) => this.madeNodeHtml(o)).join("")}</ul>` : closed && node.operands.length ? `<span class="dim made-more"> ${node.operands.length} part${node.operands.length === 1 ? "" : "s"}</span>` : "";
+    if (closed && node.operands.length) head += ` <a class="dim made-more" data-made-toggle="${node.id}">${node.operands.length} part${node.operands.length === 1 ? "" : "s"} ▸</a>`;
+    const children = node.operands.length && !closed ? `<ul>${node.operands.map((o) => this.madeNodeHtml(o)).join("")}</ul>` : "";
     return `<li class="made-${e(step.what ?? "node")}"><div class="made-row"${at}>${toggle}<span>${role}${head}${src ? `<code class="made-src">${src}</code>` : ""}</span></div>${children}</li>`;
   }
 
