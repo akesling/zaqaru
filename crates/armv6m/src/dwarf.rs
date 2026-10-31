@@ -296,8 +296,29 @@ impl Debug {
         Ok(debug)
     }
 
-    /// Where the instruction at `pc` came from: innermost first.
+    /// Where the instruction at `pc` came from: innermost first. Code the
+    /// compiler made of no line — a spill, a branch's landing — is line 0:
+    /// it is said to be of the line before it in the same function, as a
+    /// debugger says it.
     pub fn lines(&self, pc: u32) -> Vec<Line> {
+        let mut out = self.frames(pc);
+        if out.first().is_some_and(|l| l.line == 0) {
+            for back in (2..=64).step_by(2) {
+                let before = self.frames(pc.wrapping_sub(back));
+                let Some(line) = before.first() else { break };
+                if line.function != out[0].function {
+                    break;
+                }
+                if line.line > 0 {
+                    out[0] = line.clone();
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn frames(&self, pc: u32) -> Vec<Line> {
         let mut out = Vec::new();
         let Ok(mut frames) = self.lines.find_frames(u64::from(pc)).skip_all_loads() else { return out };
         while let Ok(Some(frame)) = frames.next() {

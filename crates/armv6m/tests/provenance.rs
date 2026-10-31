@@ -106,7 +106,7 @@ fn a_copy_leads_back_through_every_step_to_the_bytes_off_the_bus() {
     // first part from the buffer; and the buffer from RXDR.
     assert!(matches!(kinds[0], What::Store { addr: 0x2400_0200, size: 2, value: 0x0117 }), "{kinds:?}");
     assert!(matches!(kinds[1], What::Store { size: 4, value: 0x0117, .. }), "the push: {kinds:?}");
-    assert!(matches!(kinds[2], What::Merge { value: Some(0x0117) }), "{kinds:?}");
+    assert!(matches!(kinds[2], What::Merge { value: Some(0x0117), .. }), "{kinds:?}");
     assert!(matches!(kinds[3], What::Store { addr: 0x2400_0100, size: 1, value: 0x01 }), "{kinds:?}");
     assert_eq!(kinds[4], What::Read { addr: 0x4000_5824, value: 0x01 }, "{kinds:?}");
     assert_eq!(kinds.len(), 5);
@@ -376,8 +376,8 @@ fn derivation_text(p: &armv6m::provenance::Provenance, d: &armv6m::provenance::D
     let node = p.node(d.tag).unwrap();
     let what = match node.what {
         What::Store { addr, value, .. } => format!("store {value} to {addr:#x}"),
-        What::Merge { value: Some(value) } => format!("merge {value}"),
-        What::Merge { value: None } => "merge".to_string(),
+        What::Merge { value: Some(value), .. } => format!("merge {value}"),
+        What::Merge { value: None, .. } => "merge".to_string(),
         What::Load { addr, value } => format!("load {value} from {addr:#x}"),
         What::Bytes { value, .. } => format!("bytes {value}"),
         What::Held { addr, value, .. } => format!("held {value} at {addr:#x}"),
@@ -552,7 +552,7 @@ begin:
     let p = m.provenance.as_ref().unwrap();
     let store = p.node(p.memory[&0x2400_0200]).unwrap();
     let made = p.node(store.parents[0]).unwrap();
-    assert!(matches!(made.what, What::Merge { value: Some(0x540) }), "{made:?}");
+    assert!(matches!(made.what, What::Merge { value: Some(0x540), constant: Some(0xfc0) }), "the mask made in the window, a constant: {made:?}");
 }
 
 #[test]
@@ -582,7 +582,7 @@ begin:
     let store = p.node(p.memory[&0x2400_0200]).unwrap();
     let made = p.node(store.parents[0]).unwrap();
     let parents: Vec<_> = made.parents.iter().map(|&t| p.node(t).map(|n| n.what)).collect();
-    assert!(matches!(made.what, What::Merge { value: Some(0x540) }), "{made:?} {parents:?}");
+    assert!(matches!(made.what, What::Merge { value: Some(0x540), .. }), "{made:?} {parents:?}");
 }
 
 #[test]
@@ -635,4 +635,67 @@ begin:
         // The entry chosen by the position, shifted and masked: a step of its
     // own, not the position itself.
     assert!(text.contains(&format!("merge {}", (0x12345678u32 >> 4) & 0xfc0)), "the mask's own step:\n{text}");
+}
+
+#[test]
+fn a_count_s_word_says_since_when_the_same_code_has_stepped_it() {
+    let source = ".thumb_func\nreset:
+    ldr r0, =0x24000100
+    movs r1, #0
+    str r1, [r0]             @ set: another writer
+    movs r3, #5
+1:  ldr r1, [r0]
+    adds r1, #1
+    str r1, [r0]             @ stepped
+    ldr r2, =2000
+2:  subs r2, #1
+    bne 2b
+    subs r3, #1
+    bne 1b
+    bkpt #1
+    .ltorg
+";
+    let mut m = h753(source);
+    run(&mut m);
+    let mark = m.bus.last_write(0x2400_0100).unwrap();
+    assert_eq!(m.bus.peek(0x2400_0100, 4).ok(), Some(5));
+    // Four gaps of the delay loop's microseconds between five steps: the
+    // first step's stamp is `run` before the last's.
+    assert!(mark.run > 4, "{mark:?}");
+    let first = mark.stamp - u64::from(mark.run);
+    assert!(first >= 1 && first < mark.stamp, "{mark:?}");
+    // Set again by other code: a run of its own, from nothing.
+    assert!(m.debug_write(0x2400_0100, &[0; 4]));
+    assert_eq!(m.bus.last_write(0x2400_0100).unwrap().run, 0);
+}
+
+#[test]
+fn a_multiply_s_two_halves_are_each_what_they_came_to() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100
+    ldr r1, =0x12345678
+    str r1, [r3]
+    ldr r1, =0x00abcdef
+    str r1, [r3, #4]
+    nop
+begin:
+    ldr r0, [r3]
+    ldr r1, [r3, #4]
+    smull r4, r5, r0, r1
+    ldr r6, =0x24000200
+    str r4, [r6]
+    str r5, [r6, #4]
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 5), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let product = 0x1234_5678i64 * 0x00ab_cdef;
+    let made = |at: u32| p.node(p.node(p.memory[&at]).unwrap().parents[0]).unwrap().what;
+    assert!(matches!(made(0x2400_0200), What::Merge { value: Some(v), .. } if v == product as u32), "{:?}", made(0x2400_0200));
+    assert!(matches!(made(0x2400_0204), What::Merge { value: Some(v), .. } if v == (product >> 32) as u32), "{:?}", made(0x2400_0204));
 }

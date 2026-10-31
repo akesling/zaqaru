@@ -81,6 +81,12 @@ pub struct Mark {
     /// The address of the instruction that stored to it, or one of
     /// [`BY_DMA`], [`BY_PROBE`], [`BY_EXCEPTION`].
     pub writer: u32,
+    /// For how long, in microseconds before `stamp`, every write to it
+    /// was the same writer's: what a count, a sum, a position stepped has
+    /// been at since something else last set it, `stamp - run` its first
+    /// step. 0 for a word written by one writer once — or a run longer
+    /// than `u32` microseconds, kept at the most.
+    pub run: u32,
 }
 
 /// A word written by a peripheral's DMA.
@@ -107,7 +113,9 @@ impl Ram {
             return;
         }
         for word in offset / 4..=(offset + len - 1) / 4 {
-            self.marks[word] = Mark { stamp, writer };
+            let before = self.marks[word];
+            let run = if before.stamp != 0 && before.writer == writer { before.run.saturating_add(u32::try_from(stamp - before.stamp).unwrap_or(u32::MAX)) } else { 0 };
+            self.marks[word] = Mark { stamp, writer, run };
         }
     }
 }
@@ -349,6 +357,13 @@ impl Bus {
             self.stamp = write_stamp(self.now);
         }
         self.stamp
+    }
+
+    /// Whether `addr` is memory — flash, a RAM, system memory, the NOR
+    /// mapped — rather than a peripheral or nothing: what a value has to
+    /// be to be taken for a pointer.
+    pub fn is_memory(&self, addr: u32) -> bool {
+        matches!(self.decode(addr), Some(Target::Memory { .. }))
     }
 
     fn decode(&self, addr: u32) -> Option<Target> {

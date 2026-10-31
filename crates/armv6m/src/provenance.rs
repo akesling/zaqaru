@@ -59,8 +59,10 @@ pub enum What {
     Store { addr: u32, size: u32, value: u32 },
     /// A value made of two tagged ones: what it came to, if the
     /// instruction's result — `None` for one of the merges between that a
-    /// result of three or more is made of.
-    Merge { value: Option<u32> },
+    /// result of three or more is made of — and what a register it read
+    /// that held nothing followed held: a constant the code made before,
+    /// `0xfc0` to mask with.
+    Merge { value: Option<u32>, constant: Option<u32> },
     /// Bytes loaded together that came from different places: the tag of
     /// each, by its place in the value — what a word copy of bytes stored
     /// one by one carries, and what a byte's story follows its own lane of.
@@ -197,7 +199,7 @@ impl Provenance {
             if tag == 0 || tag == out {
                 continue;
             }
-            out = if out == 0 { tag } else { self.add(Node { what: What::Merge { value: None }, pc, time, parents: [out, tag] }) };
+            out = if out == 0 { tag } else { self.add(Node { what: What::Merge { value: None, constant: None }, pc, time, parents: [out, tag] }) };
         }
         out
     }
@@ -254,7 +256,7 @@ impl Provenance {
         let from = self.union(from, pc, time);
         // A merge made here: the address.
         if from > made {
-            self.nodes[from as usize - 1].what = What::Merge { value: Some(addr) };
+            self.nodes[from as usize - 1].what = What::Merge { value: Some(addr), constant: None };
         }
         if from != 0 && from != tag && tag != 0 {
             tag = self.add(Node { what: What::Load { addr, value: value & mask(size) }, pc, time, parents: [tag, from] });
@@ -300,32 +302,54 @@ impl Provenance {
         // Not the pc: what is made of it — a literal's address, a table's
         // beside the code — is a constant of the code's.
         let from_registers: Vec<Tag> = (0..15).filter(|n| read & 1 << n != 0).map(|n| self.regs[n]).collect();
-        let mut computed = None;
+        // A register it read that held nothing followed: a constant.
+        // Not the stack pointer; the link register, which code uses as one
+        // more register, yes.
+        let constant = (0..15).find(|&n| n != 13 && read & 1 << n != 0 && self.regs[n] == 0).map(|n| self.values[n]);
+        // What the instruction made of the registers it read, once: the tag
+        // of their union, and whether a merge of it was made here.
+        let mut made: Option<(Tag, bool)> = None;
+        // Each value it came to, by value: a multiply's two halves, each
+        // its own node of the same parts.
+        let mut computed: Vec<(u32, Tag)> = Vec::new();
         for n in 0..16 {
             if written & 1 << n == 0 {
                 continue;
             }
             let value = values[n];
             let loaded = self.loads.iter().position(|&(v, size, _)| value & mask(size) == v);
-            self.regs[n] = match loaded {
-                Some(i) => self.loads.remove(i).2,
-                None => *computed.get_or_insert_with(|| {
-                    let made = self.nodes.len() as Tag;
-                    let tag = self.union(from_registers.iter().copied(), pc, time);
-                    if tag > made {
-                        // A merge made here: what the instruction came to.
-                        self.nodes[tag as usize - 1].what = What::Merge { value: Some(value) };
-                        return tag;
-                    }
-                    // Of one value, changed — shifted, masked, a constant
-                    // added — not moved: a step of its own.
-                    let changed = tag != 0 && (0..15).filter(|&m| read & 1 << m != 0 && self.regs[m] == tag).all(|m| self.values[m] != value);
-                    if changed {
-                        return self.add(Node { what: What::Merge { value: Some(value) }, pc, time, parents: [tag, 0] });
-                    }
+            if let Some(i) = loaded {
+                self.regs[n] = self.loads.remove(i).2;
+                continue;
+            }
+            if let Some(&(_, tag)) = computed.iter().find(|&&(v, _)| v == value) {
+                self.regs[n] = tag;
+                continue;
+            }
+            let (tag, here) = *made.get_or_insert_with(|| {
+                let before = self.nodes.len() as Tag;
+                let tag = self.union(from_registers.iter().copied(), pc, time);
+                (tag, tag > before)
+            });
+            let tag = if here {
+                // A merge made here: what the instruction came to — and for
+                // a second value, a node of its own of the same parts.
+                if computed.is_empty() {
+                    self.nodes[tag as usize - 1].what = What::Merge { value: Some(value), constant };
                     tag
-                }),
+                } else {
+                    let parents = self.nodes[tag as usize - 1].parents;
+                    self.add(Node { what: What::Merge { value: Some(value), constant }, pc, time, parents })
+                }
+            } else if tag != 0 && (0..15).filter(|&m| read & 1 << m != 0 && self.regs[m] == tag).all(|m| self.values[m] != value) {
+                // Of one value, changed — shifted, masked, a constant
+                // added — not moved: a step of its own.
+                self.add(Node { what: What::Merge { value: Some(value), constant }, pc, time, parents: [tag, 0] })
+            } else {
+                tag
             };
+            computed.push((value, tag));
+            self.regs[n] = tag;
         }
         for n in 0..16 {
             if written & 1 << n != 0 {
@@ -601,7 +625,7 @@ impl Provenance {
         for parent in node.parents {
             let parent = self.through(parent, walk);
             match self.node(parent) {
-                Some(inner @ Node { what: What::Merge { value: None }, .. }) if inner.pc == node.pc && inner.time == node.time && parent != tag => self.flatten(parent, inner, walk, out),
+                Some(inner @ Node { what: What::Merge { value: None, .. }, .. }) if inner.pc == node.pc && inner.time == node.time && parent != tag => self.flatten(parent, inner, walk, out),
                 _ if parent != 0 && !out.iter().any(|&(_, t)| t == parent) => out.push((Role::Value, parent)),
                 _ => {}
             }
