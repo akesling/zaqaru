@@ -182,6 +182,19 @@
   .mem-field { margin-top: 4px; }
   .field-scale { display: inline-block; width: 90px; height: 9px; border-radius: 2px; vertical-align: -1px; background: linear-gradient(to right, rgb(120 20 30), rgb(220 70 20) 40%, rgb(255 190 40) 75%, rgb(255 255 230)); }
   .mem-maps { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end; }
+  /* What a click in a picture picked, beside it: over the pictures, moving nothing. */
+  .memory-panel:not(.maximized) { position: relative; }
+  .mem-card { position: absolute; z-index: 30; min-width: 16em; max-width: 30em; padding: 6px 10px 7px; background: Canvas; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 5px; box-shadow: 0 6px 22px #0006; font-size: 12.5px; line-height: 1.5; animation: card-in .12s ease-out; }
+  .mem-card .card-head { display: flex; gap: 8px; align-items: baseline; padding-right: 1.4em; }
+  .mem-card .card-head b { overflow-wrap: anywhere; }
+  .mem-card .card-close { position: absolute; top: 2px; right: 7px; cursor: pointer; opacity: .6; font-size: 15px; text-decoration: none; }
+  .mem-card .card-close:hover { opacity: 1; }
+  .mem-card a { color: var(--accent); cursor: pointer; }
+  .mem-card .card-acts:empty { display: none; }
+  .mem-card code { font-size: 12px; }
+  @keyframes card-in { from { opacity: 0; transform: translateY(-3px); } }
+  .mem-node.flash, .mem-words tr.flash { animation: row-flash 1.4s ease-out; }
+  @keyframes row-flash { 0%, 30% { background: color-mix(in srgb, var(--accent) 35%, transparent); } }
   .mem-ram { margin: 0; }
   /* Wrapping, not clipped: the whole-block button at its end must stay in reach. */
   .mem-crumbs { margin: 2px 0 6px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 0; }

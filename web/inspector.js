@@ -784,11 +784,9 @@ export class Inspector {
       this.draw(true);
     };
     this.warm();
-    const near = box.querySelector(".near");
-    if (near && this.focusShown !== this.view.focus) {
-      this.focusShown = this.view.focus;
-      near.scrollIntoView({ block: "nearest" });
-    }
+    // What a click in the pictures picked is said beside it, not scrolled
+    // to: the card there, which this keeps up to date.
+    this.view.drawCard();
     this.view.setArrows([...(this.arrows ?? []), ...this.storyArrows()]);
     this.view.setField(this.field());
     this.paintPicture();
@@ -850,6 +848,31 @@ export class Inspector {
     return line?.file ? `${this.e(fn)} ${this.lineLink(line)}` : this.e(writer.code ?? "?");
   }
 
+  /// What the inspector says of the place in focus: the innermost part of
+  /// a static it is in — `{ path, typeName, value, address, size }` — or
+  /// null where it is in none the inspector decoded.
+  focusPart() {
+    const focus = this.view.focus;
+    if (focus === null || this.mode !== "variables") return null;
+    const within = (n) => n.address !== null && n.address !== undefined && focus >= n.address && focus < n.address + Math.max(1, n.size ?? 1);
+    let node = (this.trees ?? []).find(within);
+    if (!node) return null;
+    const path = [node.name.split("::").slice(-2).join("::")];
+    for (let inner; (inner = node.children?.find(within)); node = inner) path.push(inner.name);
+    return { path, typeName: node.typeName, value: node.value, address: node.address, size: node.size };
+  }
+
+  /// Shows the row of the place in focus in the list: asked for.
+  revealFocus() {
+    const near = this.box.querySelector(".near");
+    if (!near) return false;
+    near.scrollIntoView({ behavior: "smooth", block: "center" });
+    near.classList.remove("flash");
+    void near.offsetWidth;
+    near.classList.add("flash");
+    return true;
+  }
+
   /// A decoded value's rows: itself, and if open, its parts.
   nodeHtml(node, key, depth, actions, latest) {
     const e = this.e;
@@ -885,6 +908,7 @@ export class Inspector {
       return stamp ? ` <span class="by dim"><span data-ago="${stamp}"></span> by ${this.writerHtml(s.writers[writer])} <a class="stand" data-stand="${stamp}" title="stand the board just after this write">⟲</a></span>` : ` <span class="by dim">never written</span>`;
     };
     const trees = [];
+    this.trees = trees;
     this.arrows = [];
     let html = "";
     if (typed?.error) html += `<div class="dim">no types for ${e(owner)}: ${e(typed.error)}; its bytes as they are</div>`;

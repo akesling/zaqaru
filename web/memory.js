@@ -388,8 +388,13 @@ export class MemoryView {
       <div class="mem-maps"></div>
       <div class="mem-readout dim">&nbsp;</div>
       <div class="mem-owners"></div>
-      <div class="mem-inspector"></div>`;
+      <div class="mem-inspector"></div>
+      <div class="mem-card" role="dialog" aria-label="what is here" hidden></div>`;
     element.onclick = (event) => this.clicked(event);
+    // The card closes on Escape, and with a click anywhere but in it or on
+    // a picture, which moves it.
+    this.card = null;
+    window.addEventListener("keydown", (event) => event.key === "Escape" && this.card && this.closeCard());
     this.whatis = new Map();
     this.inspector = new Inspector(this, element.querySelector(".mem-inspector"));
     this.equipSearch(element.querySelector("[data-symbol]"), element.querySelector(".sym-results"));
@@ -638,6 +643,7 @@ export class MemoryView {
   /// Back out to the `depth`th crumb, and then in on `into`, if given: a
   /// rectangle of a RAM's picture, as finely as it can be drawn.
   zoom(depth, into = null) {
+    if (this.card) this.closeCard();
     this.zooms.length = depth;
     if (into) this.zooms.push(into);
     this.detail = null;
@@ -1219,8 +1225,101 @@ export class MemoryView {
     this.selected = owner?.name ?? null;
     this.visit(hit.address);
     this.inspected = null;
+    // Said where it was clicked: nothing moves.
+    this.openCard(hit.address, event.clientX, event.clientY, owner?.name ?? null);
     this.draw();
     this.inspect();
+  }
+
+  /// A card beside the place clicked in a picture, at `x`, `y` of the
+  /// window: what is there, its value, what last wrote it — and links on,
+  /// each saying where they lead.
+  openCard(address, x, y, owner) {
+    const frame = this.element.getBoundingClientRect();
+    this.card = { address, owner, x: x - frame.left + this.element.scrollLeft, y: y - frame.top + this.element.scrollTop, whatis: null, hex: null, written: null, read: 0 };
+    this.readCard();
+  }
+
+  closeCard() {
+    this.card = null;
+    const box = this.element.querySelector(".mem-card");
+    box.hidden = true;
+    set(box, "");
+  }
+
+  /// What the card says that the inspector does not: what the place is
+  /// called, the word it is in, and its last write — read again now and
+  /// then while it is open, the board running on.
+  async readCard() {
+    const card = this.card;
+    if (!card) return;
+    card.read = performance.now();
+    const word = card.address & ~3;
+    const [whatis, memory, written, scanned] = await Promise.all([
+      this.read(`board/whatis/${card.address}`).catch(() => null),
+      this.read(`board/memory/${word}/4`).catch(() => null),
+      this.read(`board/written/${card.address}/1`).catch(() => null),
+      card.pixel === undefined ? this.read("board/scanned").catch(() => null) : null,
+    ]);
+    if (this.card !== card) return;
+    card.whatis = whatis?.text ?? null;
+    // On the screen, if a layer scans it out: which pixel.
+    if (card.pixel === undefined) {
+      card.pixel = null;
+      for (const layer of scanned?.layers ?? []) {
+        const offset = card.address - layer.address;
+        if (offset < 0 || offset >= layer.pitch * layer.height) continue;
+        const [x, y] = [Math.floor((offset % layer.pitch) / layer.bytes), Math.floor(offset / layer.pitch)];
+        if (x < layer.width) card.pixel = { x, y };
+      }
+    }
+    card.hex = typeof memory?.hex === "string" ? memory.hex : null;
+    const [stamp, writer] = written?.words ?? [0, -1];
+    card.written = stamp ? { stamp, writer: written.writers?.[writer] ?? null } : { stamp: 0 };
+    this.drawCard();
+  }
+
+  drawCard() {
+    const box = this.element.querySelector(".mem-card");
+    const card = this.card;
+    if (!box || !card) return;
+    if (performance.now() - card.read > 1000) this.readCard();
+    const e = this.escape;
+    const hex = (n) => `0x${(n >>> 0).toString(16).padStart(8, "0")}`;
+    const part = this.focus === card.address ? this.inspector.focusPart() : null;
+    // The word, little-endian, and the byte clicked within it.
+    let word = "";
+    if (card.hex) {
+      const bytes = card.hex.match(/../g) ?? [];
+      const value = parseInt([...bytes].reverse().join(""), 16) >>> 0;
+      const at = card.address & 3;
+      word = `<div class="card-row"><span class="dim">word</span> <code>${hex(value)}</code>${(value | 0) < 0 && (value | 0) > -100000 ? ` <span class="dim">(${value | 0})</span>` : value < 100000 ? ` <span class="dim">(${value})</span>` : ""} <span class="dim">· byte ${at}:</span> <code>0x${bytes[at] ?? "??"}</code></div>`;
+    }
+    // `doom .uninit: task_doom::ZONE_AXI + 0x14ba4 (AXI SRAM + 0x65f40)`:
+    // the name first, whose and where after.
+    const said = /^(\S+) (\S+): (.*?)(?: \((.*)\))?$/.exec(card.whatis ?? "");
+    const short = said ? said[3].replace(/^task_[\w]+::/, "") : card.whatis;
+    const name = part ? part.path.join(".") : short ?? hex(card.address);
+    const whose = said ? `${said[1]} · ${said[2]}${said[4] ? ` · ${said[4]}` : ""}` : "";
+    const screen = card.pixel ? `<div class="card-row">the screen's pixel <b>(${card.pixel.x}, ${card.pixel.y})</b></div>` : "";
+    const typed = part ? `<div class="card-row"><span class="dim">${e(part.typeName)} =</span> <b>${e(part.value)}</b></div>` : "";
+    let written = `<div class="card-row dim">reading…</div>`;
+    if (card.written) {
+      const w = card.written;
+      written = w.stamp ? `<div class="card-row dim">written <span data-ago="${w.stamp}">${age(this.now - w.stamp)}</span> ago by ${this.inspector.writerHtml(w.writer) || "?"}</div>` : `<div class="card-row dim">never written since reset</div>`;
+    }
+    const inList = part ? ` · <a data-card-list title="the row in the inspector below, scrolled to">in the list ↓</a>` : "";
+    const why = card.written?.stamp && card.written.writer?.pc !== undefined ? `<a data-card-made title="opens the story below: what this value was made of, by what code and arithmetic">how it was made ↓</a>` : "";
+    const html = `<div class="card-head"><b title="${e(card.whatis ?? "")}">${e(name)}</b> <span class="dim">${hex(card.address)}</span><a class="card-close" data-card-close title="close (Esc)">×</a></div>
+      ${whose ? `<div class="card-row dim">${e(whose)}</div>` : ""}${screen}${typed}${word}${written}
+      <div class="card-row card-acts">${why}${inList}</div>`;
+    set(box, html);
+    box.hidden = false;
+    // Beside the place, on the side there is room: never off the panel.
+    const width = box.offsetWidth;
+    const room = this.element.clientWidth + this.element.scrollLeft;
+    const left = card.x + 14 + width > room ? Math.max(4, card.x - 14 - width) : card.x + 14;
+    Object.assign(box.style, { left: `${left}px`, top: `${Math.max(4, card.y - 12)}px` });
   }
 
   /// What `address` is, as `board/whatis` says, asked for once.
@@ -1437,6 +1536,19 @@ export class MemoryView {
 
   clicked(event) {
     const t = (selector) => event.target.closest(selector);
+    if (t("[data-card-close]")) return this.closeCard();
+    if (t("[data-card-list]")) return this.inspector.revealFocus();
+    if (t("[data-card-made]") && this.card) {
+      const { address, owner } = this.card;
+      const part = this.inspector.focusPart();
+      this.inspector.readTrail(address, part ? part.path.join(".") : owner);
+      // Where it opens, brought into view: asked for.
+      requestAnimationFrame(() => this.element.querySelector(".mem-story")?.scrollIntoView({ behavior: "smooth", block: "nearest" }));
+      return;
+    }
+    if (t(".mem-card")) return;
+    // A click anywhere else in the panel puts the card away.
+    if (this.card && !t("canvas")) this.closeCard();
     if (t(".mem-inspector") && this.inspector.clicked(event)) return;
     const crumb = t("[data-crumb]");
     if (crumb) return this.zoom(Number(crumb.dataset.crumb));
