@@ -1575,7 +1575,9 @@ impl Board {
         let Some(p) = &self.machine.provenance else {
             return r#"{"following":false,"steps":[],"influences":[]}"#.to_string();
         };
-        let pointer = |value: u32| self.machine.bus.ram_at(value).is_some() || value >= 0x0800_0000;
+        // Memory's addresses, not what a value that happens to be large —
+        // a negative number — is: from flash up, what the chip maps.
+        let pointer = |value: u32| value >= 0x0800_0000 && self.machine.bus.is_memory(value);
         // The kernel's copies between tasks, and memcpy and its kin, move
         // bytes: where they read is where the bytes were, said already.
         let moves = |pc: u32| {
@@ -1832,7 +1834,7 @@ impl Board {
                 r#"{{"what":"held","addr":{addr},"size":{size},"value":{value},"where":{},"ram":{},"written":{},{common}}}"#,
                 quoted(&self.describe_typed(within(addr, size), map, read)),
                 self.machine.bus.ram_at(addr).is_some(),
-                written.map_or("null".into(), |mark| format!(r#"{{"stamp":{},"by":{}}}"#, mark.stamp, self.writer_json(mark.writer, map, read)))
+                written.map_or("null".into(), |mark| format!(r#"{{"stamp":{},"run":{},"by":{}}}"#, mark.stamp, mark.run, self.writer_json(mark.writer, map, read)))
             ),
             What::Register { n, value } => format!(
                 r#"{{"what":"register","register":"{}","value":{value},{common}}}"#,
@@ -1843,7 +1845,7 @@ impl Board {
                     n => format!("r{n}"),
                 }
             ),
-            What::Merge { value } => {
+            What::Merge { value, constant } => {
                 // An address of a register and a register: how far the
                 // second is shifted.
                 let half = |at: u32| self.machine.bus.peek(at, 2).unwrap_or(0);
@@ -1856,7 +1858,8 @@ impl Board {
                 let imm = match armv6m::ops::immediate(first, second) {
                     Some(armv6m::ops::Immediate::Value(v)) => format!(r#""imm":{v},"#),
                     Some(armv6m::ops::Immediate::Bits { lsb, width }) => format!(r#""bits":[{lsb},{width}],"#),
-                    None => String::new(),
+                    // Or one a register held, that the code made before.
+                    None => constant.map_or(String::new(), |v| format!(r#""imm":{v},"#)),
                 };
                 format!(r#"{{"what":"merge","op":"{}",{shift}{shifted}{imm}"value":{},{common}}}"#, armv6m::ops::operation(first, second), value.map_or("null".into(), |v| v.to_string()))
             }
@@ -1886,7 +1889,9 @@ impl Board {
             (None, Some(tag)) => (tag, format!(r#""node":{tag}"#)),
             (None, None) => (0, String::new()),
         };
-        let pointer = |value: u32| self.machine.bus.ram_at(value).is_some() || value >= 0x0800_0000;
+        // Memory's addresses, not what a value that happens to be large —
+        // a negative number — is: from flash up, what the chip maps.
+        let pointer = |value: u32| value >= 0x0800_0000 && self.machine.bus.is_memory(value);
         let says_nothing = |node: &armv6m::provenance::Node| match node.what {
             What::Held { addr, size, value, .. } => addr.wrapping_sub(node.pc) < 4096 || (size == 4 && pointer(value)),
             What::Register { n: 13 | 15, .. } => true,
@@ -1966,7 +1971,7 @@ impl Board {
                         .filter(|(_, leaf)| !matches!(leaf.what, What::Held { addr, .. } if addr.wrapping_sub(leaf.pc) < 4096))
                         // Nor does a pointer — which table, which the load's
                         // own address already says — only what indexed it.
-                        .filter(|(_, leaf)| !matches!(leaf.what, What::Held { size: 4, value, .. } | What::Register { value, .. } if self.machine.bus.ram_at(value).is_some() || value >= 0x0800_0000))
+                        .filter(|(_, leaf)| !matches!(leaf.what, What::Held { size: 4, value, .. } | What::Register { value, .. } if value >= 0x0800_0000 && self.machine.bus.is_memory(value)))
                         .map(|(_, leaf)| (leaf, if let What::Held { addr, .. } = leaf.what { addr } else { 0 }))
                         .collect();
                     if leaves.is_empty() {
@@ -2033,7 +2038,7 @@ impl Board {
         for n in 0..words {
             match self.machine.bus.last_write(address.wrapping_add(4 * n)) {
                 None => out.push("0,-1".to_string()),
-                Some(armv6m::bus::Mark { stamp, writer: by }) => {
+                Some(armv6m::bus::Mark { stamp, writer: by, .. }) => {
                     let index = writers.iter().position(|&w| w == by).unwrap_or_else(|| {
                         writers.push(by);
                         writers.len() - 1
