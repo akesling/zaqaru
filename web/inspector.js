@@ -23,7 +23,7 @@
 
 import { Types, changes, decode, guess, hexBytes, ringbuf, scheduling, score, walk } from "./debuginfo.js";
 import { alike, depend, dependsField, dependsSummary, grouped, pathTo, reachField, timeStrip } from "./depends.js";
-import { addressExpression, deriveField, expression, goOn, isAddress, nodeLine, onwards, operation, readTree, recurrence, valueOf, valueText } from "./derive.js";
+import { addressExpression, deriveField, expression, goOn, isAddress, loopSteps, nodeLine, nodesOf, onwards, operandValues, operation, readTree, recurrence, stepsText, valueOf, valueText } from "./derive.js";
 import { highlight } from "./highlight.js";
 import { definitionsOf, markUse, readIndex, shortFile } from "./symbols.js";
 import { progressHtml } from "./progress.js";
@@ -433,6 +433,7 @@ export class Inspector {
     const wanted = () => this.trail === trail && trail.tab === "made" && !made.stopped;
     const update = () => this.trail === trail && this.draw(true);
     update();
+    let counting = null;
     try {
       let start = trail.start;
       if (!start) {
@@ -446,12 +447,15 @@ export class Inspector {
         const answer = await this.view.query({ time: window.time, follow: { from: window.from } }, `board/derive/${start.at}`, (p) => wanted() && this.progressed("made", made.running, p));
         made.root = readTree(answer?.tree ?? null, window, made.nodes);
         if (!made.root) made.ended = "untracked";
+        // A count, a sum: gone back to where it began, at once.
+        else counting = nodesOf(made.root).find((node) => recurrence(node) && onwards(node));
       }
     } catch (why) {
       made.error = String(why);
     }
     made.running = null;
     update();
+    if (counting) this.madeOn(counting.id);
   }
 
   /// Goes on from a part of how the value was made: see `derive.js`'s
@@ -1085,6 +1089,9 @@ export class Inspector {
     };
     const when = (s) => (s.t === undefined ? "" : ` <a class="dim when" data-stand="${Math.floor(s.t / 1000) + 1}" title="stand the board here">t=${(s.t / 1e6).toFixed(3)} ms</a>`);
     let head;
+    // What it was made of, as shown: its operands, or for steps folded, what
+    // the first was taken from.
+    let shown = node.operands;
     switch (step.what) {
       case "store": {
         head = `${place(step)} = ${v} <span class="dim">stored by</span> ${by(step)}${when(step)}`;
@@ -1094,13 +1101,26 @@ export class Inspector {
         }
         if (node.repeats) {
           const since = node.earliest?.t !== undefined ? ` since t=${(node.earliest.t / 1e6).toFixed(3)} ms` : "";
-          head += ` <span class="chip made-fold" title="made ${node.repeats + 1} times over, each time of what it was the time before: a count, a sum, a position moved a step at a time">×${node.repeats + 1}${since}</span>`;
+          if (node.uncounted) head += ` <span class="chip made-fold" title="made over and over, each time of what it was the time before — a position moved, a sum — by steps not all the same, so how many is not known">made of itself${since}</span>`;
+          else head += ` <span class="chip made-fold" title="made ${node.repeats + 1} times over, each time of what it was the time before: a count, a sum, a position moved a step at a time">×${node.repeats + 1}${since}</span>`;
         }
         if (!node.operands.length && !node.cut && !node.same) head += ` <span class="dim">— a constant the code made</span>`;
         break;
       }
       case "merge": {
-        const values = node.operands.map(valueOf);
+        // Stepped round a loop: the steps as one, opened on asking.
+        const steps = node.unfolded ? null : loopSteps(node);
+        if (steps) {
+          const lines = [...new Set(steps.links.map((l) => functionOf(l.step)))];
+          head = `${v} = <span class="made-expr">${e(stepsText(valueOf(steps.start), steps.added))}</span> <span class="dim">· stepped ${steps.links.length} times by</span> ${by(step)}${lines.length > 1 ? ` <span class="dim">and ${e(lines.slice(1).join(", "))}</span>` : ""} <a data-made-unfold="${node.id}" title="each step, one below the other">each step</a>`;
+          shown = [steps.start, ...steps.by];
+          break;
+        }
+        const values = operandValues(node);
+        if (values.includes(null)) {
+          head = `${v} = <span class="made-expr">${e(operation(step.op).symbol ? `its value before ${operation(step.op).symbol} ${values.filter((x) => x !== null).map((x) => `0x${(x >>> 0).toString(16)}`).join(` ${operation(step.op).symbol} `) || "…"}` : `${operation(step.op).word} of its value before`)}</span> <span class="dim">· ${e(operation(step.op).word)} by</span> ${by(step)}`;
+          break;
+        }
         if (isAddress(step)) {
           const table = node.pointer ? ` <span class="dim" title="the table's own address, which says which table, not which entry">(the table's address + the index)</span>` : "";
           head = `<span class="dim">address</span> ${v} = <span class="made-expr">${e(addressExpression(step.value, values, step.shift ?? 0))}</span>${table} <span class="dim">· worked out by</span> ${by(step)}`;
@@ -1148,11 +1168,13 @@ export class Inspector {
     const above = node.parent ? nodeLine(node.parent) : null;
     const repeated = above && line && above.file === line.file && above.line === line.line;
     const src = step.what === "held" || step.what === "register" || repeated ? null : this.lineHtml(line);
+    // A part said in full above, and in its value here already: not again.
+    shown = shown.filter((o) => !(o.same && o.step?.what === "merge"));
     const closed = this.madeClosed(node);
-    const toggle = node.operands.length ? `<a class="made-toggle" data-made-toggle="${node.id}" title="${closed ? "show" : "hide"} what it was made of">${closed ? "▸" : "▾"}</a>` : `<span class="made-toggle"></span>`;
+    const toggle = shown.length ? `<a class="made-toggle" data-made-toggle="${node.id}" title="${closed ? "show" : "hide"} what it was made of">${closed ? "▸" : "▾"}</a>` : `<span class="made-toggle"></span>`;
     const at = step.what === "merge" || step.addr === undefined ? "" : ` data-lit="${step.addr}"`;
-    if (closed && node.operands.length) head += ` <a class="dim made-more" data-made-toggle="${node.id}">${node.operands.length} part${node.operands.length === 1 ? "" : "s"} ▸</a>`;
-    const children = node.operands.length && !closed ? `<ul>${node.operands.map((o) => this.madeNodeHtml(o)).join("")}</ul>` : "";
+    if (closed && shown.length) head += ` <a class="dim made-more" data-made-toggle="${node.id}">${shown.length} part${shown.length === 1 ? "" : "s"} ▸</a>`;
+    const children = shown.length && !closed ? `<ul>${shown.map((o) => this.madeNodeHtml(o)).join("")}</ul>` : "";
     return `<li class="made-${e(step.what ?? "node")}"><div class="made-row"${at}>${toggle}<span>${role}${head}${src ? `<code class="made-src">${src}</code>` : ""}</span></div>${children}</li>`;
   }
 
@@ -1245,10 +1267,20 @@ export class Inspector {
     const index = this.stories.indexOf(t);
     const nav = `<button type="button" data-story="${index - 1}" ${index > 0 ? "" : "disabled"} title="the story before">‹</button><button type="button" data-story="${index + 1}" ${index < this.stories.length - 1 ? "" : "disabled"} title="the story after">›</button>`;
     const value = stepsOf(t)[0]?.step;
-    const head = `<div class="story-head"><span class="controls">${nav}</span> <b>where ${e(t.label ?? hex(t.address))}${value && byteOf(value) !== null ? ` = ${byte(byteOf(value))}` : ""} came from</b> <span class="dim">${hex(t.address)}</span> <span class="controls">${t.running || (t.tab === "depends" && t.depends?.running) || (t.tab === "made" && (t.made?.running || t.made?.going)) ? `<button type="button" data-story-stop>stop</button>` : ""}${(t.hops[0] ?? t.start) ? `<button type="button" data-reach="${t.address},${(t.hops[0] ?? t.start).time}" title="follow this value forward from here: everywhere it, and anything made of it, went">where it went</button>` : ""}<button type="button" data-close="trail" title="close the story; ‹ brings it back">close</button></span></div>`;
+    // Tall as asked, or else for how it was made, a tree that is the point.
+    if (this.storyTall === undefined) {
+      try {
+        const kept = localStorage.getItem("zaqaru.storyTall");
+        this.storyTall = kept === null ? null : kept === "true";
+      } catch {
+        this.storyTall = null;
+      }
+    }
+    const tall = (this.storyTallNow = this.storyTall ?? t.tab === "made");
+    const head = `<div class="story-head"><span class="controls">${nav}</span> <b>where ${e(t.label ?? hex(t.address))}${value && byteOf(value) !== null ? ` = ${byte(byteOf(value))}` : ""} came from</b> <span class="dim">${hex(t.address)}</span> <span class="controls">${t.running || (t.tab === "depends" && t.depends?.running) || (t.tab === "made" && (t.made?.running || t.made?.going)) ? `<button type="button" data-story-stop>stop</button>` : ""}${(t.hops[0] ?? t.start) ? `<button type="button" data-reach="${t.address},${(t.hops[0] ?? t.start).time}" title="follow this value forward from here: everywhere it, and anything made of it, went">where it went</button>` : ""}<button type="button" data-story-tall title="${tall ? "shorter: the memory maps beneath in view" : "taller: more of the story at once"}">${tall ? "shorter" : "taller"}</button><button type="button" data-close="trail" title="close the story; ‹ brings it back">close</button></span></div>`;
     const tab = (name, label, title) => `<button type="button" data-story-tab="${name}"${t.tab === name ? ' class="on"' : ""} title="${title}">${label}</button>`;
     const tabs = `<div class="story-tabs controls">${tab("made", "how it was made", "what it was made of, by what code and arithmetic, down to where each part came in")}${tab("story", "its way back", "write by write, each copy back to where it came in")}${tab("depends", "everything it depended on", "every value it was made of or chosen by, each followed back in turn")}</div>`;
-    let html = `<div class="mem-story">${head}${tabs}`;
+    let html = `<div class="mem-story${tall ? " tall" : ""}">${head}${tabs}`;
     if (t.tab === "depends") return `${html}${this.dependsHtml(t)}</div>`;
     if (t.tab === "made") return `${html}${this.madeHtml(t)}</div>`;
     if (said) html += `<div class="story-summary">${e(said)}</div>`;
@@ -1665,6 +1697,20 @@ export class Inspector {
     }
     if (t("[data-made-on]") && this.trail?.made) {
       this.madeOn(Number(t("[data-made-on]").dataset.madeOn));
+      return true;
+    }
+    if (t("[data-made-unfold]") && this.trail?.made) {
+      const node = this.trail.made.nodes.get(Number(t("[data-made-unfold]").dataset.madeUnfold));
+      if (node) node.unfolded = true;
+      this.draw(true);
+      return true;
+    }
+    if (t("[data-story-tall]")) {
+      this.storyTall = !this.storyTallNow;
+      try {
+        localStorage.setItem("zaqaru.storyTall", String(this.storyTall));
+      } catch {}
+      this.draw(true);
       return true;
     }
     if (t("[data-made-toggle]") && this.trail?.made) {
