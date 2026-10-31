@@ -131,9 +131,9 @@ export function onwards(node) {
       return { path: `board/derive/${step.addr}`, time, from: time - WINDOW };
     }
     case "register": {
-      if (!/^r\d+$/.test(step.register ?? "")) return null;
+      if (!/^(r\d+|lr)$/.test(step.register ?? "")) return null;
       const time = step.t * 1000;
-      return { path: `board/derive/${step.register}`, time, from: time - WINDOW, value: step.value };
+      return { path: `board/derive/${step.register === "lr" ? "r14" : step.register}`, time, from: time - WINDOW, value: step.value };
     }
     default:
       return null;
@@ -162,7 +162,12 @@ export function recurrence(node) {
   let store = storeAbove(node);
   // Within a fold, what it began from: the fold's own store, above it.
   for (let at = node; at && at !== store; at = at.parent) if (at.role === "before") store = storeAbove(at);
-  if (store?.role === "before") store = storeAbove(store);
+  if (store?.role === "before") {
+    // What other code set it to: where it began, and no further.
+    const outer = storeAbove(store);
+    if (outer && store.step?.what === "store" && store.step.pc !== outer.step?.pc) return null;
+    store = outer;
+  }
   return store && samePlace(store, node.step) ? store : null;
 }
 
@@ -178,7 +183,7 @@ export function recurrence(node) {
 export function splice(node, found, nodes, jump = false) {
   const store = recurrence(node);
   if (store && found?.step?.what === "store" && samePlace(store, node.step)) {
-    const [seen, held] = [store.repeats, node.step.value];
+    const [seen, held, was] = [store.repeats, node.step.value, store.earliest];
     store.repeats += 1 + found.repeats;
     store.earliest = found.earliest ?? found.step;
     // What it began from: a fold of its own's, or its own value held.
@@ -197,7 +202,11 @@ export function splice(node, found, nodes, jump = false) {
         // What it held before the first step: the base, or within a fold's
         // own, what that began from.
         const first = set(base) ? base : find(base, (n) => n.step?.what === "held" && samePlace(store, n.step, false));
-        const times = count(store.step.value, held, seen + 1, found.step.value, first?.step?.value, found.repeats + 1);
+        // How many the time taken comes to, at the pace of those seen.
+        const pace = seen && store.step.t !== undefined && was?.t !== undefined ? (store.step.t - was.t) / seen : null;
+        const began = found.earliest?.t ?? found.step.t;
+        const expected = pace && began !== undefined ? (store.step.t - began) / pace + found.repeats + 1 : null;
+        const times = count(store.step.value, held, seen + 1, found.step.value, first?.step?.value, found.repeats + 1, expected);
         if (times === null) store.uncounted = true;
         else store.repeats = times - 1;
       }
@@ -221,13 +230,20 @@ export function splice(node, found, nodes, jump = false) {
 /// `began` from `first` to `after`, each the same, and the whole a whole
 /// number of them. Null where they were not — a position moved by
 /// different amounts — and the steps between are not known.
-export function count(last, before, seen, after, first, began) {
+export function count(last, before, seen, after, first, began, expected = null) {
   if ([last, before, after, first].some((v) => v === null || v === undefined)) return null;
   const diff = (a, b) => (a - b) | 0;
   const step = diff(last, before) / seen;
-  if (!Number.isInteger(step) || step === 0 || diff(after, first) !== step * began) return null;
-  const times = diff(last, first) / step;
-  return Number.isInteger(times) && times > 0 ? times : null;
+  if (!Number.isInteger(step) || step === 0 || diff(after, first) !== ((step * began) | 0)) return null;
+  // The travel wraps at 32 bits: as many steps as it seems, give or take
+  // a whole turn of them — chosen by how many the time taken comes to, or
+  // where no turn is short enough to be in doubt, none.
+  const turn = 2 ** 32 / Math.abs(step);
+  let times = step > 0 ? ((last - first) >>> 0) / step : ((first - last) >>> 0) / -step;
+  if (!Number.isInteger(times)) return null;
+  if (expected !== null && Number.isFinite(expected)) times += Math.round((expected - times) / turn) * turn;
+  else if (turn < 2 ** 24) return null;
+  return times > 0 ? times : null;
 }
 
 function find(node, test) {
@@ -327,98 +343,124 @@ function shiftBy(v, kind, n) {
   }
 }
 
-/// What an operation makes of two values, where it is one of the few
-/// that are a symbol between them: to tell its operands apart.
-function apply(op, a, b) {
-  const f = { add: a + b, adc: a + b, sub: a - b, rsb: b - a, orr: a | b, eor: a ^ b, and: a & b, bic: a & ~b, mul: Math.imul(a, b) }[op];
-  return f === undefined ? null : f >>> 0;
-}
+/// Operations of two values, `a` and `b` — the second as the instruction
+/// shifted it — with a carry `c` where one goes in: what each comes to, and
+/// how it is said, of the two said and `b`'s value. The few `expression` checks before it says them.
+const BINARY = {
+  add: [(a, b) => a + b, (a, b) => `${a} + ${b}`],
+  adc: [(a, b, c) => a + b + c, (a, b, c) => `${a} + ${b}${c ? " + carry" : ""}`],
+  sub: [(a, b) => a - b, (a, b) => `${a} − ${b}`],
+  sbc: [(a, b, c) => a - b - 1 + c, (a, b, c) => `${a} − ${b}${c ? "" : " − borrow"}`],
+  // Reversed: the second less the first.
+  rsb: [(a, b) => b - a, (a, b) => `${b} − ${a}`],
+  and: [(a, b) => a & b, (a, b) => `${a} & ${b}`],
+  orr: [(a, b) => a | b, (a, b) => `${a} | ${b}`],
+  eor: [(a, b) => a ^ b, (a, b) => `${a} ^ ${b}`],
+  bic: [(a, b) => a & ~b, (a, b) => `${a} & ~${b}`],
+  orn: [(a, b) => a | ~b, (a, b) => `${a} | ~${b}`],
+  mul: [(a, b) => Math.imul(a, b), (a, b) => `${a} × ${b}`],
+  sdiv: [(a, b) => ((b | 0) === 0 ? 0 : Math.trunc((a | 0) / (b | 0))), (a, b) => `${a} ÷ ${b}`],
+  udiv: [(a, b) => (b >>> 0 === 0 ? 0 : Math.trunc((a >>> 0) / (b >>> 0))), (a, b) => `${a} ÷ ${b}`],
+  // By a register: by its bottom byte, said as the amount it shifted by.
+  lsl: [(a, b) => shiftBy(a, "lsl", b & 0xff), (a, b, c, n) => `${a} << ${n & 0xff}`],
+  lsr: [(a, b) => shiftBy(a, "lsr", b & 0xff), (a, b, c, n) => `${a} >> ${n & 0xff}`],
+  asr: [(a, b) => shiftBy(a, "asr", b & 0xff), (a, b, c, n) => `${a} >> ${n & 0xff}`],
+  ror: [(a, b) => shiftBy(a, "ror", b & 31), (a, b, c, n) => `${a} rotated right by ${n & 31}`],
+};
+
+/// Operations whose operands are signed: a negative one said as one, so
+/// that what is said comes to the value read the natural way.
+const SIGNED = new Set(["asr", "sdiv", "smull", "smlal", "ssat", "sxtb", "sxth"]);
 
 /// A merge as an expression: its operands' values with the operation
 /// between them — `0xa38000 + 0x8000` — its second operand shifted where
 /// the instruction shifts it (`step.rshift`), the constant it worked with
 /// (`step.imm`, an immediate or a register's the code made before;
-/// `step.bits`): `0x10c492e8 >> 10`, `bits 4–9 of 0x1f3`; and
-/// where a pointer was left out (`pointer`), the pointer, from what the
-/// rest came to. Or, where no symbol says it, in words. Null with no
-/// operand to say.
+/// `step.bits`): `0x10c492e8 >> 10`, `bits 4–9 of 0x1f3`; and where a
+/// pointer was left out (`pointer`), the pointer, from what the rest came
+/// to. Every reading — which operand first, which shifted, a constant, the
+/// same register twice, a carry — is worked out, and said only where it
+/// comes to `step.value`; where none does, or no symbol says it, in words.
+/// Null with no operand to say.
 export function expression(op, values, step = {}, pointer = false) {
-  const { symbol, word } = operation(op);
+  const { word } = operation(op);
   if (!values.length) return null;
-  const shift = ["lsl", "lsr", "asr", "ror"].includes(op);
   const value = step.value;
-  const shifted = (v) => (step.rshift ? `${hex(v)} ${{ lsl: "<<", lsr: ">>", asr: ">>", ror: "rotated" }[step.rshift[0]]} ${step.rshift[1]}` : hex(v));
-  if (step.rshift && symbol) {
-    const [kind, n] = step.rshift;
-    if (values.length === 2) {
-      // Which was shifted: the way round that comes to the value.
-      for (const [a, b] of [values, [...values].reverse()]) if (apply(op, a, shiftBy(b, kind, n)) === value >>> 0) return `${hex(a)} ${symbol} ${shifted(b)}`;
-    }
-    if (values.length === 1 && pointer && (op === "add" || op === "adc")) return `${hex(value - shiftBy(values[0], kind, n))} ${symbol} ${shifted(values[0])}`;
-    // The other a constant the code had made before (`step.imm`), the way
-    // round that comes to the value; or, not known, said to be one.
-    if (values.length === 1 && !pointer) {
-      const [v, c] = [values[0], step.imm];
-      if (c !== undefined && apply(op, v, shiftBy(c, kind, n)) === value >>> 0) return `${hex(v)} ${symbol} ${shifted(c)}`;
-      if (c !== undefined && (op === "add" || op === "adc")) return `${hex(c)} + ${shifted(v)}`;
-      return `${shifted(v)} ${symbol} ${c === undefined ? "a constant" : hex(c)}`;
-    }
-  }
   const known = value !== null && value !== undefined;
-  if (op === "neg" && values.length === 1) return (values[0] | 0) < 0 ? `−(−${hex(-(values[0] | 0))})` : `−${hex(values[0])}`;
-  // A multiply and an add: which two were multiplied, by what it came to.
-  if ((op === "mla" || op === "mls") && values.length === 3 && known) {
-    for (const [a, b, c] of [values, [values[1], values[2], values[0]], [values[0], values[2], values[1]]]) {
-      const product = Math.imul(a, b);
-      if ((op === "mla" ? (c + product) >>> 0 : (c - product) >>> 0) === value >>> 0) return `${hex(c)} ${op === "mla" ? "+" : "−"} ${hex(a)} × ${hex(b)}`;
-    }
-  }
-  // A long multiply: the half of the product it came to.
-  if ((op === "smull" || op === "umull" || op === "smlal" || op === "umlal") && known && values.length >= 1 && values.length <= 2) {
-    const big = (v) => (op[0] === "s" ? BigInt(v | 0) : BigInt(v >>> 0));
-    const [a, b] = values.length === 2 ? values : [values[0], step.imm ?? values[0]];
-    const product = BigInt.asUintN(64, big(a) * big(b));
-    const said = values.length === 2 || step.imm !== undefined ? `${hex(a)} × ${hex(b)}` : `${hex(a)} × ${hex(a)}`;
-    if (Number(product & 0xffffffffn) === value >>> 0) return `low half of ${said}`;
-    if (Number(product >> 32n) === value >>> 0) return `high half of ${said}`;
-    return values.length === 1 && step.imm === undefined ? `half of ${hex(a)} × a constant` : `${word} (${values.map(hex).join(", ")})`;
-  }
-  // Of one value followed: by itself, or by a constant not known.
-  if (op === "mul" && values.length === 1 && known && step.imm === undefined) return Math.imul(values[0], values[0]) >>> 0 === value >>> 0 ? `${hex(values[0])} × ${hex(values[0])}` : `${hex(values[0])} × a constant`;
-  if (op === "rsb" && values.length === 1 && step.imm !== undefined && !step.rshift) return `${step.imm < 10 ? step.imm : hex(step.imm)} − ${hex(values[0])}`;
-  // Halves packed: the bottom of one and the top of the other, shifted —
-  // the way round that comes to the value.
-  if (op === "pkh" && values.length === 2 && known) {
-    const [kind, n] = step.rshift ?? ["lsl", 0];
-    for (const [a, b] of [values, [...values].reverse()]) {
-      const s = shiftBy(b, kind, n);
-      const said = `${hex(b)}${n ? ` ${kind === "lsl" ? "<<" : ">>"} ${n}` : ""}`;
-      if ((((a & 0xffff) | (s & 0xffff0000)) >>> 0) === value >>> 0) return `bottom of ${hex(a)}, top of ${said}`;
-      if ((((a & 0xffff0000) | (s & 0xffff)) >>> 0) === value >>> 0) return `top of ${hex(a)}, bottom of ${said}`;
-    }
-  }
-  if (values.length === 1 && pointer && symbol === "+" && value !== null && value !== undefined) return `${hex(value - values[0])} + ${hex(values[0])}`;
+  const signed = SIGNED.has(op);
+  const said = (v) => (signed && (v | 0) < 0 ? `−${hex(-(v | 0))}` : hex(v));
+  const constant = (c) => (c < 10 ? String(c) : said(c));
+  const words = () => `${word} (${values.map(said).join(", ")})`;
+  const comes = (v) => known && v >>> 0 === value >>> 0;
+  // The second operand as the instruction shifted it, and said so —
+  // bracketed, beside arithmetic that binds tighter in C.
+  const [kind, n] = step.rshift ?? [null, 0];
+  const second = (v, text) => (kind ? { v: shiftBy(v, kind, n), text: `(${text} ${{ lsl: "<<", lsr: ">>", asr: ">>", ror: "rotated right by" }[kind]} ${n})` } : { v, text });
+  if (op === "neg" && values.length === 1) return comes(-values[0]) ? ((values[0] | 0) < 0 ? `−(−${hex(-(values[0] | 0))})` : `−${hex(values[0])}`) : words();
   if (step.bits && values.length === 1) {
     const [lsb, width] = step.bits;
     return `${op === "bfi" || op === "bfc" ? word : "bits"} ${lsb}–${lsb + width - 1} of ${hex(values[0])}`;
   }
-  if (step.imm !== undefined && values.length === 1) {
-    const imm = shift || step.imm < 10 ? String(step.imm) : hex(step.imm);
-    // A constant first: `0x100 − x`, where that is what it came to.
-    if (symbol && !shift && apply(op, step.imm, values[0]) === value >>> 0 && apply(op, values[0], step.imm) !== value >>> 0) return `${imm} ${symbol} ${hex(values[0])}`;
-    if (symbol) return `${hex(values[0])} ${symbol} ${imm}`;
-    if (shift) return `${hex(values[0])} rotated by ${imm}`;
-  }
-  if (symbol && values.length >= 2) {
-    // Said only where it is so: arithmetic that does not come to the value
-    // — an operand shifted some way not known — is said in words.
-    const checks = values.length === 2 && known && apply(op, 0, 0) !== null;
-    if (checks && !step.rshift) {
-      for (const [a, b] of [values, [...values].reverse()]) if (apply(op, a, b) === value >>> 0) return `${hex(a)} ${symbol} ${hex(b)}`;
+  // A multiply and an add: which two were multiplied, by what it came to.
+  if ((op === "mla" || op === "mls") && values.length === 3 && known) {
+    for (const [a, b, c] of [values, [values[1], values[2], values[0]], [values[0], values[2], values[1]]]) {
+      const product = Math.imul(a, b);
+      if (comes(op === "mla" ? c + product : c - product)) return `${hex(c)} ${op === "mla" ? "+" : "−"} ${hex(a)} × ${hex(b)}`;
     }
-    if (!checks) return values.map(hex).join(` ${symbol} `);
+    return words();
   }
-  return `${word} (${values.map(hex).join(", ")})`;
+  // A long multiply: the half of the product it came to.
+  if (["smull", "umull", "smlal", "umlal"].includes(op) && values.length <= 2) {
+    const big = (v) => (signed ? BigInt(v | 0) : BigInt(v >>> 0));
+    const pairs = values.length === 2 ? [values] : step.imm !== undefined ? [[values[0], step.imm]] : [[values[0], values[0]]];
+    for (const [a, b] of pairs) {
+      const product = BigInt.asUintN(64, big(a) * big(b));
+      if (comes(Number(product & 0xffffffffn))) return `low half of ${said(a)} × ${said(b)}`;
+      if (comes(Number(product >> 32n))) return `high half of ${said(a)} × ${said(b)}`;
+    }
+    return values.length === 1 && step.imm === undefined ? `half of ${said(values[0])} × a constant` : words();
+  }
+  // Halves packed: the bottom of one and the top of the other, shifted —
+  // the way round that comes to the value.
+  if (op === "pkh" && values.length === 2) {
+    for (const [a, b] of [values, [...values].reverse()]) {
+      const s = second(b, hex(b));
+      if (comes((a & 0xffff) | (s.v & 0xffff0000))) return `bottom of ${hex(a)}, top of ${s.text}`;
+      if (comes((a & 0xffff0000) | (s.v & 0xffff))) return `top of ${hex(a)}, bottom of ${s.text}`;
+    }
+    return words();
+  }
+  // A shift by a constant: of one value.
+  if (["lsl", "lsr", "asr", "ror"].includes(op) && values.length === 1 && step.imm !== undefined) {
+    return comes(shiftBy(values[0], op, step.imm)) ? BINARY[op][1](said(values[0]), String(step.imm), 0, step.imm) : words();
+  }
+  const binary = BINARY[op];
+  if (!binary) return words();
+  // The table's own address left out: what it was, from what the sum came to.
+  if (values.length === 1 && pointer && (op === "add" || op === "adc") && known) {
+    const s = second(values[0], hex(values[0]));
+    return `${hex(value - s.v)} + ${s.text}`;
+  }
+  // Each reading: two values followed, either way round; one and the
+  // constant, either way round; one, twice — `x + (x << 1)`.
+  const operand = (v, c = false) => ({ v, text: c ? constant(v) : said(v) });
+  const pairs =
+    values.length === 2
+      ? [[operand(values[0]), values[1]], [operand(values[1]), values[0]]]
+      : values.length === 1 && step.imm !== undefined
+        ? [[operand(values[0]), step.imm, true], [operand(step.imm, true), values[0]]]
+        : values.length === 1
+          ? [[operand(values[0]), values[0]]]
+          : [];
+  const carries = op === "adc" || op === "sbc" ? [0, 1] : [0];
+  for (const [a, b, c = false] of pairs) {
+    const s = second(b, c ? constant(b) : said(b));
+    for (const carry of carries) if (comes(binary[0](a.v, s.v, carry))) return binary[1](a.text, s.text, carry, s.v);
+  }
+  // Of one value and a constant the code made before, not known: said to
+  // be one, which no reading can be checked against.
+  if (values.length === 1 && step.imm === undefined) return `${word} (${said(values[0])}, a constant)`;
+  return words();
 }
 
 /// A value stepped a few times in a row — `position += step` round a
@@ -455,6 +497,11 @@ export function loopSteps(node, least = 3) {
     at = before;
   }
   if (links.length < least || valueOf(start) === null) return null;
+  // Round a loop: the same code — the same instruction, or the same line
+  // unrolled — more than once; not a sum written out.
+  const where = (n) => [`pc ${n.step.pc}`, ...(lineOf(n.step) ? [`line ${lineOf(n.step).file}:${lineOf(n.step).line}`] : [])];
+  const seen = links.flatMap(where);
+  if (new Set(seen).size === seen.length) return null;
   const values = [...links.map(valueOf), valueOf(start)];
   const added = links.map((_, i) => (values[i] - values[i + 1]) | 0);
   return { links, start, added, by };
@@ -487,11 +534,11 @@ export function addressExpression(value, values, shift = 0) {
   // the address.
   if (known.length === 1 && value !== null && value !== undefined) {
     const index = known[0];
-    return `${hex(value - index * 2 ** shift)} + ${hex(index)}${shift ? ` << ${shift}` : ""}`;
+    return `${hex(value - index * 2 ** shift)} + ${shift ? `(${hex(index)} << ${shift})` : hex(index)}`;
   }
   if (known.length === 2 && value !== null && value !== undefined) {
     for (const [base, index] of [known, [...known].reverse()]) {
-      if (((base + index * 2 ** shift) >>> 0) === value >>> 0) return `${hex(base)} + ${hex(index)}${shift ? ` << ${shift}` : ""}`;
+      if (((base + index * 2 ** shift) >>> 0) === value >>> 0) return `${hex(base)} + ${shift ? `(${hex(index)} << ${shift})` : hex(index)}`;
     }
   }
   return known.length ? known.map(hex).join(" + ") : hex(value ?? 0);
@@ -508,17 +555,19 @@ export function operandValues(node) {
   if (i < 0) return values;
   const value = step.value;
   const others = values.filter((_, j) => j !== i);
-  let was = null;
-  if (value !== null && value !== undefined) {
-    let other = others.length === 1 ? others[0] : others.length === 0 ? step.imm : undefined;
-    // The other the one shifted: the place's own value is the first.
-    if (other !== undefined && other !== null && step.rshift) other = shiftBy(other, ...step.rshift);
-    if (other !== undefined && other !== null) {
-      const v = { add: value - other, adc: value - other, sub: value + other, eor: value ^ other }[step.op];
-      if (v !== undefined) was = v >>> 0;
-    }
-  }
-  values[i] = was;
+  const other = others.length === 1 ? others[0] : others.length === 0 ? step.imm : undefined;
+  values[i] = null;
+  const binary = BINARY[step.op];
+  if (value === null || value === undefined || other === undefined || other === null || !binary) return values;
+  // What it was, each way it could have been: the place's own value
+  // first or second, shifted or not — kept where exactly one of them
+  // comes to the value.
+  const shift = (v) => (step.rshift ? shiftBy(v, ...step.rshift) : v);
+  const candidates = new Set([value - other, value + other, other - value, value ^ other, value - shift(other), value + shift(other), shift(other) - value, value ^ shift(other)].map((v) => v >>> 0));
+  const carries = step.op === "adc" || step.op === "sbc" ? [0, 1] : [0];
+  const comes = (w) => [[w, other], [other, w]].some(([a, b]) => carries.some((c) => binary[0](a, shift(b), c) >>> 0 === value >>> 0));
+  const fits = [...candidates].filter(comes);
+  if (fits.length === 1) values[i] = fits[0];
   return values;
 }
 

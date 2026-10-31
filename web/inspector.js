@@ -1117,8 +1117,11 @@ export class Inspector {
           break;
         }
         const values = operandValues(node);
+        // Its value before not worked back: said by name, in its place.
         if (values.includes(null)) {
-          head = `${v} = <span class="made-expr">${e(operation(step.op).symbol ? `its value before ${operation(step.op).symbol} ${values.filter((x) => x !== null).map((x) => `0x${(x >>> 0).toString(16)}`).join(` ${operation(step.op).symbol} `) || "…"}` : `${operation(step.op).word} of its value before`)}</span> <span class="dim">· ${e(operation(step.op).word)} by</span> ${by(step)}`;
+          const parts = values.map((x) => (x === null ? "its value before" : `0x${(x >>> 0).toString(16)}`));
+          if (parts.length === 1 && step.imm !== undefined) parts.push(`0x${(step.imm >>> 0).toString(16)}`);
+          head = `${v} = <span class="made-expr">${e(`${operation(step.op).word} (${parts.join(", ")})`)}</span> <span class="dim">· ${e(operation(step.op).word)} by</span> ${by(step)}`;
           break;
         }
         if (isAddress(step)) {
@@ -1147,7 +1150,7 @@ export class Inspector {
         head = `${v} <span class="dim">read off</span> <b>${e(step.register)}</b>${step.record ? ` <a data-record="${step.record.n}" data-stand="${Math.floor(step.record.t / 1000) + 1}" title="stand the board at the trace record">trace record ${step.record.n}</a>` : ""} <span class="dim">by</span> ${by(step)}${when(step)}`;
         break;
       case "register":
-        head = `${v} <span class="dim">was in ${e(step.register)} as the window began</span>${/^r\d+$/.test(step.register ?? "") ? "" : ` <span class="dim">— where the code was, not what it made</span>`}`;
+        head = `${v} <span class="dim">was in ${e(step.register)} as the window began</span>${/^(r\d+|lr)$/.test(step.register ?? "") ? "" : ` <span class="dim">— where the code was, not what it made</span>`}`;
         break;
       default:
         head = `${v}`;

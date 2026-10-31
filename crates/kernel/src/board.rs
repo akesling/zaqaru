@@ -83,10 +83,11 @@ pub enum Subject {
 }
 
 impl Subject {
-    /// `0x2400_1000`, `603979776`, or `r3`.
+    /// `0x2400_1000`, `603979776`, `r3`, or `lr` (`r14`).
     pub fn parse(text: &str, number: impl Fn(&str) -> Option<u64>) -> Option<Subject> {
+        let text = if text == "lr" { "r14" } else { text };
         match text.strip_prefix('r') {
-            Some(n) => n.parse::<u8>().ok().filter(|&n| n < 13).map(Subject::Register),
+            Some(n) => n.parse::<u8>().ok().filter(|&n| n < 13 || n == 14).map(Subject::Register),
             None => number(text).map(|a| Subject::Address(a as u32)),
         }
     }
@@ -1571,19 +1572,10 @@ impl Board {
     /// or went into it (`value`). Pointers, and constants the code loaded
     /// from beside itself, which say only which table, are left out.
     pub fn influences_json(&self, subject: Subject, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
-        use armv6m::provenance::What;
         let Some(p) = &self.machine.provenance else {
             return r#"{"following":false,"steps":[],"influences":[]}"#.to_string();
         };
-        // Memory's addresses, not what a value that happens to be large —
-        // a negative number — is: from flash up, what the chip maps.
-        let pointer = |value: u32| value >= 0x0800_0000 && self.machine.bus.is_memory(value);
-        // The kernel's copies between tasks, and memcpy and its kin, move
-        // bytes: where they read is where the bytes were, said already.
-        let moves = |pc: u32| {
-            let code = self.code_at(pc, map);
-            code.starts_with("kernel") || ["memcpy", "memmove", "copy_forward", "copy_backward", "compiler_builtins::mem"].iter().any(|n| code.contains(n))
-        };
+        let moves = |pc: u32| self.moves(pc, map);
         let all = match subject {
             Subject::Address(address) => p.influences(address, 128, &moves),
             Subject::Register(n) => p.register_influences(n as usize, 128, &moves),
@@ -1591,12 +1583,7 @@ impl Board {
         let total = all.len();
         let leaves: Vec<String> = all
             .into_iter()
-            .filter(|(_, node, ..)| match node.what {
-                What::Held { addr, size, value, .. } => addr.wrapping_sub(node.pc) >= 4096 && !(size == 4 && pointer(value)),
-                What::Register { value, .. } => !pointer(value),
-                What::Store { size: 4, value, .. } => !pointer(value),
-                _ => true,
-            })
+            .filter(|(_, node, ..)| !self.says_nothing(node))
             .take(64)
             .filter_map(|(_, node, byte, via)| {
                 let step = self.why_steps(p, vec![(node, byte)], map, read, 4).pop()?;
@@ -1620,12 +1607,7 @@ impl Board {
             return r#"{"following":false,"makers":[],"runs":[]}"#.to_string();
         };
         let mut moving = std::collections::HashMap::new();
-        let mut moves = |pc: u32| {
-            *moving.entry(pc).or_insert_with(|| {
-                let code = self.code_at(pc, map);
-                code.starts_with("kernel") || ["memcpy", "memmove", "copy_forward", "copy_backward", "compiler_builtins::mem"].iter().any(|n| code.contains(n))
-            })
-        };
+        let mut moves = |pc: u32| *moving.entry(pc).or_insert_with(|| self.moves(pc, map));
         let mut makers: Vec<u32> = Vec::new();
         let mut runs: Vec<(u32, u32, i64)> = Vec::new();
         for offset in 0..length.min(1 << 20) {
@@ -1807,6 +1789,39 @@ impl Board {
         format!(r#"{{"following":true,"since_ns":{},"runs":{total},"shown":[{}]}}"#, p.since / 1000, out.join(","))
     }
 
+    /// Whether `value` is an address the chip maps — memory, or a
+    /// peripheral's registers — rather than a number that happens to be
+    /// large, a negative one.
+    fn pointer(&self, value: u32) -> bool {
+        let bus = &self.machine.bus;
+        value >= 0x0800_0000 && (bus.is_memory(value) || bus.soc.contains(value) || (0xE000_0000..0xE010_0000).contains(&value))
+    }
+
+    /// Whether an origin, as what an address was worked out from, says
+    /// only which table or which struct — a pointer, however it got there,
+    /// or a constant the code loaded from beside itself — so that what was
+    /// loaded from it was not chosen by it: the one rule `board/derive`,
+    /// `board/why` and `board/influences` all leave such origins out by.
+    fn says_nothing(&self, node: &armv6m::provenance::Node) -> bool {
+        use armv6m::provenance::What;
+        match node.what {
+            What::Held { addr, size, value, .. } => addr.wrapping_sub(node.pc) < 4096 || (size == 4 && self.pointer(value)),
+            What::Register { n: 13 | 15, .. } => true,
+            What::Register { value, .. } => self.pointer(value),
+            // A pointer the code made and kept: which struct, which table.
+            What::Store { size: 4, value, .. } => self.pointer(value),
+            _ => false,
+        }
+    }
+
+    /// Whether the code at `pc` only moves bytes — the kernel's copies
+    /// between tasks, memcpy and its kin — so that where it read is where
+    /// the bytes were, said already, not what they are.
+    fn moves(&self, pc: u32, map: Option<&Result<armv6m::hubris::Image, String>>) -> bool {
+        let code = self.code_at(pc, map);
+        code.starts_with("kernel") || ["memcpy", "memmove", "copy_forward", "copy_backward", "compiler_builtins::mem"].iter().any(|n| code.contains(n))
+    }
+
     /// One node of a value's history as JSON: what it was — a store, a
     /// read off a bus, what was held since before, a register's, a merge
     /// and its operation, a load — with its value, where, its code and
@@ -1863,7 +1878,7 @@ impl Board {
                 };
                 format!(r#"{{"what":"merge","op":"{}",{shift}{shifted}{imm}"value":{},{common}}}"#, armv6m::ops::operation(first, second), value.map_or("null".into(), |v| v.to_string()))
             }
-            What::Load { addr, value } => format!(r#"{{"what":"load","addr":{addr},"value":{value},"where":{},{common}}}"#, quoted(&self.describe_typed(addr, map, read))),
+            What::Load { addr, value } => format!(r#"{{"what":"load","addr":{addr},"value":{value},"where":{},{common}}}"#, quoted(&self.describe_typed(within(addr, 4), map, read))),
             What::Bytes { addr, value, .. } => format!(r#"{{"what":"bytes","addr":{addr},"value":{value},"where":{},{common}}}"#, quoted(&self.describe_typed(addr, map, read))),
         }
     }
@@ -1879,7 +1894,7 @@ impl Board {
     /// `same`.
     pub fn derive_json(&self, subject: Option<Subject>, node: Option<u32>, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
         use crate::system::server::quoted;
-        use armv6m::provenance::{Derived, Role, What};
+        use armv6m::provenance::{Derived, Role};
         let Some(p) = &self.machine.provenance else {
             return r#"{"following":false}"#.to_string();
         };
@@ -1891,16 +1906,7 @@ impl Board {
         };
         // Memory's addresses, not what a value that happens to be large —
         // a negative number — is: from flash up, what the chip maps.
-        let pointer = |value: u32| value >= 0x0800_0000 && self.machine.bus.is_memory(value);
-        let says_nothing = |node: &armv6m::provenance::Node| match node.what {
-            What::Held { addr, size, value, .. } => addr.wrapping_sub(node.pc) < 4096 || (size == 4 && pointer(value)),
-            What::Register { n: 13 | 15, .. } => true,
-            What::Register { value, .. } => pointer(value),
-            // A pointer the code made and kept, or loaded: which struct,
-            // which table.
-            What::Store { size: 4, value, .. } | What::Load { value, .. } | What::Bytes { value, .. } => pointer(value),
-            _ => false,
-        };
+        let says_nothing = |node: &armv6m::provenance::Node| self.says_nothing(node);
         let tree = p.derivation(tag, 40, 400, &says_nothing);
         fn json(board: &Board, p: &armv6m::provenance::Provenance, d: &Derived, role: Role, byte: u32, map: Option<&Result<armv6m::hubris::Image, String>>, read: ReadFile) -> String {
             let Some(node) = p.node(d.tag) else { return "null".into() };
@@ -1968,10 +1974,9 @@ impl Board {
                     let leaves: Vec<(&armv6m::provenance::Node, u32)> = p
                         .origins(node.parents[1], 8)
                         .into_iter()
-                        .filter(|(_, leaf)| !matches!(leaf.what, What::Held { addr, .. } if addr.wrapping_sub(leaf.pc) < 4096))
                         // Nor does a pointer — which table, which the load's
                         // own address already says — only what indexed it.
-                        .filter(|(_, leaf)| !matches!(leaf.what, What::Held { size: 4, value, .. } | What::Register { value, .. } if value >= 0x0800_0000 && self.machine.bus.is_memory(value)))
+                        .filter(|(_, leaf)| !self.says_nothing(leaf))
                         .map(|(_, leaf)| (leaf, if let What::Held { addr, .. } = leaf.what { addr } else { 0 }))
                         .collect();
                     if leaves.is_empty() {
@@ -2613,6 +2618,138 @@ mod tests {
         assert!(parse("image /f.bin\nled PZ9 low").is_err());
         let h753 = parse("chip STM32H753ZITx\nimage /f.bin").unwrap();
         assert_eq!((h753.chip.as_str(), h753.leds.len()), ("stm32h753", 3));
+    }
+
+    /// A board around a G031 running `code` from 0x0800_0100, with
+    /// `literals` after it: what a test of what the board serves needs, and
+    /// nothing it would listen on.
+    fn board_running(code: &[u16], literals: &[u32]) -> Board {
+        let mut image = vec![0u8; 0x200];
+        image[0..4].copy_from_slice(&0x2000_2000u32.to_le_bytes());
+        image[4..8].copy_from_slice(&0x0800_0101u32.to_le_bytes());
+        let mut at = 0x100;
+        for halfword in code {
+            image[at..at + 2].copy_from_slice(&halfword.to_le_bytes());
+            at += 2;
+        }
+        at = (at + 3) & !3;
+        for word in literals {
+            image[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            at += 4;
+        }
+        Board {
+            machine: Machine::stm32g031(&image).unwrap(),
+            debugger: Debugger::default(),
+            chip: "stm32g031".into(),
+            image: String::new(),
+            archive: None,
+            map: RefCell::new(None),
+            debug: RefCell::default(),
+            stacks_for: None,
+            listener: 0,
+            probe: Address::Inet { address: 0, port: 0 },
+            client: None,
+            origin: None,
+            speed: Speed::Scaled(1000),
+            paused: false,
+            rate: (0, 0),
+            ratio: 0.0,
+            behind: false,
+            now: 0,
+            leds: Vec::new(),
+            name: String::new(),
+            trace: VecDeque::new(),
+            stamp: 0,
+            trace_next: 0,
+            serial: Vec::new(),
+            faults: 0,
+            console: Vec::new(),
+            usb_probe: Probe::default(),
+            usb_responses: VecDeque::new(),
+            host: armv6m::net::Peer::default(),
+            heard: VecDeque::new(),
+            heard_count: 0,
+            pings: 0,
+            configured: Vec::new(),
+            wiring: Vec::new(),
+            multicast: 0,
+            last_multicast: None,
+            nor: None,
+            keyboard: None,
+        }
+    }
+
+    #[test]
+    fn how_a_value_was_made_is_served_as_a_tree_the_page_can_read() {
+        // A count, and a byte of a table looked up by it.
+        let mut board = board_running(
+            &[
+                0x4b04, // ldr r3, =0x2000_0100
+                0x4c05, // ldr r4, =0x2000_0200
+                0x2000, // movs r0, #0
+                0x6018, // str r0, [r3]
+                0x6819, // 1: ldr r1, [r3]
+                0x3101, // adds r1, #1
+                0x6019, // str r1, [r3]
+                0x5c62, // ldrb r2, [r4, r1]
+                0x605a, // str r2, [r3, #4]
+                0xe7f9, // b 1b
+            ],
+            &[0x2000_0100, 0x2000_0200],
+        );
+        for n in 0..64u8 {
+            board.machine.bus.rams[0].bytes[0x200 + n as usize] = n.wrapping_mul(3);
+        }
+        board.machine.run_until(u64::MAX, 30);
+        board.machine.follow_everything_from(board.machine.time);
+        board.machine.run_until(u64::MAX, 60);
+        let read: ReadFile = &|_| Err(crate::errno::Errno::NoEntry);
+        let derive = |subject, node| -> serde_json::Value { serde_json::from_str(&board.derive_json(subject, node, None, read)).expect("board/derive is JSON") };
+
+        // The count: stored by the same code of what it held before, folded.
+        let count = derive(Some(Subject::Address(0x2000_0100)), None);
+        assert_eq!(count["following"], true);
+        let tree = &count["tree"];
+        assert_eq!(tree["step"]["what"], "store");
+        assert!(tree["repeats"].as_u64().unwrap() >= 2, "{tree}");
+        let made = &tree["operands"][0];
+        assert_eq!(made["step"]["what"], "merge");
+        assert_eq!(made["step"]["op"], "add");
+        assert_eq!(made["step"]["imm"], 1);
+        assert!(tree["operands"].as_array().unwrap().iter().any(|o| o["role"] == "before") || made["operands"].as_array().unwrap().iter().any(|o| o["role"] == "before"), "its value before the repeats: {tree}");
+
+        // The byte looked up: chosen by the count, the table's own pointer
+        // left out and said to be.
+        let looked = derive(Some(Subject::Address(0x2000_0104)), None);
+        let load = &looked["tree"]["operands"][0];
+        assert_eq!(load["step"]["what"], "load", "{looked}");
+        let count_now = board.machine.bus.peek(0x2000_0100, 4).unwrap();
+        assert_eq!(load["step"]["value"], u64::from(count_now.wrapping_mul(3) & 0xff));
+        let chose = load["operands"].as_array().unwrap().iter().find(|o| o["role"] == "chose").expect("what chose it");
+        assert_eq!(chose["step"]["op"], "ldr", "the address it was read at — a load, by its family: {chose}");
+        assert_eq!(chose["pointer"], true);
+        assert_eq!(chose["step"]["value"], u64::from(0x2000_0200 + count_now));
+
+        // A node by its tag: the same as asked by its place.
+        let tag = load["tag"].as_u64().unwrap() as u32;
+        let by_tag = derive(None, Some(tag));
+        assert_eq!(by_tag["node"], tag);
+        assert_eq!(by_tag["tree"]["step"], load["step"]);
+
+        // A register: what r1 holds, the count.
+        let register = derive(Some(Subject::Register(1)), None);
+        assert_eq!(register["register"], "r1");
+        assert!(register["tree"]["step"].is_object());
+    }
+
+    #[test]
+    fn a_subject_is_an_address_or_a_register_lr_among_them() {
+        let number = |t: &str| t.parse::<u64>().ok();
+        assert!(matches!(Subject::parse("r3", number), Some(Subject::Register(3))));
+        assert!(matches!(Subject::parse("lr", number), Some(Subject::Register(14))));
+        assert!(matches!(Subject::parse("r14", number), Some(Subject::Register(14))));
+        assert!(Subject::parse("r13", number).is_none(), "the stack pointer is no value made");
+        assert!(matches!(Subject::parse("4096", number), Some(Subject::Address(4096))));
     }
 
     #[test]

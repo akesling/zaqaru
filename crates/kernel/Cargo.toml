@@ -35,3 +35,6 @@ armv6m = { package = "zaqaru-armv6m", path = "../armv6m" }
 # baked images rather than a hand-written stand-in for one.
 image = { package = "zaqaru-image", path = "../image" }
 libc = "0.2"
+# Reading back what the board serves as JSON — written by hand, with
+# format! — in its tests, to check it parses and says what the page reads.
+serde_json = "1"
