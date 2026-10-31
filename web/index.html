@@ -237,8 +237,10 @@
   .mem-owner .doing { margin-left: auto; overflow: hidden; text-overflow: ellipsis; max-width: 16em; }
   .mem-owner .doing + .mem-gauge { margin-left: 6px; }
   .mem-views { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
-  .mem-view { flex: 1 1 32em; min-width: 0; }
-  .mem-source { flex: 1 1 32em; min-width: 0; position: sticky; top: 3em; max-height: 70vh; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; }
+  .mem-view { flex: 1 1 32em; min-width: 0; overflow-x: clip; }
+  /* Who wrote a word wraps rather than run under the source beside it. */
+  .mem-words td:last-child { white-space: normal; }
+  .mem-source { flex: 1 1 32em; min-width: 0; position: sticky; top: 3em; max-height: 70vh; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; background: Canvas; z-index: 1; }
   .mem-source-head { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-bottom: 3px; }
   .mem-source-head a, .mem-history a[data-close], .mem-node .acts a { color: var(--accent); cursor: pointer; }
   .mem-source-body { flex: 1 1 auto; min-height: 0; overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.45; }
