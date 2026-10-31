@@ -494,18 +494,24 @@ impl Machine {
         self.provenance = Some(Box::new(match seed {
             Some((address, length)) => {
                 let values: Vec<u8> = (0..length).map(|i| self.bus.peek(address.wrapping_add(i), 1).unwrap_or(0) as u8).collect();
-                provenance::Provenance::seeded(self.time, address, &values, self.cpu.pc)
+                let mut p = provenance::Provenance::seeded(self.time, address, &values, self.cpu.pc);
+                p.values = self.provenance_registers();
+                p
             }
-            None => {
-                let mut regs = [0; 16];
-                regs[..13].copy_from_slice(&self.cpu.r[..13]);
-                regs[13] = self.cpu.sp();
-                regs[14] = self.cpu.r[14];
-                regs[15] = self.cpu.pc;
-                provenance::Provenance::everything(self.time, &regs)
-            }
+            None => provenance::Provenance::everything(self.time, &self.provenance_registers()),
         }));
         self.cpu.watch.on = true;
+    }
+
+    /// The registers as following values takes them: r0–r12, the stack
+    /// pointer in use, lr and the pc.
+    fn provenance_registers(&self) -> [u32; 16] {
+        let mut regs = [0; 16];
+        regs[..13].copy_from_slice(&self.cpu.r[..13]);
+        regs[13] = self.cpu.sp();
+        regs[14] = self.cpu.r[14];
+        regs[15] = self.cpu.pc;
+        regs
     }
 
     fn execute_until(&mut self, until: u64, instructions: u64) -> Outcome {
@@ -577,7 +583,11 @@ impl Machine {
     /// Follows where values go from now on — or stops — keeping a tag on
     /// every register and byte of memory: see [`provenance`].
     pub fn follow_values(&mut self, on: bool) {
-        self.provenance = on.then(|| Box::new(provenance::Provenance::new(self.time)));
+        self.provenance = on.then(|| {
+            let mut p = provenance::Provenance::new(self.time);
+            p.values = self.provenance_registers();
+            Box::new(p)
+        });
         self.cpu.watch.on = on;
         self.follow_from = None;
     }

@@ -44,6 +44,8 @@ pub fn shifted_operand(hw1: u32, hw2: u32) -> Option<(&'static str, u32)> {
     match (hw2 >> 4 & 3, amount) {
         (0, 0) => None,
         (kind @ (1 | 2), 0) => Some((SHIFTS[kind as usize], 32)),
+        // ROR #0 is RRX: a rotate by one through the carry (A7.4.2).
+        (3, 0) => Some(("rrx", 1)),
         (kind, n) => Some((SHIFTS[kind as usize], n)),
     }
 }
@@ -82,7 +84,8 @@ pub fn immediate(hw1: u32, hw2: u32) -> Option<Immediate> {
         0b11101 if hw1 >> 9 & 3 == 0b01 && hw1 & 15 == 15 && hw1 >> 5 & 15 == 2 => {
             let amount = (hw2 >> 12 & 7) << 2 | hw2 >> 6 & 3;
             match (hw2 >> 4 & 3, amount) {
-                (0, 0) => None,
+                // RRX: by one, through the carry, no constant.
+                (0, 0) | (3, 0) => None,
                 (1 | 2, 0) => Some(Value(32)),
                 (_, n) => Some(Value(n)),
             }
@@ -123,7 +126,16 @@ fn narrow_operation(hw: u32) -> &'static str {
         0b010000 => ["and", "eor", "lsl", "lsr", "asr", "adc", "sbc", "ror", "tst", "neg", "cmp", "cmn", "orr", "mul", "bic", "mvn"][(hw >> 6 & 15) as usize],
         0b010001 => ["add", "cmp", "mov", "bx"][(hw >> 8 & 3) as usize],
         0b010010..=0b010011 => "ldr",
-        0b010100..=0b100111 => {
+        // A register's offset: opB 000–010 stores, 011 (LDRSB) and up
+        // loads (A5.2.4).
+        0b010100..=0b010111 => {
+            if hw >> 9 & 7 < 3 {
+                "str"
+            } else {
+                "ldr"
+            }
+        }
+        0b011000..=0b100111 => {
             if hw >> 11 & 1 == 0 {
                 "str"
             } else {
@@ -177,11 +189,23 @@ fn wide_operation(hw1: u32, hw2: u32) -> &'static str {
                             "mvn"
                         } else if shift == 0 && hw2 >> 4 & 3 == 0 {
                             "mov"
+                        } else if shift == 0 && hw2 >> 4 & 3 == 3 {
+                            "rrx"
                         } else {
                             SHIFTS[(hw2 >> 4 & 3) as usize]
                         }
                     }
                     op => DATA[op as usize],
+                }
+            } else if hw1 & 0xffe0 == 0xe840 {
+                // Exclusive, of a word.
+                if hw1 >> 4 & 1 == 0 { "strex" } else { "ldrex" }
+            } else if hw1 & 0xffe0 == 0xe8c0 {
+                // A table branch, or exclusive of a byte, a half, two.
+                match (hw1 >> 4 & 1, hw2 >> 4 & 15) {
+                    (1, 0 | 1) => "tbb",
+                    (0, _) => "strex",
+                    _ => "ldrex",
                 }
             } else if hw1 >> 9 & 3 == 0b00 {
                 // Loads and stores of several, or of two.
@@ -276,11 +300,10 @@ fn data_register(hw1: u32, hw2: u32) -> &'static str {
         // With a register added: `sxtah` and the like, an add.
         return if hw1 & 15 == 15 { extend } else { "add" };
     }
-    if op1 >> 2 == 0b10 && op2 >> 2 == 0b00 {
-        return ["qadd", "qdadd", "qsub", "qdsub"][(op2 & 3) as usize];
-    }
     if op1 >> 2 == 0b10 && op2 >> 2 == 0b10 {
         return match (op1 & 3, op2 & 3) {
+            // Saturating: op1 10xx, op2 10xx too (A5.3.15).
+            (0b00, n) => ["qadd", "qdadd", "qsub", "qdsub"][n as usize],
             (0b01, 0) => "rev",
             (0b01, 1) => "rev16",
             (0b01, 2) => "rbit",
@@ -323,6 +346,28 @@ mod tests {
         assert_eq!(named(&[0xf101, 0x0001]), "add"); // add.w r0, r1, #1
         assert_eq!(named(&[0xf2c1, 0x2034]), "movt"); // movt r0, #0x1234
         assert_eq!(named(&[0xfab1, 0xf081]), "clz"); // clz r0, r1
+        assert_eq!(named(&[0xfa82, 0xf081]), "qadd"); // qadd r0, r1, r2
+        assert_eq!(named(&[0xfa91, 0xf002]), "add"); // sadd16 r0, r1, r2, a lane at a time
+        assert_eq!(named(&[0xfad1, 0xf002]), "sub"); // ssub16 r0, r1, r2
+        assert_eq!(named(&[0x5688]), "ldr"); // ldrsb r0, [r1, r2]
+        assert_eq!(named(&[0x5488]), "str"); // strb r0, [r1, r2]
+        assert_eq!(named(&[0x5a88]), "ldr"); // ldrh r0, [r1, r2]
+        assert_eq!(named(&[0x5288]), "str"); // strh r0, [r1, r2]
+        assert_eq!(named(&[0xea4f, 0x0031]), "rrx"); // rrx r0, r1
+        assert_eq!(named(&[0xe851, 0x0f00]), "ldrex"); // ldrex r0, [r1]
+        assert_eq!(named(&[0xe841, 0x0200]), "strex"); // strex r2, r0, [r1]
+        assert_eq!(named(&[0xe8d0, 0xf001]), "tbb"); // tbb [r0, r1]
+        assert_eq!(named(&[0xe8d0, 0xf011]), "tbb"); // tbh [r0, r1, lsl #1]
+        assert_eq!(named(&[0xe8d1, 0x0f4f]), "ldrex"); // ldrexb r0, [r1]
+        assert_eq!(named(&[0xe8c1, 0x0f42]), "strex"); // strexb r2, r0, [r1]
+        assert_eq!(named(&[0xe9d2, 0x0100]), "ldrd"); // ldrd r0, r1, [r2]
+        assert_eq!(named(&[0xe9c2, 0x0100]), "strd"); // strd r0, r1, [r2]
+    }
+
+    #[test]
+    fn a_rotate_by_nothing_is_one_through_the_carry() {
+        assert_eq!(shifted_operand(0xeb01, 0x0032), Some(("rrx", 1))); // add.w r0, r1, r2, rrx
+        assert_eq!(immediate(0xea4f, 0x0031), None); // rrx r0, r1: no constant
     }
 
     #[test]

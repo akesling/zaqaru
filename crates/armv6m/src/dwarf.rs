@@ -123,6 +123,9 @@ pub struct Line {
     pub file: Option<String>,
     pub line: u32,
     pub column: u32,
+    /// Taken from the code before it, its own being line 0: likely, not
+    /// what the line table says.
+    pub inferred: bool,
 }
 
 /// A frame of a stack: the instruction it is at, its canonical frame
@@ -297,12 +300,14 @@ impl Debug {
     }
 
     /// Where the instruction at `pc` came from: innermost first. Code the
-    /// compiler made of no line — a spill, a branch's landing — is line 0:
-    /// it is said to be of the line before it in the same function, as a
-    /// debugger says it.
+    /// compiler made of no line — a spill, a branch's landing, code merged
+    /// from several — is line 0 (DWARF 5, 6.2.5.1): it is said to be of the
+    /// line before it in the same function, as a debugger says it, and
+    /// marked [`Line::inferred`], the line before not necessarily where
+    /// control came from. Code with no line table at all is left as it is.
     pub fn lines(&self, pc: u32) -> Vec<Line> {
         let mut out = self.frames(pc);
-        if out.first().is_some_and(|l| l.line == 0) {
+        if out.first().is_some_and(|l| l.line == 0 && l.file.is_some()) {
             for back in (2..=64).step_by(2) {
                 let before = self.frames(pc.wrapping_sub(back));
                 let Some(line) = before.first() else { break };
@@ -310,7 +315,7 @@ impl Debug {
                     break;
                 }
                 if line.line > 0 {
-                    out[0] = line.clone();
+                    out[0] = Line { inferred: true, ..line.clone() };
                     break;
                 }
             }
@@ -328,6 +333,7 @@ impl Debug {
                 file: location.and_then(|l| l.file).map(str::to_string),
                 line: location.and_then(|l| l.line).unwrap_or(0),
                 column: location.and_then(|l| l.column).unwrap_or(0),
+                inferred: false,
             });
         }
         out

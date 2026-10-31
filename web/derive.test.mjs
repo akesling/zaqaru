@@ -35,6 +35,7 @@ test("an instruction's operation is said with a symbol, or in words", () => {
   assert.equal(expression("orr", [0x1, 0x2], { value: 0x201, rshift: ["lsl", 8] }), "0x1 | (0x2 << 8)");
   assert.equal(expression("and", [0x6b448cb], { value: 0x480, rshift: ["lsr", 4] }), "masked (0x6b448cb, a constant)", "a mask the code made before, not known");
   assert.equal(expression("and", [0x6b448cb], { value: 0x480, rshift: ["lsr", 4], imm: 0xfc0 }), "0xfc0 & (0x6b448cb >> 4)", "and what it held");
+  assert.equal(expression("and", [0x6b448cb], { value: 0x480, rshift: ["lsr", 4], held: { register: "r2", value: 0xfc0 } }), "0xfc0 & (0x6b448cb >> 4)", "what a register held, as good as a constant for the step");
   assert.equal(expression("sub", [0x30], { value: 0xd0, imm: 0x100 }), "0x100 − 0x30", "a constant first");
   assert.equal(expression("sub", [0x130], { value: 0x30, imm: 0x100 }), "0x130 − 0x100");
   assert.equal(expression("weird", [1, 2]), "weird (0x1, 0x2)");

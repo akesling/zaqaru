@@ -97,6 +97,11 @@ export function readTree(tree, window, nodes, parent = null) {
     cut: !!tree.cut,
     same: !!tree.same,
     pointer: !!tree.pointer,
+    // Copies left out; a fold cut short, more before; which bytes of a
+    // value put together from bytes this part was.
+    copiesMore: tree.copies_more ?? 0,
+    repeatsCut: !!tree.repeats_cut,
+    lanes: tree.lanes ?? null,
     window,
     parent,
     operands: [],
@@ -375,8 +380,8 @@ const SIGNED = new Set(["asr", "sdiv", "smull", "smlal", "ssat", "sxtb", "sxth"]
 /// A merge as an expression: its operands' values with the operation
 /// between them — `0xa38000 + 0x8000` — its second operand shifted where
 /// the instruction shifts it (`step.rshift`), the constant it worked with
-/// (`step.imm`, an immediate or a register's the code made before;
-/// `step.bits`): `0x10c492e8 >> 10`, `bits 4–9 of 0x1f3`; and where a
+/// (`step.imm`, an immediate; `step.held`, what a register nothing
+/// followed held; `step.bits`): `0x10c492e8 >> 10`, `bits 4–9 of 0x1f3`; and where a
 /// pointer was left out (`pointer`), the pointer, from what the rest came
 /// to. Every reading — which operand first, which shifted, a constant, the
 /// same register twice, a carry — is worked out, and said only where it
@@ -384,6 +389,9 @@ const SIGNED = new Set(["asr", "sdiv", "smull", "smlal", "ssat", "sxtb", "sxth"]
 /// Null with no operand to say.
 export function expression(op, values, step = {}, pointer = false) {
   const { word } = operation(op);
+  // What a register it read held that nothing followed made, as it held
+  // it then: as good as a constant, for this step.
+  if (step.imm === undefined && step.held) step = { ...step, imm: step.held.value };
   if (!values.length) return null;
   const value = step.value;
   const known = value !== null && value !== undefined;
@@ -458,7 +466,8 @@ export function expression(op, values, step = {}, pointer = false) {
     for (const carry of carries) if (comes(binary[0](a.v, s.v, carry))) return binary[1](a.text, s.text, carry, s.v);
   }
   // Of one value and a constant the code made before, not known: said to
-  // be one, which no reading can be checked against.
+  // be one, which no reading can be checked against. (Following everything
+  // the register's own is known: `step.held`.)
   if (values.length === 1 && step.imm === undefined) return `${word} (${said(values[0])}, a constant)`;
   return words();
 }

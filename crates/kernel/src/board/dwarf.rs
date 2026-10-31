@@ -245,11 +245,12 @@ fn hex(bytes: &[Option<u8>]) -> String {
 
 pub fn line_json(line: &Line) -> String {
     format!(
-        r#"{{"function":{},"file":{},"line":{},"column":{}}}"#,
+        r#"{{"function":{},"file":{},"line":{},"column":{}{}}}"#,
         line.function.as_deref().map_or("null".into(), quoted),
         line.file.as_deref().map_or("null".into(), quoted),
         line.line,
-        line.column
+        line.column,
+        if line.inferred { r#","inferred":true"# } else { "" }
     )
 }
 

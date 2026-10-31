@@ -59,10 +59,11 @@ pub enum What {
     Store { addr: u32, size: u32, value: u32 },
     /// A value made of two tagged ones: what it came to, if the
     /// instruction's result — `None` for one of the merges between that a
-    /// result of three or more is made of — and what a register it read
-    /// that held nothing followed held: a constant the code made before,
-    /// `0xfc0` to mask with.
-    Merge { value: Option<u32>, constant: Option<u32> },
+    /// result of three or more is made of — and a register it read that
+    /// held nothing followed, and what it held: a constant the code made
+    /// before, `0xfc0` to mask with, or a value made only of immediates, a
+    /// loop's index.
+    Merge { value: Option<u32>, constant: Option<(u8, u32)> },
     /// Bytes loaded together that came from different places: the tag of
     /// each, by its place in the value — what a word copy of bytes stored
     /// one by one carries, and what a byte's story follows its own lane of.
@@ -116,11 +117,18 @@ pub struct Derived {
     /// first: the value's earlier places. The operand is what the last was
     /// made of.
     pub copies: Vec<Tag>,
+    /// Copies before those, left out: [`COPIES`] are kept.
+    pub copies_more: u32,
     /// For a store, how many times before it the same code stored to the
     /// same place a value made of what it had stored there before — a
     /// count, a sum, a step — and the earliest of them.
     pub repeats: u32,
     pub earliest: Tag,
+    /// Folded no further than [`REPEATS`]: there were more before.
+    pub repeats_cut: bool,
+    /// For a part of bytes put together from different places, which of
+    /// them were this part's: a bit a byte, the lowest the first.
+    pub lanes: u8,
     pub operands: Vec<(Role, Derived)>,
     /// Left out, past the depth or the budget.
     pub cut: bool,
@@ -142,6 +150,13 @@ pub enum Role {
     /// The place's own value before the repeats (see [`Derived::repeats`]).
     Again,
 }
+
+/// The most copies of a value a node of a derivation names.
+pub const COPIES: usize = 16;
+/// The most repeats a node of a derivation folds, a step at a time: past
+/// it, a count is better found by how long its writer has been at it
+/// ([`crate::bus::Mark::run`]).
+pub const REPEATS: u32 = 4096;
 
 struct Walk<'a> {
     budget: usize,
@@ -302,10 +317,11 @@ impl Provenance {
         // Not the pc: what is made of it — a literal's address, a table's
         // beside the code — is a constant of the code's.
         let from_registers: Vec<Tag> = (0..15).filter(|n| read & 1 << n != 0).map(|n| self.regs[n]).collect();
-        // A register it read that held nothing followed: a constant.
-        // Not the stack pointer; the link register, which code uses as one
-        // more register, yes.
-        let constant = (0..15).find(|&n| n != 13 && read & 1 << n != 0 && self.regs[n] == 0).map(|n| self.values[n]);
+        // A register it read that held nothing followed, and what it held:
+        // the register itself, unless the instruction wrote it too, when
+        // it is what it held when last written. Not the stack pointer; the
+        // link register, which code uses as one more register, yes.
+        let constant = (0..15).find(|&n| n != 13 && read & 1 << n != 0 && self.regs[n] == 0).map(|n| (n as u8, if written & 1 << n == 0 { values[n] } else { self.values[n] }));
         // What the instruction made of the registers it read, once: the tag
         // of their union, and whether a merge of it was made here.
         let mut made: Option<(Tag, bool)> = None;
@@ -412,12 +428,18 @@ impl Provenance {
     /// by the code — at most `most`, each once. Not through the addresses
     /// loads were made from: those are their own question.
     pub fn origins(&self, tag: Tag, most: usize) -> Vec<(Tag, &Node)> {
+        self.origins_whole(tag, most).0
+    }
+
+    /// The same, and whether they are all of them: false where the walk
+    /// stopped at `most`, or at the most nodes it looks through, first.
+    fn origins_whole(&self, tag: Tag, most: usize) -> (Vec<(Tag, &Node)>, bool) {
         let mut out: Vec<(Tag, &Node)> = Vec::new();
         let mut queue = std::collections::VecDeque::from([tag]);
         let mut seen = std::collections::HashSet::new();
         while let Some(at) = queue.pop_front() {
             if out.len() >= most || seen.len() > 4096 {
-                break;
+                return (out, false);
             }
             if at == 0 || !seen.insert(at) {
                 continue;
@@ -432,7 +454,7 @@ impl Provenance {
                 _ => out.push((at, node)),
             }
         }
-        out
+        (out, true)
     }
 
     /// Everything the byte at `address` depended on, where each came into
@@ -547,12 +569,18 @@ impl Provenance {
         }
         walk.budget -= 1;
         let mut operands: Vec<(Role, Tag)> = Vec::new();
+        // Of bytes put together: which bytes each operand was.
+        let mut lanes: Vec<u8> = Vec::new();
         match node.what {
             What::Store { .. } => {
                 // The copies it was before: stores of the same value.
                 let mut at = tag;
                 while let Some(before) = self.copied_from(at, walk) {
-                    out.copies.push(before);
+                    if out.copies.len() < COPIES {
+                        out.copies.push(before);
+                    } else {
+                        out.copies_more += 1;
+                    }
                     at = before;
                 }
                 let made = self.node(at).map_or(0, |n| n.parents[0]);
@@ -561,7 +589,8 @@ impl Provenance {
                 if let Some(previous) = self.repeated(at) {
                     let (mut earliest, mut times) = (previous, 1);
                     while let Some(before) = self.repeated(earliest) {
-                        if times >= 1 << 20 {
+                        if times >= REPEATS {
+                            out.repeats_cut = true;
                             break;
                         }
                         earliest = before;
@@ -575,24 +604,32 @@ impl Provenance {
             }
             What::Merge { .. } => self.flatten(tag, node, walk, &mut operands),
             What::Load { .. } => operands.extend([(Role::Value, node.parents[0]), (Role::Chose, node.parents[1])]),
-            What::Bytes { lanes, .. } => {
-                for lane in lanes {
-                    if lane != 0 && !operands.iter().any(|&(_, t)| t == lane) {
-                        operands.push((Role::Value, lane));
+            What::Bytes { lanes: by_lane, .. } => {
+                for (i, lane) in by_lane.into_iter().enumerate() {
+                    if lane == 0 {
+                        continue;
+                    }
+                    match operands.iter().position(|&(_, t)| t == lane) {
+                        Some(at) => lanes[at] |= 1 << i,
+                        None => {
+                            operands.push((Role::Value, lane));
+                            lanes.push(1 << i);
+                        }
                     }
                 }
             }
             _ => {}
         }
         let mut dropped = false;
-        for (role, operand) in operands {
+        for (i, (role, operand)) in operands.into_iter().enumerate() {
             let operand = self.through(operand, walk);
             if operand == 0 {
                 continue;
             }
-            // The place's value before the repeats: the earliest of them,
-            // in its stead, and what that was made of.
-            if again.0 != 0 && operand == again.0 {
+            // The place's value before the repeats — itself, or a copy of it
+            // a loop kept elsewhere, spilled and reloaded: the earliest of
+            // them, in its stead, and what that was made of.
+            if again.0 != 0 && self.copy_of(operand, again.0, walk) {
                 let mut earliest = Derived { tag: again.1, ..Derived::default() };
                 if let Some(first) = self.node(again.1).map(|n| n.parents[0]).map(|t| self.through(t, walk)).filter(|&t| t != 0) {
                     earliest.operands.push((Role::Value, self.derive(first, depth - 1, walk, (0, 0), choosing)));
@@ -605,7 +642,9 @@ impl Provenance {
                 dropped = true;
                 continue;
             }
-            out.operands.push((role, self.derive(operand, depth - 1, walk, again, choosing)));
+            let mut part = self.derive(operand, depth - 1, walk, again, choosing);
+            part.lanes = lanes.get(i).copied().unwrap_or(0);
+            out.operands.push((role, part));
         }
         out.pointer = dropped;
         out
@@ -614,9 +653,14 @@ impl Provenance {
     /// Whether everything the value tagged `tag` came from says nothing
     /// (see [`Provenance::derivation`]): a pointer, however it got here —
     /// which table, not which entry.
+    /// Where not every origin was found — a loop's index stepped longer
+    /// than the walk looks — it is not known to say nothing, and does not.
     fn only_pointers(&self, tag: Tag, walk: &mut Walk) -> bool {
         let says_nothing = walk.says_nothing;
-        *walk.plain.entry(tag).or_insert_with(|| self.origins(tag, 8).iter().all(|(_, n)| says_nothing(n)))
+        *walk.plain.entry(tag).or_insert_with(|| {
+            let (origins, whole) = self.origins_whole(tag, 16);
+            whole && origins.iter().all(|(_, n)| says_nothing(n))
+        })
     }
 
     /// The operands of the merges an instruction made of what it read:
@@ -630,6 +674,20 @@ impl Provenance {
                 _ => {}
             }
         }
+    }
+
+    /// Whether the store `tag` is `of`, or a copy of it, a few copies back.
+    fn copy_of(&self, mut tag: Tag, of: Tag, walk: &mut Walk) -> bool {
+        for _ in 0..COPIES {
+            if tag == of {
+                return true;
+            }
+            match self.copied_from(tag, walk) {
+                Some(before) => tag = before,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// The store `tag` is a copy of, if it is one: a store of the same

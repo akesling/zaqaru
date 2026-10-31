@@ -836,7 +836,10 @@ export class Inspector {
   lineLink(line, label = null) {
     if (!line?.file) return "";
     const short = line.file.split("/").slice(-2).join("/");
-    return `<a class="src" data-src="${this.e(line.file)}" data-line="${line.line}" title="${this.e(`${line.function ?? ""} ${line.file}:${line.line}`)}">${this.e(label ?? `${short}:${line.line}`)}</a>`;
+    // A line the table did not give this code — taken from the code
+    // before it — said to be likely, ≈.
+    const likely = line.inferred ? " — likely: this code is of no line of its own, and this is the line before it" : "";
+    return `<a class="src" data-src="${this.e(line.file)}" data-line="${line.line}" title="${this.e(`${line.function ?? ""} ${line.file}:${line.line}${likely}`)}">${this.e(label ?? `${short}:${line.inferred ? "≈" : ""}${line.line}`)}</a>`;
   }
 
   /// A writer as the inspector names it: its function and line.
@@ -1097,11 +1100,13 @@ export class Inspector {
         head = `${place(step)} = ${v} <span class="dim">stored by</span> ${by(step)}${when(step)}`;
         if (node.copies.length) {
           const maker = node.copies.at(-1);
-          head = `${place(step)} = ${v} <span class="dim">copied from</span> ${node.copies.map(place).join(" ← ")} <span class="dim">· made by</span> ${by(maker)}${when(maker)}`;
+          const more = node.copiesMore ? ` <span class="dim">← ${node.copiesMore} more</span>` : "";
+          head = `${place(step)} = ${v} <span class="dim">copied from</span> ${node.copies.map(place).join(" ← ")}${more} <span class="dim">· made by</span> ${by(maker)}${when(maker)}`;
         }
         if (node.repeats) {
           const since = node.earliest?.t !== undefined ? ` since t=${(node.earliest.t / 1e6).toFixed(3)} ms` : "";
           if (node.uncounted) head += ` <span class="chip made-fold" title="made over and over, each time of what it was the time before — a position moved, a sum — by steps not all the same, so how many is not known">made of itself${since}</span>`;
+          else if (node.repeatsCut) head += ` <span class="chip made-fold" title="made at least ${node.repeats + 1} times over in this window, each time of what it was the time before; folded no further, there were more before">×${node.repeats + 1}+${since}</span>`;
           else head += ` <span class="chip made-fold" title="made ${node.repeats + 1} times over, each time of what it was the time before: a count, a sum, a position moved a step at a time">×${node.repeats + 1}${since}</span>`;
         }
         if (!node.operands.length && !node.cut && !node.same) head += ` <span class="dim">— a constant the code made</span>`;
@@ -1156,6 +1161,8 @@ export class Inspector {
         head = `${v}`;
     }
     const role = node.role === "chose" ? `<span class="chip made-role" title="what picked which entry of a table it was read from: an index, a coordinate">chose</span> ` : node.role === "before" ? `<span class="chip made-role" title="what the place held before the repeats above began">began from</span> ` : "";
+    // Of a value put together from bytes: which of them this was.
+    if (node.lanes?.length) head = `<span class="chip made-role" title="which bytes of the value above this part was, the lowest byte 0">byte${node.lanes.length > 1 ? "s" : ""} ${node.lanes.join(", ")}</span> ${head}`;
     if (node.same) head += ` <span class="dim">(as above)</span>`;
     if (node.running) head += ` <span class="dim">following…</span>`;
     else if (onwards(node)) {

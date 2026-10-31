@@ -1873,10 +1873,13 @@ impl Board {
                 let imm = match armv6m::ops::immediate(first, second) {
                     Some(armv6m::ops::Immediate::Value(v)) => format!(r#""imm":{v},"#),
                     Some(armv6m::ops::Immediate::Bits { lsb, width }) => format!(r#""bits":[{lsb},{width}],"#),
-                    // Or one a register held, that the code made before.
-                    None => constant.map_or(String::new(), |v| format!(r#""imm":{v},"#)),
+                    None => String::new(),
                 };
-                format!(r#"{{"what":"merge","op":"{}",{shift}{shifted}{imm}"value":{},{common}}}"#, armv6m::ops::operation(first, second), value.map_or("null".into(), |v| v.to_string()))
+                // And what a register it read held that nothing followed made:
+                // a constant the code made before, or a value made only of
+                // immediates — what it held then, not the instruction's own.
+                let held = constant.map_or(String::new(), |(n, v)| format!(r#""held":{{"register":"{}","value":{v}}},"#, if n == 14 { "lr".to_string() } else { format!("r{n}") }));
+                format!(r#"{{"what":"merge","op":"{}",{shift}{shifted}{imm}{held}"value":{},{common}}}"#, armv6m::ops::operation(first, second), value.map_or("null".into(), |v| v.to_string()))
             }
             What::Load { addr, value } => format!(r#"{{"what":"load","addr":{addr},"value":{value},"where":{},{common}}}"#, quoted(&self.describe_typed(within(addr, 4), map, read))),
             What::Bytes { addr, value, .. } => format!(r#"{{"what":"bytes","addr":{addr},"value":{value},"where":{},{common}}}"#, quoted(&self.describe_typed(addr, map, read))),
@@ -1920,8 +1923,18 @@ impl Board {
                 let copies: Vec<String> = d.copies.iter().filter_map(|&c| p.node(c)).map(|n| board.node_json(n, 0, map, read)).collect();
                 out += &format!(r#","copies":[{}]"#, copies.join(","));
             }
+            if d.copies_more > 0 {
+                out += &format!(r#","copies_more":{}"#, d.copies_more);
+            }
             if d.repeats > 0 {
                 out += &format!(r#","repeats":{},"earliest":{}"#, d.repeats, p.node(d.earliest).map_or("null".into(), |n| board.node_json(n, 0, map, read)));
+            }
+            if d.repeats_cut {
+                out += r#","repeats_cut":true"#;
+            }
+            if d.lanes != 0 {
+                let lanes: Vec<String> = (0..4).filter(|i| d.lanes & 1 << i != 0).map(|i: u32| i.to_string()).collect();
+                out += &format!(r#","lanes":[{}]"#, lanes.join(","));
             }
             if d.cut {
                 out += r#","cut":true"#;

@@ -168,6 +168,7 @@ impl Machine {
             }
             // lr now holds EXC_RETURN, which carries nothing.
             provenance.regs[14] = 0;
+            provenance.values[14] = exc_return;
         }
         let time = self.time;
         let signal = match n {

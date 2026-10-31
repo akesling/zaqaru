@@ -1957,6 +1957,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "ruzstd",
+ "serde_json",
  "zaqaru-armv6m",
  "zaqaru-cpu",
  "zaqaru-image",

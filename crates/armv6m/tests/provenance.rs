@@ -552,7 +552,7 @@ begin:
     let p = m.provenance.as_ref().unwrap();
     let store = p.node(p.memory[&0x2400_0200]).unwrap();
     let made = p.node(store.parents[0]).unwrap();
-    assert!(matches!(made.what, What::Merge { value: Some(0x540), constant: Some(0xfc0) }), "the mask made in the window, a constant: {made:?}");
+    assert!(matches!(made.what, What::Merge { value: Some(0x540), constant: Some((2, 0xfc0)) }), "the mask made in the window, a constant: {made:?}");
 }
 
 #[test]
@@ -698,4 +698,134 @@ begin:
     let made = |at: u32| p.node(p.node(p.memory[&at]).unwrap().parents[0]).unwrap().what;
     assert!(matches!(made(0x2400_0200), What::Merge { value: Some(v), .. } if v == product as u32), "{:?}", made(0x2400_0200));
     assert!(matches!(made(0x2400_0204), What::Merge { value: Some(v), .. } if v == (product >> 32) as u32), "{:?}", made(0x2400_0204));
+}
+
+/// Nothing a pointer: what says nothing of which, as a test has it.
+fn pointers(node: &armv6m::provenance::Node) -> bool {
+    match node.what {
+        What::Held { addr, value, .. } => addr.wrapping_sub(node.pc) < 4096 || value >= 0x2000_0000,
+        What::Register { n: 13 | 15, .. } => true,
+        What::Register { value, .. } | What::Store { size: 4, value, .. } => value >= 0x2000_0000,
+        _ => false,
+    }
+}
+
+#[test]
+fn an_index_stepped_longer_than_the_walk_looks_still_chose_its_entry() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000400      @ a table
+    movs r1, #0              @ the index, from before
+    ldr r5, =5000
+    nop
+begin:
+1:  adds r1, #1
+    subs r5, #1
+    bne 1b
+    ldr r2, [r3, r1, lsl #2]
+    ldr r6, =0x24000200
+    str r2, [r6]
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 4), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let tree = p.derivation(p.memory[&0x2400_0200], 8, 64, &pointers);
+    let mut text = String::new();
+    derivation_text(p, &tree, "", 0, &mut text);
+    assert!(text.contains("chose: "), "the index chose it, however long its way back:\n{text}");
+}
+
+#[test]
+fn a_constant_followed_only_off_the_bus_is_what_its_register_held() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100
+    ldr r1, =0x12345678
+    str r1, [r3]
+    movs r1, #0xff           @ the mask, before following began
+    nop
+begin:
+    ldr r0, [r3]
+    ands r0, r1
+    ldr r6, =0x24000200
+    str r0, [r6]
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 5), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_forward_from(probe.time, 0x2400_0100, 4);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let store = p.node(p.memory[&0x2400_0200]).unwrap();
+    let made = p.node(store.parents[0]).unwrap();
+    assert!(matches!(made.what, What::Merge { value: Some(0x78), constant: Some((1, 0xff)) }), "{made:?}");
+}
+
+#[test]
+fn a_count_kept_in_a_register_and_spilled_is_folded_through_its_copies() {
+    // t1++ round a loop, the count stored where it is kept and copied to
+    // another place each time — a spill, an argument — before the next.
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100
+    movs r1, #0
+    str r1, [r3]
+    nop
+begin:
+    movs r5, #6
+1:  ldr r1, [r3, #4]         @ from the copy
+    adds r1, #1
+    str r1, [r3]             @ the count
+    ldr r2, [r3]
+    str r2, [r3, #4]         @ copied
+    subs r5, #1
+    bne 1b
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 4), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let tree = p.derivation(p.memory[&0x2400_0100], 24, 200, &pointers);
+    let mut text = String::new();
+    derivation_text(p, &tree, "", 0, &mut text);
+    assert!(text.lines().next().unwrap().contains("repeated 5"), "folded once, at the top:\n{text}");
+    assert_eq!(text.matches("repeated").count(), 1, "not again at each copy:\n{text}");
+}
+
+#[test]
+fn bytes_put_together_say_which_bytes_each_part_was() {
+    let source = ".thumb_func\nreset:
+    ldr r3, =0x24000100
+    ldr r1, =0x11223344
+    str r1, [r3]
+    nop
+begin:
+    ldr r6, =0x24000200
+    movs r2, #0xaa
+    strb r2, [r6, #1]        @ one byte of its own
+    ldr r1, [r3]
+    strh r1, [r6, #2]        @ two of another
+    ldr r0, [r6]
+    str r0, [r3, #8]
+    bkpt #1
+    .ltorg
+";
+    let mut probe = h753(source);
+    assert!(matches!(probe.run_until(u64::MAX, 4), Outcome::Budget));
+    let mut m = h753(source);
+    m.follow_everything_from(probe.time);
+    run(&mut m);
+    let p = m.provenance.as_ref().unwrap();
+    let tree = p.derivation(p.memory[&0x2400_0108], 8, 64, &pointers);
+    let bytes = &tree.operands[0].1;
+    let lanes: Vec<u8> = bytes.operands.iter().map(|(_, o)| o.lanes).collect();
+    assert!(lanes.contains(&0b0010) && lanes.contains(&0b1100), "byte 1 one's, bytes 2 and 3 another's: {lanes:?}");
 }
